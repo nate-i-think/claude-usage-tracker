@@ -138,24 +138,33 @@ def render_bar_chart(values: List[Tuple[str, Optional[float]]],
 BURN_WINDOW_MINUTES = 15
 
 
+def _recent_window(history, window_minutes: int = BURN_WINDOW_MINUTES):
+    """Recent samples, trimmed to post-reset only.
+
+    Utilization is monotonic-non-decreasing within a window, so a drop in
+    samples can only mean we crossed a reset. After a reset the pre-reset
+    samples are no longer meaningful for burn rate, so we anchor to the
+    most recent reset point.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    recent = [(t, p) for t, p in history if t >= cutoff and p is not None]
+    reset_idx = 0
+    for i in range(1, len(recent)):
+        if recent[i][1] + 5 < recent[i - 1][1]:   # >5% drop = reset
+            reset_idx = i
+    return recent[reset_idx:]
+
+
 def compute_rate(history: List[Tuple[datetime, Optional[float]]],
                  window_minutes: int = BURN_WINDOW_MINUTES) -> Optional[float]:
     """Burn rate (%/min) over the most recent `window_minutes` of history."""
-    if len(history) < 2:
-        return None
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-    recent = [(t, p) for t, p in history if t >= cutoff and p is not None]
+    recent = _recent_window(history, window_minutes)
     if len(recent) < 2:
         return None
     minutes = (recent[-1][0] - recent[0][0]).total_seconds() / 60
     if minutes <= 0:
         return None
     return (recent[-1][1] - recent[0][1]) / minutes
-
-
-def _recent_window(history, window_minutes: int = BURN_WINDOW_MINUTES):
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-    return [(t, p) for t, p in history if t >= cutoff and p is not None]
 
 
 def render_burn_lines(history, snap: Snapshot) -> Group:
