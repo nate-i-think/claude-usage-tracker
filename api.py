@@ -29,14 +29,17 @@ def _load_client_sha() -> str:
     if env := os.environ.get("CLAUDE_USAGE_TUI_CLIENT_SHA"):
         return env
     sha_file = os.path.join(os.path.dirname(__file__), "client_sha.txt")
-    if os.path.exists(sha_file):
-        try:
-            value = open(sha_file, encoding="utf-8").read().strip()
-            if value and len(value) >= 8:
-                return value
-        except OSError:
-            pass
-    return "dc0cedc76e6502966b76c5ddc9e3411719f69f54"
+    try:
+        value = open(sha_file, encoding="utf-8").read().strip()
+        if value and len(value) >= 8:
+            return value
+    except OSError:
+        pass
+    raise RuntimeError(
+        f"client_sha.txt is missing, empty, or unreadable at {sha_file}.\n"
+        "Restore the file with a current anthropic-client-sha value, or "
+        "set CLAUDE_USAGE_TUI_CLIENT_SHA env var. See README.md."
+    )
 
 
 ANTHROPIC_CLIENT_SHA = _load_client_sha()
