@@ -62,44 +62,75 @@ def _fmt_min(m: float) -> str:
 
 # --- Bar chart ------------------------------------------------------------
 
+class BarChart:
+    """Vertical bar chart that adapts its slot width to fit the terminal.
+
+    Slot widths chosen at render time based on available space:
+      4 — full breathing room ("██  ", labels with trailing space)
+      3 — compact ("██ ", labels touch)
+      2 — dense ("█ ", thin bars, 2-letter labels)
+    Always falls back gracefully so the chart never overflows its panel.
+    """
+
+    def __init__(self, values: List[Tuple[str, Optional[float]]],
+                 height: int = 8, title: str = ""):
+        self.values = values
+        self.height = height
+        self.title = title
+
+    def __rich_console__(self, console, options):
+        if not self.values:
+            yield Panel(Text("no data yet", style="dim"),
+                        title=self.title, border_style="dim")
+            return
+        # Subtract panel chrome (2 border + 2 padding from padding=(0,1))
+        # and 5 chars for y-axis labels + corner.
+        avail = options.max_width - 4 - 5
+        slot_w = max(2, min(4, avail // len(self.values)))
+        text = Text("\n".join(self._rows(slot_w)))
+        yield Panel(Align.center(text),
+                    title=self.title, border_style="cyan", padding=(0, 1))
+
+    def _rows(self, slot_w: int) -> List[str]:
+        height = self.height
+        y_marks = {
+            height:                       "100%",
+            max(1, round(height * 0.75)): " 75%",
+            max(1, round(height * 0.50)): " 50%",
+            max(1, round(height * 0.25)): " 25%",
+        }
+        bar_w = max(1, slot_w - 1)
+        gap = " " * (slot_w - bar_w)
+        empty = " " * slot_w
+
+        rows: List[str] = []
+        for r in range(height, 0, -1):
+            y_label = y_marks.get(r, "    ")
+            bars: List[str] = []
+            for _, pct in self.values:
+                if pct is None:
+                    bars.append(empty)
+                    continue
+                bar_h = pct * height / 100
+                if bar_h >= r:
+                    bars.append("█" * bar_w + gap)
+                elif bar_h > r - 1:
+                    idx = min(7, max(0, int((bar_h - (r - 1)) * 8)))
+                    bars.append(BLOCKS[idx] * bar_w + gap)
+                else:
+                    bars.append(empty)
+            rows.append(f"{y_label}┤{''.join(bars)}")
+
+        label_w = slot_w  # labels fill full slot; use 2-char abbrevs at slot=2
+        rows.append("  0%└" + "─" * (len(self.values) * slot_w))
+        rows.append("     " + "".join(
+            f"{label[:label_w]:<{label_w}}" for label, _ in self.values))
+        return rows
+
+
 def render_bar_chart(values: List[Tuple[str, Optional[float]]],
-                     height: int = 8, title: str = "") -> Panel:
-    """Vertical bar chart of (label, percentage 0..100 or None) tuples."""
-    if not values:
-        return Panel(Text("no data yet", style="dim"),
-                     title=title, border_style="dim")
-
-    y_marks = {
-        height:                          "100%",
-        max(1, round(height * 0.75)):    " 75%",
-        max(1, round(height * 0.50)):    " 50%",
-        max(1, round(height * 0.25)):    " 25%",
-    }
-
-    # 4-char slot per bar: 2 chars of bar + 2 chars of breathing room.
-    rows: List[str] = []
-    for r in range(height, 0, -1):
-        y_label = y_marks.get(r, "    ")
-        bars: List[str] = []
-        for _, pct in values:
-            if pct is None:
-                bars.append("    ")
-                continue
-            bar_h = pct * height / 100
-            if bar_h >= r:
-                bars.append("██  ")
-            elif bar_h > r - 1:
-                idx = min(7, max(0, int((bar_h - (r - 1)) * 8)))
-                bars.append(f"{BLOCKS[idx]}{BLOCKS[idx]}  ")
-            else:
-                bars.append("    ")
-        rows.append(f"{y_label}┤{''.join(bars)}")
-
-    rows.append("  0%└" + "─" * (len(values) * 4))
-    rows.append("     " + "".join(f"{label[:3]:<4}" for label, _ in values))
-
-    return Panel(Align.center(Text("\n".join(rows))),
-                 title=title, border_style="cyan", padding=(0, 1))
+                     height: int = 8, title: str = "") -> BarChart:
+    return BarChart(values, height, title)
 
 
 # --- Burn rate, projection, headroom --------------------------------------
