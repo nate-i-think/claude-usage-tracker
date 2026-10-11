@@ -397,11 +397,20 @@ pub fn recommendation(jar: &CookieJar, probe: &Probe, now: f64) -> Vec<String> {
     }
     let permission_error =
         matches!(sniff, Some(Sniff::ApiError { kind, .. }) if kind == "permission_error");
-    if permission_error {
+    // Like Python: blame the client SHA only when the session looks live.
+    // With a missing or expired sessionKey, the re-login advice above leads.
+    let session_live = sess.is_some_and(|s| !expired(s, now));
+    if permission_error && session_live {
         lines.push(
             "• permission_error — the anthropic-client-sha is probably stale. Refresh \
              client_sha.txt (or set CLAUDE_USAGE_TUI_CLIENT_SHA); if that doesn't help, sign out \
              of claude.ai and back in."
+                .to_owned(),
+        );
+    } else if permission_error {
+        lines.push(
+            "• permission_error — expected without a live sessionKey. Sign back in first; \
+             only if it persists with fresh cookies, refresh client_sha.txt."
                 .to_owned(),
         );
     }
@@ -641,10 +650,37 @@ mod tests {
             },
         );
         assert!(r.starts_with("The request failed."));
+        assert!(r.contains("probably stale"), "{r}");
         assert!(r.contains("client_sha.txt"), "{r}");
         assert!(r.contains("sign out"), "{r}");
+        assert!(!r.contains("EXPIRED"), "{r}");
         assert!(!r.contains("__cf_bm"), "{r}");
         assert!(!r.contains("impersonat"), "{r}");
+    }
+
+    #[test]
+    fn recommendation_permission_error_with_expired_session_leads_with_relogin() {
+        let mut jar = healthy_jar();
+        for c in &mut jar.cookies {
+            if c.name == "sessionKey" {
+                c.expiry = Some(NOW - 2.0 * 86_400.0);
+            }
+        }
+        let lines = recommendation(
+            &jar,
+            &Probe::Response {
+                status: 403,
+                sniff: Sniff::ApiError {
+                    kind: "permission_error".into(),
+                    message: None,
+                },
+            },
+            NOW,
+        );
+        let r = lines.join("\n");
+        assert!(lines[1].contains("sessionKey is EXPIRED (2d ago)"), "{r}");
+        assert!(!r.contains("probably stale"), "{r}");
+        assert!(r.contains("Sign back in first"), "{r}");
     }
 
     #[test]
