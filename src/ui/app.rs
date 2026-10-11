@@ -126,7 +126,10 @@ impl App {
         // (window::viewport_builder); on Windows the saved position and
         // maximized state are applied here, while the window is hidden.
         #[cfg(windows)]
-        window::apply_placement(cc, window::startup_placement(&settings));
+        window::apply_placement(
+            cc,
+            window::startup_placement(&settings, ctx.pixels_per_point()),
+        );
         let notify_ctx = ctx.clone();
         let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
             notify_ctx.request_repaint()
