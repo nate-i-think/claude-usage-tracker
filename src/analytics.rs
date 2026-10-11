@@ -14,7 +14,10 @@ use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 
 use crate::model::{ExtraUsage, Snapshot, UsageWindow};
 
+mod names;
 mod timeline;
+
+pub use names::{encode_project_path, prettify_project, prettify_project_in, PROJECT_NAME_CHARS};
 
 pub use timeline::{fable_layer, pace, projection, seven_day_pace, Projection, WindowSample};
 
