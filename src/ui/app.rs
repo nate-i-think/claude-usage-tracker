@@ -3,17 +3,18 @@
 //!
 //! Work that must go on while the window is hidden (draining poll events,
 //! telling the poller about settings changes, persisting settings, the 1 s
-//! tick, tracking the window rect) runs in [`eframe::App::logic`], which
+//! tick, tracking the window rect, the tray icon) runs in [`eframe::App::logic`], which
 //! eframe calls every pass, even when it skips the UI. `ui()` only draws.
 
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use eframe::egui::{
     self, style::ScrollStyle, Align, CentralPanel, Frame, Margin, RichText, ScrollArea, Ui,
 };
 
 use crate::config::{Pos, Settings, UiMode};
+use crate::crash;
 use crate::paths::Paths;
 use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 
@@ -22,6 +23,7 @@ use super::layout::{self, right_then_left, GAP};
 use super::mode::{self, Settle, SettleStep};
 use super::pill::{self, PillAction, PillState};
 use super::settings::{self, PanelAction, SettingsPanel};
+use super::tray::{self, CloseDecision, IconFace, Tray, TrayAction};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
 use super::{chips, details, footer, motion, theme, timeline};
 
@@ -116,6 +118,16 @@ pub struct App {
     pulse_tracker: motion::PulseTracker,
     /// This frame's pulse, from [`App::update_motion`].
     pulse: motion::Pulse,
+    /// The tray icon, while [`Settings::tray_enabled`] and it could be
+    /// created.
+    tray: Option<Tray>,
+    /// Creating the tray icon failed; not retried until the setting is
+    /// turned off and on again.
+    tray_failed: bool,
+    /// Hidden to the tray (minimized and invisible; only `logic()` runs).
+    hidden: bool,
+    /// Quit was chosen: the close that follows is not turned into a hide.
+    quitting: bool,
 }
 
 impl App {
@@ -148,7 +160,7 @@ impl App {
         let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
             notify_ctx.request_repaint()
         });
-        Self {
+        let mut app = Self {
             poller,
             poller_settings: settings.clone(),
             persisted: settings.clone(),
@@ -163,7 +175,13 @@ impl App {
             last_refresh: None,
             pulse_tracker: motion::PulseTracker::default(),
             pulse: motion::Pulse::NONE,
-        }
+            tray: None,
+            tray_failed: false,
+            hidden: false,
+            quitting: false,
+        };
+        app.sync_tray_presence(&ctx);
+        app
     }
 
     fn drain_events(&mut self) {
@@ -257,9 +275,125 @@ impl App {
         }
     }
 
-    /// Runs every pass after the poll results are in, visible or not: the
-    /// tray icon (Task 9) and threshold alerts (Task 10) hook in here.
+    /// Runs every pass after the poll results are in, visible or not:
+    /// threshold alerts (Task 10) hook in here.
     fn background_hooks(&mut self, _now: Instant) {}
+
+    /// Hide to the tray. Minimizing as well as hiding is what makes eframe
+    /// skip `ui()` (it only checks the minimized state); `logic()` goes on.
+    fn hide(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hidden = true;
+    }
+
+    /// Bring the window back from the tray (or from the taskbar).
+    fn show(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.hidden = false;
+        ctx.request_repaint();
+    }
+
+    /// Exit for real: the close request this sends is not turned into a
+    /// hide. `save()` still runs.
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// The close button (or Alt+F4) hides to the tray when the settings say
+    /// so.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        let decision = tray::close_decision(
+            self.tray.is_some(),
+            self.settings.closes_to_tray(),
+            self.quitting,
+        );
+        if decision == CloseDecision::HideToTray {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide(ctx);
+        }
+    }
+
+    /// Create or drop the tray icon to match the setting, act on its clicks
+    /// and menu, and keep its icon, tooltip and "Pill mode" check current.
+    fn sync_tray(&mut self, ctx: &egui::Context) {
+        self.sync_tray_presence(ctx);
+        if self.tray.is_none() {
+            // Nothing could bring the window back.
+            if self.hidden {
+                self.show(ctx);
+            }
+            return;
+        }
+        while let Some(action) = self.tray.as_ref().and_then(Tray::try_recv) {
+            self.tray_action(ctx, action);
+        }
+        let snap = self.state.data.as_ref().map(|d| &d.snapshot);
+        let pct = snap.and_then(|s| s.five_hour_pct());
+        let resets_at = snap.and_then(|s| s.five_hour_resets_at());
+        let failed = self.state.error.is_some() || !self.poller.is_alive();
+        let pill = self.settings.ui_mode == UiMode::Pill;
+        if let Some(t) = self.tray.as_mut() {
+            t.update(
+                IconFace::for_pct(pct),
+                tray::tooltip_in(pct, resets_at, failed, &Local),
+            );
+            t.set_pill_checked(pill);
+        }
+    }
+
+    /// Create the tray icon (on the main thread) when the setting is on and
+    /// it does not exist yet; drop it when the setting is off.
+    fn sync_tray_presence(&mut self, ctx: &egui::Context) {
+        if !self.settings.tray_enabled {
+            self.tray_failed = false;
+            self.tray = None;
+        } else if self.tray.is_none() && !self.tray_failed {
+            match Tray::create(ctx, self.settings.ui_mode == UiMode::Pill) {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => {
+                    self.tray_failed = true;
+                    let _ = crash::append(
+                        &Paths::platform_default(),
+                        Local::now(),
+                        &format!("Tray icon unavailable: {e}"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
+        match action {
+            TrayAction::ToggleVisible => {
+                let minimized = ctx.input(|i| i.viewport().minimized) == Some(true);
+                if self.hidden || minimized {
+                    self.show(ctx);
+                } else {
+                    self.hide(ctx);
+                }
+            }
+            TrayAction::PillMenu => {
+                let pill = self.tray.as_ref().is_some_and(Tray::pill_checked);
+                if self.hidden {
+                    self.show(ctx);
+                }
+                self.set_mode(ctx, if pill { UiMode::Pill } else { UiMode::Full });
+            }
+            TrayAction::Refresh => {
+                if refresh_ready(self.last_refresh, Instant::now()) {
+                    self.refresh_now();
+                }
+            }
+            TrayAction::Quit => self.quit(ctx),
+        }
+    }
 
     /// Hand this frame's motion preferences to the widgets and advance the
     /// near-cap pulse; asks for the next pulse frame only while it moves
@@ -383,7 +517,7 @@ impl App {
                     self.toggle_settings();
                 }
             }
-            PillAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            PillAction::Quit => self.quit(&ctx),
         }
     }
 
@@ -482,7 +616,9 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = Instant::now();
         self.track_window(ctx, frame);
+        self.handle_close_request(ctx);
         self.drain_events();
+        self.sync_tray(ctx);
         self.sync_settings(frame);
         self.background_hooks(now);
         // Keeps "last polled" and the countdowns ticking; eframe throttles
