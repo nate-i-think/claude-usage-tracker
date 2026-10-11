@@ -785,6 +785,28 @@ mod tests {
     }
 
     #[test]
+    fn current_usage_keys_keep_insertion_order() {
+        let (_tmp, paths) = temp_paths();
+        write_latest(&paths, &snapshot(30, 42.0, 3600));
+        let u = current_usage(&paths, &cfg(), now());
+        let keys: Vec<&str> = u.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "available",
+                "as_of",
+                "age_seconds",
+                "stale",
+                "windows",
+                "five_hour",
+                "extra",
+                "recommendation",
+                "summary"
+            ]
+        );
+    }
+
+    #[test]
     fn stale_snapshot() {
         let (_tmp, paths) = temp_paths();
         write_latest(&paths, &snapshot(181, 42.0, 3600));
