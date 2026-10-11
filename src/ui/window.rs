@@ -261,9 +261,12 @@ pub fn grab_strip(window: PxRect, height: i32) -> PxRect {
 
 /// The top-left for `window` (outer rect, pixels) that keeps at least
 /// `visible` (width, height) of it on `work` with its top edge inside, moving
-/// it as little as possible. A work area smaller than `visible` pins it to
-/// the work area's left/top instead of panicking.
+/// it as little as possible. `visible` is capped at the window's own size,
+/// so a window smaller than it (the pill) can sit flush on an edge. A work
+/// area smaller than `visible` pins it to the work area's left/top instead
+/// of panicking.
 pub fn keep_visible(window: PxRect, work: PxRect, visible: (i32, i32)) -> Pos {
+    let visible = capped_visible(window, visible);
     let clamp = |v: i32, lo: i32, hi: i32| v.min(hi).max(lo);
     Pos {
         x: clamp(
@@ -273,6 +276,14 @@ pub fn keep_visible(window: PxRect, work: PxRect, visible: (i32, i32)) -> Pos {
         ),
         y: clamp(window.top, work.top, work.bottom - visible.1),
     }
+}
+
+/// `visible` (width, height) no larger than `window` itself.
+pub fn capped_visible(window: PxRect, visible: (i32, i32)) -> (i32, i32) {
+    (
+        visible.0.min(window.width().max(0)),
+        visible.1.min((window.bottom - window.top).max(0)),
+    )
 }
 
 /// The full-mode rect to save for this frame's viewport: outer position in
@@ -445,7 +456,7 @@ mod win32 {
         GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
-    use super::{grab_strip, keep_visible, PxRect, MIN_VISIBLE};
+    use super::{capped_visible, grab_strip, keep_visible, PxRect, MIN_VISIBLE};
     use crate::config::Pos;
 
     fn to_px(r: RECT) -> PxRect {
@@ -490,9 +501,12 @@ mod win32 {
             };
             let dpi = GetDpiForWindow(hwnd);
             let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-            let visible = (
-                (MIN_VISIBLE.x * scale).round() as i32,
-                (MIN_VISIBLE.y * scale).round() as i32,
+            let visible = capped_visible(
+                window,
+                (
+                    (MIN_VISIBLE.x * scale).round() as i32,
+                    (MIN_VISIBLE.y * scale).round() as i32,
+                ),
             );
             let strip = to_rect(grab_strip(window, visible.1));
             let monitor = MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST);
@@ -793,6 +807,33 @@ mod tests {
             keep_visible(win(-5000, -400), work, vis),
             Pos { x: 270 - 973, y: 0 }
         );
+    }
+
+    #[test]
+    fn keep_visible_leaves_a_pill_flush_in_the_corner() {
+        // 300x44 pt at 225 % = 675x99 px; MIN_VISIBLE asks for 270x108 px,
+        // more than the pill is tall: capped at the window's own size.
+        let work = px(0, 0, 3840, 2100);
+        let pill = px(3840 - 675, 2100 - 99, 3840, 2100);
+        assert_eq!(
+            keep_visible(pill, work, (270, 108)),
+            Pos {
+                x: 3840 - 675,
+                y: 2100 - 99
+            }
+        );
+        // Below the bottom edge it comes back fully, flush, not 9 px higher.
+        let low = px(100, 2050, 775, 2149);
+        assert_eq!(
+            keep_visible(low, work, (270, 108)),
+            Pos {
+                x: 100,
+                y: 2100 - 99
+            }
+        );
+        // A window narrower than the visible width keeps its whole width on.
+        let narrow = px(-500, 0, -400, 50);
+        assert_eq!(keep_visible(narrow, work, (270, 108)), Pos { x: 0, y: 0 });
     }
 
     #[test]
