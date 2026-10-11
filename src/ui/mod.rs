@@ -6,10 +6,16 @@
 //! fonts and spacing come from [`theme`], the one source of visual truth.
 
 pub mod app;
+pub mod banners;
 pub mod charts;
+pub mod chips;
+pub mod details;
 pub mod digits;
+pub mod footer;
+pub mod layout;
 pub mod rows;
 pub mod settings;
+pub mod sparkline;
 pub mod theme;
 pub mod timeline;
 pub mod window;
