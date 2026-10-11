@@ -30,7 +30,6 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.36.2", features = ["persistence"] }
-egui_plot = "0.37.0"
 tempfile = "3"
 
 [profile.release]
