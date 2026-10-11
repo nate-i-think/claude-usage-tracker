@@ -716,6 +716,74 @@ mod tests {
         assert_eq!(u["summary"], "5-hour 42% · resets in 1h 00m");
     }
 
+    /// Contract between the writer (GUI/CLI) and the MCP reader: a Snapshot
+    /// written by storage must come back intact through current_usage.
+    #[test]
+    fn storage_written_snapshot_round_trips_through_current_usage() {
+        use crate::model::{ExtraUsage, Snapshot, UsageWindow};
+        let (_tmp, paths) = temp_paths();
+        let fetched = now() - Duration::seconds(20);
+        let snap = Snapshot {
+            fetched_at: fetched,
+            windows: vec![
+                UsageWindow {
+                    label: "5-hour".into(),
+                    utilization: Some(37.5),
+                    resets_at: Some(now() + Duration::seconds(5400)),
+                },
+                UsageWindow {
+                    label: "7-day all".into(),
+                    utilization: Some(61.0),
+                    resets_at: Some(now() + Duration::days(2)),
+                },
+                UsageWindow {
+                    label: "Fable".into(),
+                    utilization: None,
+                    resets_at: None,
+                },
+            ],
+            extra: Some(ExtraUsage {
+                enabled: true,
+                monthly_limit: 75.0,
+                used_credits: 12.34,
+                utilization: 16.45,
+                currency: "EUR".into(),
+                disabled_reason: None,
+            }),
+        };
+        storage::write_latest_snapshot(&paths, &snap).unwrap();
+
+        let u = current_usage(&paths, &cfg(), now());
+        assert_eq!(u["available"], true);
+        assert_eq!(u["age_seconds"], 20);
+        assert_eq!(u["stale"], false);
+        let labels: Vec<&str> = u["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["5-hour", "7-day all", "Fable"]);
+        assert_eq!(u["windows"][0]["utilization_pct"], 37.5);
+        assert_eq!(u["windows"][0]["resets_in_seconds"], 5400);
+        assert_eq!(u["windows"][1]["utilization_pct"], 61.0);
+        assert_eq!(u["windows"][1]["resets_in_seconds"], 2 * 86_400);
+        assert_eq!(u["windows"][2]["utilization_pct"], Value::Null);
+        assert_eq!(u["windows"][2]["resets_in_seconds"], Value::Null);
+        assert_eq!(u["five_hour"]["utilization_pct"], 37.5);
+        assert_eq!(
+            u["extra"],
+            json!({
+                "enabled": true,
+                "monthly_limit": 75.0,
+                "used_credits": 12.34,
+                "utilization": 16.45,
+                "currency": "EUR",
+                "disabled_reason": null,
+            })
+        );
+    }
+
     #[test]
     fn stale_snapshot() {
         let (_tmp, paths) = temp_paths();
