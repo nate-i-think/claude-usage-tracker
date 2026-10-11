@@ -2,8 +2,8 @@
   "mcpServers": {
     "claude-usage": {
       "type": "stdio",
-      "command": "python",
-      "args": ["mcp_server.py"]
+      "command": "target/release/claude-usage-cli",
+      "args": ["mcp"]
     }
   }
 }

@@ -31,8 +31,14 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.36.2", features = ["persistence"] }
 tempfile = "3"
+rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "io-std"] }
+schemars = "1"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+rmcp = { version = "=3.5.1", features = ["client", "server", "macros"] }

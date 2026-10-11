@@ -5,6 +5,7 @@ pub mod config;
 pub mod cookies;
 pub mod debug_report;
 pub mod fetch;
+pub mod mcp;
 pub mod model;
 pub mod paths;
 pub mod poller;
