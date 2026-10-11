@@ -45,4 +45,6 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+# Already in the tree via epaint; tests read font charmaps with it.
+skrifa = "=0.44.0"
 rmcp = { version = "=3.5.1", features = ["client", "server", "macros"] }
