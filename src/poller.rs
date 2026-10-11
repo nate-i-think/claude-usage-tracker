@@ -37,8 +37,6 @@ pub struct Dashboard {
     pub history: Vec<Sample>,
     /// In-memory Fable weekly samples, oldest first.
     pub fable_history: Vec<Sample>,
-    pub five_hour_buckets: Vec<Sample>,
-    pub fable_buckets: Vec<Sample>,
     pub daily_history: Vec<(NaiveDate, Option<f64>)>,
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     pub burners: Vec<InstanceUsage>,
@@ -225,14 +223,12 @@ fn build_dashboard(
     let window_end = snapshot
         .five_hour_resets_at()
         .unwrap_or(ws + ChronoDuration::hours(5));
-    // One history read feeds all four charts and the window samples.
+    // One history read feeds the 7-day rollups and the window samples.
     let rollups = storage::rollups(paths, ws, window_end, DAILY_DAYS, now);
     let window_samples = with_current_sample(rollups.window_samples, &snapshot, ws, window_end);
     Dashboard {
         history: history.five_hour(),
         fable_history: history.fable(),
-        five_hour_buckets: rollups.five_hour,
-        fable_buckets: rollups.fable_five_hour,
         daily_history: rollups.daily,
         fable_daily: rollups.fable_daily,
         burners: storage::attribute_recent(&dirs.claude_code, &dirs.cowork, ws),
@@ -774,14 +770,12 @@ mod tests {
             d.window_start,
             d.snapshot.five_hour_resets_at().unwrap() - ChronoDuration::hours(5)
         );
-        assert_eq!(d.five_hour_buckets.len(), 10);
-        assert_eq!(d.fable_buckets.len(), 10);
         assert_eq!(d.daily_history.len(), DAILY_DAYS);
         assert_eq!(d.fable_daily.len(), DAILY_DAYS);
         assert!(d.burners.is_empty());
         assert_eq!(d.persist_error, None);
-        // The just-appended sample lands in the current 30-minute bucket.
-        assert!(d.five_hour_buckets.iter().any(|(_, v)| *v == Some(42.0)));
+        // The just-appended sample is in the window samples.
+        assert!(d.window_samples.iter().any(|s| s.five_hour == Some(42.0)));
     }
 
     #[test]

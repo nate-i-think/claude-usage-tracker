@@ -113,8 +113,6 @@ mod tests {
             },
             history: Vec::new(),
             fable_history: Vec::new(),
-            five_hour_buckets: Vec::new(),
-            fable_buckets: Vec::new(),
             daily_history: Vec::new(),
             fable_daily: Vec::new(),
             burners: Vec::new(),

@@ -19,11 +19,6 @@ use crate::analytics::{project_display_name, WindowSample};
 use crate::model::{ExtraUsage, Snapshot};
 use crate::paths::Paths;
 
-/// Width of one chart bucket in the five-hour window.
-const BUCKET_MINUTES: i64 = crate::analytics::CHART_BUCKET_MINUTES;
-/// Length of the five-hour window, in minutes.
-const WINDOW_MINUTES: i64 = 300;
-
 /// One row of history.jsonl. Field names are the on-disk schema shared with
 /// the Python app; do not rename.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -189,37 +184,13 @@ fn iso(dt: DateTime<Utc>) -> String {
 
 // --- Rollups for charts ----------------------------------------------------
 
-/// 5-hour utilization in 30-minute buckets across the window starting at
-/// `window_start`.
-pub fn five_hour_buckets(
-    paths: &Paths,
-    window_start: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Vec<(DateTime<Utc>, Option<f64>)> {
-    let rows = read_recent(paths, window_start);
-    window_buckets(&rows, window_start, now, |e| e.five_hour)
-}
-
-/// Fable weekly-% at the same buckets as [`five_hour_buckets`] (aligned
-/// indices), so the 5-hour chart can show the Fable rise across the window.
-pub fn fable_five_hour_buckets(
-    paths: &Paths,
-    window_start: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Vec<(DateTime<Utc>, Option<f64>)> {
-    let rows = read_recent(paths, window_start);
-    window_buckets(&rows, window_start, now, |e| e.fable_7d)
-}
-
-/// All four chart rollups, plus the raw samples of the five-hour window, from
-/// a single read of history.jsonl. The rollups are identical to calling
-/// [`five_hour_buckets`], [`fable_five_hour_buckets`], [`daily_history`] and
-/// [`fable_daily_history`] separately, but the history is read and parsed
-/// once (from the earliest cutoff any of them needs).
+/// The daily rollups plus the raw samples of the five-hour window, from a
+/// single read of history.jsonl. The rollups are identical to calling
+/// [`daily_history`] and [`fable_daily_history`] separately, but the
+/// history is read and parsed once (from the earliest cutoff any of them
+/// needs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rollups {
-    pub five_hour: Vec<(DateTime<Utc>, Option<f64>)>,
-    pub fable_five_hour: Vec<(DateTime<Utc>, Option<f64>)>,
     pub daily: Vec<(NaiveDate, Option<f64>)>,
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     /// Every row in `[window_start, window_end)`, oldest first.
@@ -240,8 +211,6 @@ pub fn rollups(
     };
     let rows = read_recent(paths, since);
     Rollups {
-        five_hour: window_buckets(&rows, window_start, now, |e| e.five_hour),
-        fable_five_hour: window_buckets(&rows, window_start, now, |e| e.fable_7d),
         daily: daily_max(&rows, days, now, |e| e.seven_day),
         fable_daily: daily_max(&rows, days, now, |e| e.fable_7d),
         window_samples: window_samples(&rows, window_start, window_end),
@@ -271,51 +240,6 @@ fn window_samples(
     // The file is append-only, but concurrent writers can interleave.
     samples.sort_by_key(|s| s.t);
     samples
-}
-
-/// Bucket one field over the five-hour window: max per bucket. Buckets that
-/// have started (start <= now) with no sample carry the previous value
-/// forward (utilization is monotonic within a window); later buckets are
-/// left as they are (None unless they hold a sample).
-///
-/// `rows` may hold entries outside the window; they are ignored.
-fn window_buckets(
-    rows: &[HistoryEntry],
-    window_start: DateTime<Utc>,
-    now: DateTime<Utc>,
-    field: impl Fn(&HistoryEntry) -> Option<f64>,
-) -> Vec<(DateTime<Utc>, Option<f64>)> {
-    let n = (WINDOW_MINUTES / BUCKET_MINUTES) as usize;
-    let times: Vec<DateTime<Utc>> = (0..n as i64)
-        .map(|i| window_start + Duration::minutes(BUCKET_MINUTES * i))
-        .collect();
-    let start_ts = unix_seconds(window_start);
-    let end_ts = unix_seconds(window_start + Duration::minutes(WINDOW_MINUTES));
-    let mut buckets: Vec<Option<f64>> = vec![None; n];
-
-    for e in rows {
-        let Some(val) = field(e) else { continue };
-        if e.ts < start_ts || e.ts >= end_ts {
-            continue;
-        }
-        let idx = ((e.ts - start_ts) / 60.0 / BUCKET_MINUTES as f64) as usize;
-        if let Some(slot) = buckets.get_mut(idx) {
-            *slot = Some(slot.map_or(val, |cur| cur.max(val)));
-        }
-    }
-
-    let mut last: Option<f64> = None;
-    for (slot, t) in buckets.iter_mut().zip(&times) {
-        if *t > now {
-            break;
-        }
-        match *slot {
-            None => *slot = last,
-            Some(v) => last = Some(v),
-        }
-    }
-
-    times.into_iter().zip(buckets).collect()
 }
 
 /// Last `days` local calendar days of 7-day utilization, max per day,
@@ -942,65 +866,6 @@ mod tests {
         assert_eq!(read_latest_snapshot(&paths), None);
     }
 
-    // --- five-hour buckets ------------------------------------------------------
-
-    #[test]
-    fn buckets_max_carry_forward_and_future_none() {
-        let (_tmp, paths) = temp_paths();
-        let ws = utc(2026, 10, 11, 10, 0, 0);
-        let at = |h, m| utc(2026, 10, 11, h, m, 0);
-        write_history(
-            &paths,
-            &[
-                row(at(9, 59), "five_hour", 99.0), // before window
-                row(at(10, 5), "five_hour", 5.0),
-                row(at(10, 20), "five_hour", 8.0), // bucket 0 max
-                row(at(10, 25), "five_hour", 6.0),
-                json!({"ts": unix_seconds(at(10, 40)), "five_hour": null}).to_string(),
-                row(at(11, 0), "five_hour", 12.0), // bucket 2
-                row(at(15, 0), "five_hour", 77.0), // window end (exclusive)
-            ],
-        );
-        let now = at(11, 40);
-        let got = five_hour_buckets(&paths, ws, now);
-
-        assert_eq!(got.len(), 10);
-        let times: Vec<DateTime<Utc>> = got.iter().map(|(t, _)| *t).collect();
-        let expected_times: Vec<DateTime<Utc>> =
-            (0..10).map(|i| ws + Duration::minutes(30 * i)).collect();
-        assert_eq!(times, expected_times);
-
-        let vals: Vec<Option<f64>> = got.iter().map(|(_, v)| *v).collect();
-        let mut expected = vec![Some(8.0), Some(8.0), Some(12.0), Some(12.0)];
-        expected.extend([None; 6]);
-        assert_eq!(vals, expected);
-    }
-
-    #[test]
-    fn buckets_empty_history_all_none() {
-        let (_tmp, paths) = temp_paths();
-        let ws = utc(2026, 10, 11, 10, 0, 0);
-        let got = five_hour_buckets(&paths, ws, ws + Duration::hours(6));
-        assert!(got.iter().all(|(_, v)| v.is_none()));
-    }
-
-    #[test]
-    fn fable_buckets_use_fable_field() {
-        let (_tmp, paths) = temp_paths();
-        let ws = utc(2026, 10, 11, 10, 0, 0);
-        write_history(
-            &paths,
-            &[json!({"ts": unix_seconds(ws + Duration::minutes(45)),
-                       "five_hour": 50.0, "fable_7d": 3.0})
-            .to_string()],
-        );
-        let got = fable_five_hour_buckets(&paths, ws, ws + Duration::minutes(70));
-        let vals: Vec<Option<f64>> = got.iter().map(|(_, v)| *v).collect();
-        let mut expected = vec![None, Some(3.0), Some(3.0)];
-        expected.extend([None; 7]);
-        assert_eq!(vals, expected);
-    }
-
     // --- daily history ------------------------------------------------------------
 
     #[test]
@@ -1063,19 +928,13 @@ mod tests {
 
         for days in [0, 1, 7] {
             let got = rollups(&paths, ws, ws + Duration::hours(5), days, now);
-            assert_eq!(got.five_hour, five_hour_buckets(&paths, ws, now));
-            assert_eq!(
-                got.fable_five_hour,
-                fable_five_hour_buckets(&paths, ws, now)
-            );
             assert_eq!(got.daily, daily_history(&paths, days, now));
             assert_eq!(got.fable_daily, fable_daily_history(&paths, days, now));
         }
         // Window older than the daily range: the window cutoff wins.
         let old_ws = now - Duration::days(8);
         let got = rollups(&paths, old_ws, old_ws + Duration::hours(5), 7, now);
-        assert_eq!(got.five_hour, five_hour_buckets(&paths, old_ws, now));
-        assert!(got.five_hour.iter().any(|(_, v)| v.is_some()));
+        assert!(got.window_samples.iter().any(|w| w.five_hour.is_some()));
         assert_eq!(got.daily, daily_history(&paths, 7, now));
     }
 
