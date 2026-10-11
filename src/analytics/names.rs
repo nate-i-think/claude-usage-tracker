@@ -3,8 +3,28 @@
 use crate::paths;
 
 /// Longest name returned by [`prettify_project`], in characters, including
-/// the trailing "…" of a truncated name.
+/// the leading "…" of a truncated name.
 pub const PROJECT_NAME_CHARS: usize = 24;
+
+/// The burner-row name of a Claude Code project: the last component of its
+/// working directory (`cwd`, as recorded in its session lines) when known,
+/// else [`prettify_project`] of the directory name. Truncated the same way.
+pub fn project_display_name(dir_name: &str, cwd: Option<&str>) -> String {
+    match cwd.and_then(last_path_component) {
+        Some(last) => truncate(last),
+        None => prettify_project(dir_name),
+    }
+}
+
+/// The last component of a Windows or POSIX path (either separator;
+/// trailing separators ignored), or `None` when there is none: empty, a
+/// root (`/`), or a bare drive (`C:`, `C:\`).
+pub fn last_path_component(path: &str) -> Option<&str> {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|c| !c.is_empty() && !c.ends_with(':'))
+}
 
 /// A short readable name for a Claude Code project directory name, using
 /// the current user's home directory. See [`prettify_project_in`].
@@ -37,10 +57,11 @@ pub fn encode_project_path(path: &str) -> String {
 /// 3. If what is left holds `---` (a separator followed by a folder that
 ///    began with `.` or `_`, e.g. `Documents\__tomos`), keep the part after
 ///    the last `---`; otherwise keep it all.
-/// 4. Truncate to [`PROJECT_NAME_CHARS`] with "…".
+/// 4. Truncate to [`PROJECT_NAME_CHARS`], keeping the end (what tells rows
+///    apart) behind a leading "…".
 ///
 /// So `C--Users-Nathan-Myers-Documents---tomos-claude-usage-monitor` reads
-/// `tomos-claude-usage-moni…` and `C--Users-Nathan-Myers-Desktop-gitfiti`
+/// `…os-claude-usage-monitor` and `C--Users-Nathan-Myers-Desktop-gitfiti`
 /// reads `Desktop-gitfiti`.
 pub fn prettify_project_in(name: &str, home: &str) -> String {
     if name.starts_with("cowork:") {
@@ -91,8 +112,9 @@ fn truncate(name: &str) -> String {
     if name.chars().count() <= PROJECT_NAME_CHARS {
         return name.to_owned();
     }
-    let mut short: String = name.chars().take(PROJECT_NAME_CHARS - 1).collect();
-    short.push('…');
+    let skip = name.chars().count() - (PROJECT_NAME_CHARS - 1);
+    let mut short = String::from('…');
+    short.extend(name.chars().skip(skip));
     short
 }
 
@@ -123,13 +145,13 @@ mod tests {
     fn this_machines_names() {
         assert_eq!(
             pretty("C--Users-Nathan-Myers-Documents---tomos-claude-usage-monitor"),
-            "tomos-claude-usage-moni…"
+            "…os-claude-usage-monitor"
         );
         assert_eq!(
             pretty(
                 "C--Users-Nathan-Myers-Documents---tomos-3---Tomos-Firmware-01-blakey-pico-test"
             ),
-            "Tomos-Firmware-01-blake…"
+            "…are-01-blakey-pico-test"
         );
         assert_eq!(
             pretty("C--Users-Nathan-Myers-Desktop-gitfiti"),
@@ -187,7 +209,41 @@ mod tests {
         let long = "é".repeat(PROJECT_NAME_CHARS + 1);
         let got = pretty(&long);
         assert_eq!(got.chars().count(), PROJECT_NAME_CHARS);
-        assert_eq!(got, "é".repeat(PROJECT_NAME_CHARS - 1) + "…");
+        assert_eq!(got, "…".to_owned() + &"é".repeat(PROJECT_NAME_CHARS - 1));
+        // The tail is kept: it is what tells rows apart.
+        let got = pretty(&format!("{}-frontend", "x".repeat(30)));
+        assert_eq!(got, format!("…{}-frontend", "x".repeat(14)));
+    }
+
+    #[test]
+    fn display_name_prefers_cwd_last_component() {
+        let dir = "C--Users-Nathan-Myers-Documents---tomos-claude-usage-monitor";
+        let win = r"C:\Users\Nathan Myers\Documents\__tomos\claude-usage-monitor";
+        assert_eq!(project_display_name(dir, Some(win)), "claude-usage-monitor");
+        assert_eq!(
+            project_display_name("-home-bob-w", Some("/home/bob/w/")),
+            "w"
+        );
+        // No cwd, or one without a usable component: the prettified dir name.
+        assert_eq!(project_display_name("proj-b", None), "proj-b");
+        assert_eq!(project_display_name("proj-b", Some("")), "proj-b");
+        assert_eq!(
+            project_display_name("x", Some("/srv/a-very-long-project-name-indeed")),
+            "…ong-project-name-indeed"
+        );
+    }
+
+    #[test]
+    fn last_path_component_windows_and_posix() {
+        assert_eq!(last_path_component(r"C:\a\b c"), Some("b c"));
+        assert_eq!(last_path_component(r"C:\a\b\"), Some("b"));
+        assert_eq!(last_path_component("/home/bob/proj"), Some("proj"));
+        assert_eq!(last_path_component(r"C:/mixed\sep"), Some("sep"));
+        assert_eq!(last_path_component("relative"), Some("relative"));
+        assert_eq!(last_path_component("/"), None);
+        assert_eq!(last_path_component(r"C:\"), None);
+        assert_eq!(last_path_component("C:"), None);
+        assert_eq!(last_path_component(""), None);
     }
 
     #[test]

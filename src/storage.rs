@@ -15,7 +15,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc}
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::analytics::WindowSample;
+use crate::analytics::{project_display_name, WindowSample};
 use crate::model::{ExtraUsage, Snapshot};
 use crate::paths::Paths;
 
@@ -39,7 +39,12 @@ pub struct HistoryEntry {
 /// Tokens used by one local Claude Code project or Cowork session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceUsage {
+    /// The project directory name, or `cowork:<id>`.
     pub name: String,
+    /// What the burner rows show: the last component of the project's most
+    /// recent session `cwd`, else the prettified directory name; Cowork
+    /// sessions keep `name`.
+    pub display_name: String,
     /// `"claude-code"` or `"cowork"`.
     pub source: &'static str,
     pub tokens: u64,
@@ -412,11 +417,13 @@ pub fn attribute_recent(
             .filter(|p| p.is_file() && has_jsonl_ext(p))
             .collect();
         if let Some(usage) = scan_instance(&files, window_start) {
+            let name = file_name(&project_dir);
             out.push(InstanceUsage {
-                name: file_name(&project_dir),
+                display_name: project_display_name(&name, usage.cwd.as_deref()),
+                name,
                 source: "claude-code",
-                tokens: usage.0,
-                last_active: usage.1,
+                tokens: usage.tokens,
+                last_active: usage.last_active,
             });
         }
     }
@@ -432,11 +439,13 @@ pub fn attribute_recent(
         collect_jsonls(&session_dir, &mut files);
         if let Some(usage) = scan_instance(&files, window_start) {
             let short: String = file_name(&session_dir).chars().skip(6).take(8).collect();
+            let name = format!("cowork:{short}");
             out.push(InstanceUsage {
-                name: format!("cowork:{short}"),
+                display_name: name.clone(),
+                name,
                 source: "cowork",
-                tokens: usage.0,
-                last_active: usage.1,
+                tokens: usage.tokens,
+                last_active: usage.last_active,
             });
         }
     }
@@ -445,21 +454,33 @@ pub fn attribute_recent(
     out
 }
 
-/// `(tokens, last_active)` across `files`, or `None` when no tokens were used.
-fn scan_instance(files: &[PathBuf], window_start: DateTime<Utc>) -> Option<(u64, DateTime<Utc>)> {
-    let (tokens, last_ts) = scan_jsonls(files, window_start);
-    (tokens > 0).then(|| {
-        let last = from_unix_seconds(last_ts).unwrap_or(window_start);
-        (tokens as u64, last)
+/// What one instance's session files say about the window.
+struct InstanceScan {
+    tokens: u64,
+    last_active: DateTime<Utc>,
+    /// The non-empty `cwd` of the latest timestamped entry that has one.
+    cwd: Option<String>,
+}
+
+/// The scan of `files`, or `None` when no tokens were used.
+fn scan_instance(files: &[PathBuf], window_start: DateTime<Utc>) -> Option<InstanceScan> {
+    let (tokens, last_ts, cwd) = scan_jsonls(files, window_start);
+    (tokens > 0).then(|| InstanceScan {
+        tokens: tokens as u64,
+        last_active: from_unix_seconds(last_ts).unwrap_or(window_start),
+        cwd,
     })
 }
 
 /// Sum tokens of entries at or after `window_start`; also the latest entry
-/// timestamp (starting from the cutoff itself).
-fn scan_jsonls(files: &[PathBuf], window_start: DateTime<Utc>) -> (i64, f64) {
+/// timestamp (starting from the cutoff itself), and the `cwd` of the latest
+/// timestamped entry carrying a non-empty one (older entries of a scanned
+/// file count too: the directory rarely changes).
+fn scan_jsonls(files: &[PathBuf], window_start: DateTime<Utc>) -> (i64, f64, Option<String>) {
     let cutoff = unix_seconds(window_start);
     let mut tokens: i64 = 0;
     let mut last_ts = cutoff;
+    let mut cwd: Option<(f64, String)> = None;
     for path in files {
         if modified_before(path, window_start) {
             continue;
@@ -470,6 +491,11 @@ fn scan_jsonls(files: &[PathBuf], window_start: DateTime<Utc>) -> (i64, f64) {
                 continue;
             };
             let Some(ts) = extract_ts(&d) else { continue };
+            if let Some(dir) = d.get("cwd").and_then(Value::as_str) {
+                if !dir.is_empty() && cwd.as_ref().is_none_or(|(at, _)| ts >= *at) {
+                    cwd = Some((ts, dir.to_owned()));
+                }
+            }
             if ts < cutoff {
                 continue;
             }
@@ -479,7 +505,7 @@ fn scan_jsonls(files: &[PathBuf], window_start: DateTime<Utc>) -> (i64, f64) {
             }
         }
     }
-    (tokens, last_ts)
+    (tokens, last_ts, cwd.map(|(_, dir)| dir))
 }
 
 fn modified_before(path: &Path, t: DateTime<Utc>) -> bool {
@@ -1164,22 +1190,92 @@ mod tests {
             vec![
                 InstanceUsage {
                     name: "proj-b".into(),
+                    display_name: "proj-b".into(),
                     source: "claude-code",
                     tokens: 507,
                     last_active: cutoff + Duration::minutes(1),
                 },
                 InstanceUsage {
                     name: "cowork:abcdef12".into(),
+                    display_name: "cowork:abcdef12".into(),
                     source: "cowork",
                     tokens: 200,
                     last_active: utc(2026, 10, 11, 12, 0, 0),
                 },
                 InstanceUsage {
                     name: "proj-a".into(),
+                    display_name: "proj-a".into(),
                     source: "claude-code",
                     tokens: 105,
                     last_active: utc(2026, 10, 11, 11, 0, 0),
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn attribution_display_names_from_latest_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cc = tmp.path().join("projects");
+        let cutoff = utc(2026, 10, 11, 10, 0, 0);
+        let s = unix_seconds(cutoff);
+        let used = |ts: f64, tokens: i64, cwd: Option<&str>| {
+            let mut v = json!({"ts": ts, "usage": {"input_tokens": tokens}});
+            if let Some(dir) = cwd {
+                v["cwd"] = json!(dir);
+            }
+            v
+        };
+
+        // Windows paths across two files; the latest non-empty cwd wins.
+        let win = cc.join("C--Users-x-Documents---tomos-claude-usage-monitor");
+        write_lines(
+            &win.join("a.jsonl"),
+            &[
+                used(s + 10.0, 100, Some(r"C:\Users\x\old-name")),
+                used(
+                    s + 30.0,
+                    1,
+                    Some(r"C:\Users\x\Documents\__tomos\claude-usage-monitor"),
+                ),
+            ],
+        );
+        write_lines(
+            &win.join("b.jsonl"),
+            &[
+                used(s + 20.0, 1, Some(r"C:\Users\x\middle")),
+                used(s + 40.0, 1, Some("")), // empty: ignored
+                json!({"cwd": r"C:\no-timestamp", "usage": {}}), // no ts: ignored
+            ],
+        );
+        // POSIX path, only on an entry from before the window.
+        write_lines(
+            &cc.join("-home-bob-widget").join("s.jsonl"),
+            &[
+                used(s - 600.0, 5, Some("/home/bob/widget")),
+                used(s + 5.0, 50, None),
+            ],
+        );
+        // No cwd at all: the prettified directory name.
+        write_lines(
+            &cc.join("F--MIMIC-III").join("s.jsonl"),
+            &[used(s + 5.0, 10, None)],
+        );
+
+        let got = attribute_recent(&cc, &tmp.path().join("cw"), cutoff);
+        let names: Vec<(&str, &str)> = got
+            .iter()
+            .map(|i| (i.name.as_str(), i.display_name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (
+                    "C--Users-x-Documents---tomos-claude-usage-monitor",
+                    "claude-usage-monitor"
+                ),
+                ("-home-bob-widget", "widget"),
+                ("F--MIMIC-III", "MIMIC-III"),
             ]
         );
     }
