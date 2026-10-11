@@ -24,7 +24,7 @@ const IMPORTANT_COOKIES: &[(&str, &str)] = &[
     ("anthropic-device-id", "device ID (sent as a header too)"),
 ];
 
-/// As the Python debug.py `_mask` (removed): "<none>" for no value; all
+/// As the Python debug.py `_mask` (removed): `"<none>"` for no value; all
 /// `*` when 15 characters or fewer; else the first and last 6 characters
 /// around "…" plus the length.
 pub fn mask(value: Option<&str>) -> String {

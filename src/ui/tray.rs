@@ -5,7 +5,7 @@
 //! The pure parts (icon pixels, tooltip text, event mapping, the close
 //! decision) are testable on any platform; [`Tray`] owns the native icon.
 //! Its event handlers only push a [`TrayAction`] into a channel and wake
-//! the app; [`crate::ui::App::logic`] drains it, so the tray works while the
+//! the app; `App::logic` ([`eframe::App::logic`]) drains it, so the tray works while the
 //! window is hidden.
 
 use std::fmt::Display;

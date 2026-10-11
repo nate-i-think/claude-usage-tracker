@@ -1,6 +1,6 @@
 //! Threshold alerts glue: after each new poll, decide which alerts fire
 //! ([`crate::analytics::alerts::evaluate`]) and hand their copy to the
-//! notifier thread ([`crate::notify`]). The edge state lives in
+//! notifier thread ([`crate::ui::notify`]). The edge state lives in
 //! [`Settings::alert_state`], so the app's usual settings sync persists it
 //! and a restart does not repeat an alert.
 
