@@ -11,6 +11,7 @@ pub mod digits;
 pub mod rows;
 pub mod settings;
 pub mod theme;
+pub mod window;
 
 pub use app::App;
 
