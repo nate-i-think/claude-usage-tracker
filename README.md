@@ -9,7 +9,7 @@ Written in Rust with [egui](https://github.com/emilk/egui). It ships two binarie
 ## What it shows
 
 - **Header**: plan label, plus buttons to refresh now, keep the window on top (📌), and open Settings.
-- **Usage windows**: one row per window (5-hour, 7-day, and per-model caps such as Fable) with utilization, a bar color-coded by threshold (green < 50%, yellow ≥ 50%, orange ≥ 75%, red ≥ 90%), and time to reset. 5-hour, 7-day, and Fable always show; other windows at 0% are hidden unless "Show all buckets" is on.
+- **Usage windows**: one row per window (5-hour, 7-day, and per-model caps such as Fable) with utilization, a bar color-coded by threshold (green < 50%, yellow ≥ 50%, orange ≥ 75%, red ≥ 90%), and time to reset. 5-hour, 7-day, and Fable show whenever the API reports them; other windows at 0% are hidden unless "Show all buckets" is on.
 - **Burn rate**: a 15-minute rolling rate for all usage (ALL) and for Fable, with a "→ 100% in X" projection. The rate is available right after a restart because it is seeded from the saved history.
 - **Extra usage**: credits used against your monthly limit, and why extra usage is disabled if it is.
 - **Charts**: the current 5-hour window in 30-minute buckets and the last 7 days by weekday, with the Fable share drawn as an orange segment at the bottom of each bar. Side by side when the window is wide, stacked when it is narrow.
@@ -39,7 +39,7 @@ just test         # cargo test
 just lint         # cargo clippy --all-targets -- -D warnings
 ```
 
-`just start` runs from the repo root, so it picks up the repo's `client_sha.txt` (see [Refreshing the client SHA](#refreshing-the-client-sha)). If you copy `claude-usage.exe` somewhere else or launch it from a shortcut, copy `client_sha.txt` next to it, or paste the SHA into Settings.
+`just start` runs from the repo root, so it picks up the repo's `client_sha.txt` (see [Refreshing the client SHA](#refreshing-the-client-sha)). If you copy `claude-usage.exe` somewhere else, or launch it from a shortcut whose "Start in" folder is not the repo root, copy `client_sha.txt` next to the exe or paste the SHA into Settings.
 
 Before the first run, sign in (next section) and make sure a current client SHA is available (the section after).
 
@@ -169,7 +169,7 @@ The data directory is:
 - macOS: `~/Library/Application Support/claude_usage_tui/`
 - Linux: `$XDG_DATA_HOME/claude_usage_tui/` (default `~/.local/share/claude_usage_tui/`)
 
-This is the same directory the Python version used, so existing history carries over.
+This is the same directory the Python version used with python.org (non-Store) Python, so that history carries over as is. If you ran the Python version with Microsoft Store Python, see [Migrating history from the Python version](#migrating-history-from-the-python-version).
 
 The GUI's settings (plan label, poll interval, show-all, always-on-top, cookie file path, client SHA) and its window geometry and theme are stored by eframe in `app.ron`:
 
@@ -186,6 +186,35 @@ This project used to be a Python terminal dashboard (`claude_usage_tui.py`). The
 - **`--no-fullscreen`**, which only made sense for the terminal UI.
 
 Other differences: `--once` and `--debug` became the `once` and `debug` subcommands of `claude-usage-cli`; the poll interval, plan label, cookie file, and client SHA are set in the GUI's Settings instead of on the command line; and the 5-hour chart labels the bucket that contains each hour rather than only buckets starting exactly on the hour.
+
+### Migrating history from the Python version
+
+With python.org Python, the Python version wrote `history.jsonl` to `%APPDATA%\claude_usage_tui\`, the directory the Rust app uses, so there is nothing to do.
+
+Microsoft Store Python virtualizes `%APPDATA%`: the Python version's files actually landed in
+
+```
+%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.<version>_<id>\LocalCache\Roaming\claude_usage_tui\
+```
+
+and the Rust app does not see them. To keep your chart history, merge that `history.jsonl` into `%APPDATA%\claude_usage_tui\history.jsonl`. Both versions use the same one-JSON-object-per-line schema. Close the GUI and any Python monitor first, then run in PowerShell:
+
+```powershell
+# The Store Python file (if you have several Python versions installed, set $old by hand).
+$old = Get-ChildItem "$env:LOCALAPPDATA\Packages\PythonSoftwareFoundation.Python.*\LocalCache\Roaming\claude_usage_tui\history.jsonl" |
+    Select-Object -First 1 -ExpandProperty FullName
+$new = "$env:APPDATA\claude_usage_tui\history.jsonl"
+
+New-Item -ItemType Directory -Force (Split-Path $new) | Out-Null
+if (Test-Path $new) { Copy-Item $new "$new.bak" }   # backup of the destination
+
+# Old rows plus new rows, blank lines dropped, sorted by timestamp, written as UTF-8 without BOM.
+$lines = (@(Get-Content $old) + @(if (Test-Path $new) { Get-Content $new })) | Where-Object { $_.Trim() }
+$sorted = $lines | Sort-Object { [double]([regex]::Match($_, '"ts":\s*([-0-9.eE+]+)').Groups[1].Value) }
+[IO.File]::WriteAllLines($new, [string[]]$sorted, (New-Object Text.UTF8Encoding $false))
+```
+
+It leaves the Store Python file untouched, and `history.jsonl.bak` holds the previous destination if you need to undo. Run it once: running it again duplicates the old rows.
 
 ## Caveats
 
