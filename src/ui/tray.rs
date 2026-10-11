@@ -272,6 +272,25 @@ fn cap_utf16(text: String, max: usize) -> String {
 #[cfg(windows)]
 pub use native::Tray;
 
+/// No tray outside Windows: [`Tray::create`] always fails.
+#[cfg(not(windows))]
+pub struct Tray;
+
+#[cfg(not(windows))]
+impl Tray {
+    pub fn create(_ctx: &eframe::egui::Context, _pill: bool) -> Result<Self, String> {
+        Err("no tray icon on this platform".to_owned())
+    }
+    pub fn try_recv(&self) -> Option<TrayAction> {
+        None
+    }
+    pub fn pill_checked(&self) -> bool {
+        false
+    }
+    pub fn set_pill_checked(&self, _on: bool) {}
+    pub fn update(&mut self, _face: IconFace, _tooltip: String) {}
+}
+
 #[cfg(windows)]
 mod native {
     use std::sync::mpsc::{channel, Receiver};
