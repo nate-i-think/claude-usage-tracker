@@ -11,9 +11,14 @@ fn main() -> eframe::Result {
     // The first window gets our own saved geometry; eframe's window
     // persistence is off (see ui::window).
     let settings = window::load_settings_early();
+    let viewport = window::viewport_builder(&settings, window::PlaceBy::for_platform());
+    let ours = viewport.clone();
     let options = eframe::NativeOptions {
-        viewport: window::viewport_builder(&settings, window::PlaceBy::for_platform()),
+        viewport,
         persist_window: false,
+        // eframe still applies a stale "window" key from older builds (until
+        // App::logic removes it); our geometry wins.
+        window_builder: Some(Box::new(move |b| window::keep_our_geometry(b, &ours))),
         ..Default::default()
     };
     let result = eframe::run_native(

@@ -137,6 +137,33 @@ pub fn viewport_builder(settings: &Settings, place_by: PlaceBy) -> ViewportBuild
     }
 }
 
+/// Storage key of eframe's own window geometry (private
+/// `STORAGE_WINDOW_KEY` in eframe's native/epi_integration.rs). eframe reads
+/// it even with `persist_window: false`, and builds before the redesign
+/// wrote it.
+pub const EFRAME_WINDOW_KEY: &str = "window";
+
+/// For `NativeOptions::window_builder`: put our geometry (`ours`, from
+/// [`viewport_builder`]) back over what eframe derived from a stale
+/// [`EFRAME_WINDOW_KEY`] (position, size, maximized, fullscreen).
+pub fn keep_our_geometry(mut eframe: ViewportBuilder, ours: &ViewportBuilder) -> ViewportBuilder {
+    eframe.position = ours.position;
+    eframe.inner_size = ours.inner_size;
+    eframe.maximized = ours.maximized;
+    eframe.fullscreen = ours.fullscreen;
+    eframe
+}
+
+/// Drop eframe's stale window geometry from storage; true if there was
+/// one (so the caller flushes).
+pub fn remove_stale_window_key(storage: &mut dyn eframe::Storage) -> bool {
+    let stale = storage.get_string(EFRAME_WINDOW_KEY).is_some();
+    if stale {
+        storage.remove_string(EFRAME_WINDOW_KEY);
+    }
+    stale
+}
+
 /// Inner size for a saved full rect: [`FULL_SIZE`] if none or non-finite,
 /// never below [`FULL_MIN`].
 pub fn sane_size(saved: Option<SavedRect>) -> Vec2 {
@@ -271,37 +298,66 @@ fn hwnd_of(
 /// Move the (still hidden) window to `placement`, kept on the work area of
 /// the monitor its title band overlaps most (or the nearest one, so it
 /// can't land in a gap of an L-shaped layout or on an unplugged monitor),
-/// then maximize it if it was. Call from `App::new` with its
-/// `CreationContext`.
+/// then maximize it if it was. Call from `App::new`.
+///
+/// Maximizing goes through winit so its window state stays in sync. Note
+/// that winit (like eframe's own `with_maximized`) maximizes with
+/// `ShowWindow(SW_MAXIMIZE)`, which shows the window before the first paint.
 #[cfg(windows)]
-pub fn apply_placement(handle: &impl raw_window_handle::HasWindowHandle, placement: Placement) {
-    use windows_sys::Win32::Foundation::RECT;
+pub fn apply_placement(cc: &eframe::CreationContext<'_>, placement: Placement) {
+    if let (Some(pos), Some(hwnd)) = (placement.pos, hwnd_of(cc)) {
+        // Second pass: moving across monitor scales resizes the window
+        // (winit keeps its logical size), so re-check with the new size.
+        let mut at = pos;
+        for _ in 0..2 {
+            if let Some(target) = win32::visible_target(hwnd, at) {
+                win32::move_to(hwnd, target);
+                at = target;
+            }
+        }
+    }
+    if placement.maximized {
+        if let Some(w) = cc.winit_window() {
+            w.set_maximized(true);
+        }
+    }
+}
+
+#[cfg(windows)]
+mod win32 {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-        SW_MAXIMIZE,
+        GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
-    let to_px = |r: RECT| PxRect {
-        left: r.left,
-        top: r.top,
-        right: r.right,
-        bottom: r.bottom,
-    };
-    let to_rect = |r: PxRect| RECT {
-        left: r.left,
-        top: r.top,
-        right: r.right,
-        bottom: r.bottom,
-    };
+    use super::{grab_strip, keep_visible, PxRect, MIN_VISIBLE};
+    use crate::config::Pos;
 
-    let Some(hwnd) = hwnd_of(handle) else {
-        return;
-    };
-    if let Some(pos) = placement.pos {
+    fn to_px(r: RECT) -> PxRect {
+        PxRect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        }
+    }
+
+    fn to_rect(r: PxRect) -> RECT {
+        RECT {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        }
+    }
+
+    /// Where the window (at its current outer size and DPI) should go if its
+    /// top-left were `pos`, kept visible on the best monitor.
+    pub(super) fn visible_target(hwnd: HWND, pos: Pos) -> Option<Pos> {
         let mut current = RECT {
             left: 0,
             top: 0,
@@ -311,48 +367,51 @@ pub fn apply_placement(handle: &impl raw_window_handle::HasWindowHandle, placeme
         // SAFETY: hwnd is our live top-level window; the out-pointers point
         // at locals of the right types.
         unsafe {
-            if GetWindowRect(hwnd, &mut current) != 0 {
-                let size = to_px(current);
-                let window = PxRect {
-                    left: pos.x,
-                    top: pos.y,
-                    right: pos.x + size.width(),
-                    bottom: pos.y + (size.bottom - size.top),
-                };
-                let dpi = GetDpiForWindow(hwnd);
-                let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-                let visible = (
-                    (MIN_VISIBLE.x * scale).round() as i32,
-                    (MIN_VISIBLE.y * scale).round() as i32,
-                );
-                let strip = to_rect(grab_strip(window, visible.1));
-                let monitor = MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST);
-                let mut info = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    rcMonitor: current,
-                    rcWork: current,
-                    dwFlags: 0,
-                };
-                let target = if GetMonitorInfoW(monitor, &mut info) != 0 {
-                    keep_visible(window, to_px(info.rcWork), visible)
-                } else {
-                    pos
-                };
-                SetWindowPos(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    target.x,
-                    target.y,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+            if GetWindowRect(hwnd, &mut current) == 0 {
+                return None;
             }
+            let size = to_px(current);
+            let window = PxRect {
+                left: pos.x,
+                top: pos.y,
+                right: pos.x + size.width(),
+                bottom: pos.y + (size.bottom - size.top),
+            };
+            let dpi = GetDpiForWindow(hwnd);
+            let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+            let visible = (
+                (MIN_VISIBLE.x * scale).round() as i32,
+                (MIN_VISIBLE.y * scale).round() as i32,
+            );
+            let strip = to_rect(grab_strip(window, visible.1));
+            let monitor = MonitorFromRect(&strip, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                rcMonitor: current,
+                rcWork: current,
+                dwFlags: 0,
+            };
+            Some(if GetMonitorInfoW(monitor, &mut info) != 0 {
+                keep_visible(window, to_px(info.rcWork), visible)
+            } else {
+                pos
+            })
         }
     }
-    if placement.maximized {
+
+    pub(super) fn move_to(hwnd: HWND, pos: Pos) {
         // SAFETY: hwnd is our live top-level window.
-        unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                pos.x,
+                pos.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
     }
 }
 
@@ -657,6 +716,71 @@ mod tests {
             full_state_to_save(UiMode::Full, &max_only, &s),
             (Some(old), true)
         );
+    }
+
+    /// A pre-redesign app.ron: eframe's "window" key says maximized at
+    /// 800x900 somewhere else; ours says a 440x500 normal window.
+    const STALE_APP_RON: &str = r#"{
+    "window": "(inner_position_pixels:Some((x:120.0,y:150.0)),outer_position_pixels:Some((x:100.0,y:100.0)),fullscreen:false,maximized:true,inner_size_points:Some((x:800.0,y:900.0)))",
+    "settings": "(plan:\"Max\",full_rect:Some((pos:(x:1350,y:338),w:440.0,h:500.0)),full_maximized:false)",
+    "egui": "()",
+}"#;
+
+    #[test]
+    fn stale_eframe_window_key_does_not_win() {
+        let s = settings_from_app_ron(STALE_APP_RON);
+        assert_eq!(s.full_rect, Some(saved(1350, 338, 440.0, 500.0)));
+        assert!(!s.full_maximized);
+
+        for place_by in [PlaceBy::Native, PlaceBy::Builder] {
+            let ours = viewport_builder(&s, place_by);
+            // What eframe's WindowSettings::initialize_viewport_builder does
+            // with the stale key.
+            let eframe_view = ours
+                .clone()
+                .with_position(Pos2::new(44.4, 44.4))
+                .with_inner_size(Vec2::new(800.0, 900.0))
+                .with_fullscreen(false)
+                .with_maximized(true);
+            let b = keep_our_geometry(eframe_view, &ours);
+            assert_eq!(b.position, ours.position);
+            assert_eq!(b.inner_size, Some(Vec2::new(440.0, 500.0)));
+            assert_eq!(b.maximized, ours.maximized);
+            assert_eq!(b.fullscreen, None);
+            // Everything else stays as eframe had it (ours, here).
+            assert_eq!(b.min_inner_size, ours.min_inner_size);
+            assert_eq!(b.title, ours.title);
+        }
+        assert_eq!(viewport_builder(&s, PlaceBy::Native).position, None);
+        assert_eq!(viewport_builder(&s, PlaceBy::Native).maximized, None);
+    }
+
+    #[derive(Default)]
+    struct MapStorage(HashMap<String, String>, usize);
+
+    impl eframe::Storage for MapStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.1 += 1;
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn stale_window_key_is_removed_once() {
+        let mut storage = MapStorage(ron::from_str(STALE_APP_RON).unwrap(), 0);
+        assert!(remove_stale_window_key(&mut storage));
+        assert!(!storage.0.contains_key(EFRAME_WINDOW_KEY));
+        assert!(storage.0.contains_key(SETTINGS_KEY) && storage.0.contains_key("egui"));
+        // Already gone: no remove (which would mark eframe's storage dirty).
+        assert!(!remove_stale_window_key(&mut storage));
+        assert_eq!(storage.1, 1);
     }
 
     #[test]
