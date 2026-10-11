@@ -115,3 +115,14 @@ Tasks 3, 4, 5 run in parallel. Tasks 10 and 11 run in parallel with the GUI task
 - Break the client SHA in settings, confirm the error banner and hint appear and the last good data stays visible.
 - Register `claude-usage-cli mcp` in Claude Code via `.mcp.json`, call `get_usage`, `wait(confirm=false)`, and a short `wait(seconds=5, confirm=true)`.
 - Check release binary startup time and idle CPU (should be near zero between repaints).
+
+## Implementation notes (as built)
+
+Where the shipped app differs from the design above:
+
+- **Charts**: drawn with egui's `Painter` (custom bars, axes, gridlines, and labels); `egui_plot` was dropped and is not a dependency.
+- **5-hour chart hour labels**: each hour label goes on the bucket that contains that hour boundary, not only on buckets that start exactly on the hour. Buckets start at `resets_at - 5h`, so on-the-hour starts are rare and the strict rule left the chart unlabeled.
+- **HTTP stack**: `reqwest` (blocking) with rustls on the `ring` provider and Firefox-like headers; the spike showed Cloudflare accepts it, so `wreq` was not needed.
+- **Time labels**: chart hour and weekday labels use local time.
+- **Burn history**: seeded from `history.jsonl` on startup (rows from the last 15 minutes), so the burn rate is available right after a restart, in the GUI and in `once`.
+- **Stale-SHA hint**: shown only when a 403 body contains `permission_error`, not for any 403 (Cloudflare 403s are not a SHA problem).
