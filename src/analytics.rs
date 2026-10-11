@@ -14,6 +14,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 
 use crate::model::{ExtraUsage, Snapshot, UsageWindow};
 
+pub mod alerts;
 mod names;
 mod timeline;
 
