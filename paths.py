@@ -27,6 +27,12 @@ def history_file() -> Path:
     return config_dir() / "history.jsonl"
 
 
+def latest_file() -> Path:
+    """Full most-recent snapshot, written each ping for out-of-process readers
+    (the MCP server). Unlike history.jsonl this keeps every window's resets_at."""
+    return config_dir() / "latest.json"
+
+
 def anonymous_id_file() -> Path:
     return config_dir() / "anonymous_id"
 

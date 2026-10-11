@@ -3,7 +3,7 @@
 claude_usage_tui.py — Real-time TUI for claude.ai Max-plan usage.
 
 Polls https://claude.ai/api/organizations/{org_id}/usage and renders a Rich
-dashboard: 5-hour / 7-day / Sonnet 7-day windows, current burn rate with
+dashboard: 5-hour / 7-day / per-model (Fable) windows, current burn rate with
 "100% in X" projection, side-by-side bar charts of the current 5h window
 and the last 7 days, plus per-instance attribution from local Claude Code
 and Cowork JSONLs.
@@ -46,7 +46,8 @@ except ImportError as e:
 from api import Snapshot, fetch_usage
 from debug import run_debug
 from storage import (
-    append_snapshot, attribute_recent, daily_history, five_hour_buckets,
+    append_snapshot, attribute_recent, daily_history, fable_daily_history,
+    fable_five_hour_buckets, five_hour_buckets,
 )
 from ui import render_dashboard, render_error
 
@@ -115,8 +116,16 @@ def main() -> None:
               file=sys.stderr)
 
     history: Deque[Tuple[datetime, Optional[float]]] = deque(maxlen=HISTORY_LEN)
+    fable_history: Deque[Tuple[datetime, Optional[float]]] = deque(maxlen=HISTORY_LEN)
     session = requests.Session()
     console = Console()
+    console.set_window_title("Claude Usage Monitor")
+
+    def record(snap: Snapshot) -> None:
+        """Append this poll to the in-memory burn histories (5-hour and Fable)."""
+        history.append((snap.fetched_at, snap.five_hour_pct))
+        fw = snap.window("Fable")
+        fable_history.append((snap.fetched_at, fw.utilization if fw else None))
 
     def render(snap: Snapshot) -> Panel:
         ws = _window_start(snap)
@@ -129,12 +138,15 @@ def main() -> None:
             poll_sec=args.interval,
             plan=args.plan,
             show_all=args.show_all,
+            fable_history=list(fable_history),
+            fable_daily=fable_daily_history(),
+            fable_buckets=fable_five_hour_buckets(ws),
         )
 
     if args.once:
         try:
             snap = fetch_usage(session, args.cookie_file)
-            history.append((snap.fetched_at, snap.five_hour_pct))
+            record(snap)
             append_snapshot(snap)
             console.print(render(snap))
         except Exception as e:
@@ -149,7 +161,7 @@ def main() -> None:
         while True:
             try:
                 snap = fetch_usage(session, args.cookie_file)
-                history.append((snap.fetched_at, snap.five_hour_pct))
+                record(snap)
                 append_snapshot(snap)
                 layout.update(render(snap))
                 live.refresh()
