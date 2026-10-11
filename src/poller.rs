@@ -6,7 +6,6 @@
 //! its main loop, `record()`, and the inputs to `render()`.
 
 use std::collections::VecDeque;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -18,6 +17,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 
 use crate::analytics::{BURN_WINDOW_MINUTES, HISTORY_LEN};
 use crate::config::{Settings, MIN_INTERVAL_SECS};
+use crate::crash::catch_recoverable;
 use crate::fetch::{self, FetchError};
 use crate::model::Snapshot;
 use crate::paths::{self, Paths};
@@ -345,10 +345,8 @@ struct LoopCtx<N> {
 
 fn run(mut source: impl UsageSource, mut settings: Settings, ctx: &LoopCtx<impl Fn()>) {
     let flags = &ctx.flags;
-    let mut history = catch_unwind(AssertUnwindSafe(|| {
-        BurnHistory::seeded(&ctx.paths, Utc::now())
-    }))
-    .unwrap_or_default();
+    let mut history =
+        catch_recoverable(|| BurnHistory::seeded(&ctx.paths, Utc::now())).unwrap_or_default();
     loop {
         flags.busy.store(true, Ordering::SeqCst);
         if flags.shutdown.load(Ordering::SeqCst) {
@@ -358,7 +356,7 @@ fn run(mut source: impl UsageSource, mut settings: Settings, ctx: &LoopCtx<impl 
         if flags.shutdown.load(Ordering::SeqCst) || ctx.events.send(event).is_err() {
             return;
         }
-        let _ = catch_unwind(AssertUnwindSafe(&ctx.notify));
+        let _ = catch_recoverable(&ctx.notify);
         flags.busy.store(false, Ordering::SeqCst);
 
         let first = match ctx.control.recv_timeout(poll_interval(&settings)) {
@@ -381,9 +379,7 @@ fn poll_event(
     settings: &Settings,
     history: &mut BurnHistory,
 ) -> PollEvent {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        poll_once(source, &ctx.paths, &ctx.dirs, settings, history)
-    }));
+    let result = catch_recoverable(|| poll_once(source, &ctx.paths, &ctx.dirs, settings, history));
     match result {
         Ok(Ok(dashboard)) => PollEvent::Ok(Box::new(dashboard)),
         Ok(Err(e)) => PollEvent::Err(FetchErrorInfo::from(&e)),
@@ -589,6 +585,9 @@ mod tests {
             fn fetch(&mut self, _: &Paths, _: &Settings) -> Result<Snapshot, FetchError> {
                 self.0 += 1;
                 if self.0 == 1 {
+                    // Guarded: the panic hook logs this but shows no box.
+                    // (If not, this panics without "kaboom" and the test fails.)
+                    assert!(crate::crash::is_recoverable());
                     panic!("kaboom");
                 }
                 Ok(snap(Utc::now(), Some(5.0), None))
@@ -933,6 +932,8 @@ mod tests {
     #[test]
     fn panicking_notify_does_not_kill_poller() {
         let tmp = tempfile::tempdir().unwrap();
+        let guarded = Arc::new(AtomicBool::new(false));
+        let guarded_flag = Arc::clone(&guarded);
         let poller = Poller::spawn_with(
             FakeSource::new(vec![Ok(1.0), Ok(2.0)]),
             Paths::with_data_dir(tmp.path().join("data")),
@@ -941,7 +942,10 @@ mod tests {
                 cowork: tmp.path().join("cw"),
             },
             Settings::default(),
-            || panic!("notify failed"),
+            move || {
+                guarded_flag.store(crate::crash::is_recoverable(), Ordering::SeqCst);
+                panic!("notify failed")
+            },
         );
         let wait_event = || {
             let deadline = Instant::now() + WAIT;
@@ -957,6 +961,10 @@ mod tests {
         poller.send(PollMsg::RefreshNow);
         assert_eq!(ok_pct(wait_event()), 2.0);
         assert!(poller.is_alive());
+        assert!(
+            guarded.load(Ordering::SeqCst),
+            "notify ran outside the guard"
+        );
     }
 
     #[test]
