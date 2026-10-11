@@ -160,6 +160,16 @@ pub fn show_charts(ui: &mut Ui, d: &Dashboard) {
     }
 }
 
+/// The 7-day chart alone, under the hero timeline (until Task 6 replaces
+/// the main view's charts).
+pub fn show_seven_day(ui: &mut Ui, d: &Dashboard) {
+    chart(
+        ui,
+        SEVEN_DAY_TITLE,
+        &seven_day_bars(&d.daily_history, &d.fable_daily),
+    );
+}
+
 /// One chart on a card with its title.
 fn chart(ui: &mut Ui, title: &str, bars: &[ChartBar]) {
     let palette = Palette::for_visuals(ui.visuals());

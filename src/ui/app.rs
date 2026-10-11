@@ -23,7 +23,7 @@ use super::charts;
 use super::rows::{self, BurnTag};
 use super::settings::{self, PanelAction, SettingsPanel};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
-use super::{level_color, show_runs, theme, tone_color, Tone};
+use super::{level_color, show_runs, theme, timeline, tone_color, Tone};
 
 /// Key eframe stores egui's memory (including the theme preference) under
 /// (private `STORAGE_EGUI_MEMORY_KEY` in eframe's native/epi_integration.rs).
@@ -373,7 +373,15 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &Settings) {
     }
 
     ui.add_space(8.0);
-    charts::show_charts(ui, d);
+    // Temporary placement until Task 6's layout: the hero timeline where the
+    // 5-hour bar chart was.
+    let palette = theme::Palette::for_visuals(ui.visuals());
+    theme::card(palette).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        timeline::show_timeline(ui, d, now, palette, timeline::FULL_HEIGHT);
+    });
+    ui.add_space(6.0);
+    charts::show_seven_day(ui, d);
     ui.add_space(8.0);
 
     show_runs(ui, &rows::burners_runs(&d.burners));
