@@ -14,6 +14,10 @@ use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 
 use crate::model::{ExtraUsage, Snapshot, UsageWindow};
 
+mod timeline;
+
+pub use timeline::{fable_layer, pace, projection, seven_day_pace, Projection, WindowSample};
+
 /// Burn rate is measured over the most recent this-many minutes of history.
 pub const BURN_WINDOW_MINUTES: i64 = 15;
 
@@ -149,7 +153,7 @@ pub fn recent_window(
 
 /// `(rate %/min, span minutes)` of the samples [`recent_window`] kept, or
 /// `None` with fewer than two samples or a zero time span.
-fn pace(recent: &[(DateTime<Utc>, f64)]) -> Option<(f64, f64)> {
+fn rate_and_span(recent: &[(DateTime<Utc>, f64)]) -> Option<(f64, f64)> {
     let [(t0, p0), .., (t1, p1)] = recent else {
         return None;
     };
@@ -163,7 +167,7 @@ fn pace(recent: &[(DateTime<Utc>, f64)]) -> Option<(f64, f64)> {
 /// Burn rate (%/min) over the most recent [`BURN_WINDOW_MINUTES`] of history,
 /// or `None` with fewer than two usable samples (or a zero time span).
 pub fn compute_rate(history: &[(DateTime<Utc>, Option<f64>)], now: DateTime<Utc>) -> Option<f64> {
-    pace(&recent_window(history, now, BURN_WINDOW_MINUTES)).map(|(rate, _)| rate)
+    rate_and_span(&recent_window(history, now, BURN_WINDOW_MINUTES)).map(|(rate, _)| rate)
 }
 
 /// Time to the cap at the current pace.
@@ -186,6 +190,23 @@ impl Eta {
             Eta::Minutes { level, .. } => level,
         }
     }
+}
+
+/// Minutes until 100% from `pct` at `rate` %/min, or `None` when the pace
+/// counts as steady: rate <= 0.01 %/min, or already at or over 100%. The
+/// single source of the "steady" rule for [`burn_line`] and [`projection`].
+pub(crate) fn minutes_to_cap(pct: f64, rate: f64) -> Option<f64> {
+    if rate <= 0.01 || pct >= 100.0 {
+        None
+    } else {
+        Some((100.0 - pct) / rate)
+    }
+}
+
+/// Whether a cap `minutes` from `now` lands strictly after `reset`. A cap
+/// exactly at the reset counts as hitting the cap first.
+pub(crate) fn lands_after(minutes: f64, now: DateTime<Utc>, reset: DateTime<Utc>) -> bool {
+    minutes > minutes_between(now, reset)
 }
 
 /// The burn line: "15m burn {rate}, → 100% in {eta} (over last {span}m,
@@ -214,7 +235,7 @@ pub fn burn_line(
     now: DateTime<Utc>,
 ) -> Option<BurnLine> {
     let recent = recent_window(history, now, BURN_WINDOW_MINUTES);
-    let (rate, span_minutes) = pace(&recent)?;
+    let (rate, span_minutes) = rate_and_span(&recent)?;
     let pct = pct?;
 
     let rate_level = if rate > 0.5 {
@@ -227,21 +248,21 @@ pub fn burn_line(
         Level::Green
     };
 
-    let eta = if rate <= 0.01 || pct >= 100.0 {
-        Eta::Steady
-    } else {
-        let minutes = (100.0 - pct) / rate;
-        let lands_after_reset = resets.is_some_and(|r| minutes > minutes_between(now, r));
-        let level = if lands_after_reset {
-            Level::Green // won't hit cap before reset
-        } else if minutes < 30.0 {
-            Level::Red
-        } else if minutes < 60.0 {
-            Level::Orange
-        } else {
-            Level::Yellow
-        };
-        Eta::Minutes { minutes, level }
+    let eta = match minutes_to_cap(pct, rate) {
+        None => Eta::Steady,
+        Some(minutes) => {
+            let lands_after_reset = resets.is_some_and(|r| lands_after(minutes, now, r));
+            let level = if lands_after_reset {
+                Level::Green // won't hit cap before reset
+            } else if minutes < 30.0 {
+                Level::Red
+            } else if minutes < 60.0 {
+                Level::Orange
+            } else {
+                Level::Yellow
+            };
+            Eta::Minutes { minutes, level }
+        }
     };
 
     Some(BurnLine {
