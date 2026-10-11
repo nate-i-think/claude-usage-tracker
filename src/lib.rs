@@ -4,6 +4,7 @@ pub mod config;
 pub mod cookies;
 pub mod model;
 pub mod paths;
+pub mod storage;
 
 /// Install the rustls `ring` crypto provider as the process default.
 ///
