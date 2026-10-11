@@ -117,10 +117,25 @@ pub fn write_latest_snapshot(paths: &Paths, snap: &Snapshot) -> io::Result<()> {
         })).collect::<Vec<_>>(),
         "extra": snap.extra.as_ref().map(extra_json),
     });
-    let target = paths.latest_file();
-    let tmp = paths.data_dir().join("latest.json.tmp");
-    fs::write(&tmp, payload.to_string())?;
-    fs::rename(&tmp, &target)
+    // A uniquely named temp file, so the GUI and a concurrent `once` never
+    // write the same temp path; persist() replaces the target (also on
+    // Windows).
+    let mut tmp = tempfile::NamedTempFile::new_in(paths.data_dir())?;
+    tmp.write_all(payload.to_string().as_bytes())?;
+    // Windows briefly denies a replace while another writer's replace of
+    // the same target is in flight; retry a few times before giving up.
+    let mut attempts = 0;
+    loop {
+        match tmp.persist(paths.latest_file()) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.error.kind() == io::ErrorKind::PermissionDenied && attempts < 20 => {
+                attempts += 1;
+                tmp = e.file;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.error),
+        }
+    }
 }
 
 /// The JSON written by [`write_latest_snapshot`], or `None` when the file
@@ -789,7 +804,34 @@ mod tests {
                           "disabled_reason": "spend_limit"},
             })
         );
-        assert!(!paths.data_dir().join("latest.json.tmp").exists());
+        assert_only_latest_json(&paths);
+    }
+
+    /// No temp files are left next to latest.json.
+    fn assert_only_latest_json(paths: &Paths) {
+        let names: Vec<String> = fs::read_dir(paths.data_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["latest.json"]);
+    }
+
+    #[test]
+    fn latest_json_concurrent_writers_do_not_collide() {
+        let (_tmp, paths) = temp_paths();
+        std::thread::scope(|s| {
+            for i in 0..4 {
+                let paths = &paths;
+                s.spawn(move || {
+                    for j in 0..10 {
+                        let t = utc(2026, 10, 11, 1, 0, 0) + Duration::seconds(i * 100 + j);
+                        write_latest_snapshot(paths, &snapshot(t)).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(read_latest_snapshot(&paths).is_some());
+        assert_only_latest_json(&paths);
     }
 
     #[test]
@@ -803,7 +845,7 @@ mod tests {
         let got = read_latest_snapshot(&paths).unwrap();
         assert_eq!(got["fetched_at"], "2026-10-11T02:00:00+00:00");
         assert_eq!(got["extra"], Value::Null);
-        assert!(!paths.data_dir().join("latest.json.tmp").exists());
+        assert_only_latest_json(&paths);
     }
 
     #[test]
