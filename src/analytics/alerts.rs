@@ -22,9 +22,9 @@ pub const WINDOW_KEY_TOLERANCE_MINUTES: i64 = 5;
 /// An alert to deliver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertKind {
-    /// The 5-hour window reached 75%; `pct` is the usage then, rounded.
+    /// The 5-hour window reached 75%; `pct` is the usage then, rounded down.
     Crossed75 { pct: u32 },
-    /// The 5-hour window reached 90%; `pct` is the usage then, rounded.
+    /// The 5-hour window reached 90%; `pct` is the usage then, rounded down.
     Crossed90 { pct: u32 },
     /// At the current burn rate the 5-hour window hits 100% at `at`, before
     /// it resets.
@@ -106,7 +106,9 @@ pub fn evaluate(
     let new_90 = reached(90.0) && !state.crossed_90;
     state.crossed_75 |= new_75;
     state.crossed_90 |= new_90;
-    let shown = pct.map_or(0, |p| p.round() as u32); // `as` saturates
+    // Rounded down, like the chips: 89.5 must not read "90%" on the 75%
+    // alert. `as` saturates.
+    let shown = pct.map_or(0, |p| p.floor() as u32);
     if new_90 && enabled.crossed_90 {
         fired.push(AlertKind::Crossed90 { pct: shown });
     } else if new_75 && enabled.crossed_75 {
@@ -273,15 +275,17 @@ mod tests {
     }
 
     #[test]
-    fn fired_pct_is_rounded_current_usage() {
+    fn fired_pct_is_current_usage_rounded_down() {
         let mut s = AlertState::default();
         assert_eq!(
-            eval(&mut s, key(0), 77.6),
-            [AlertKind::Crossed75 { pct: 78 }]
+            eval(&mut s, key(0), 89.5),
+            [AlertKind::Crossed75 { pct: 89 }],
+            "the 75% alert never reads 90%"
         );
         assert_eq!(
             eval(&mut s, key(0), 99.5),
-            [AlertKind::Crossed90 { pct: 100 }]
+            [AlertKind::Crossed90 { pct: 99 }],
+            "the 90% alert never reads 100% below the cap"
         );
     }
 
