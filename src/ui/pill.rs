@@ -70,13 +70,18 @@ pub fn model(chips: &[Chip]) -> PillModel {
         .unwrap_or(PillModel::EMPTY)
 }
 
-/// "5h · 1h59m": the countdown to the 5-hour reset, compact ("5h · —"
-/// when unknown, "5h · now" once reached).
+/// "5h · 1h59m": the countdown to the 5-hour reset, compact ("5h · 10m"
+/// under an hour, "5h · —" when unknown, "5h · now" once reached).
 pub fn countdown_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
-    format!(
-        "5h · {}",
-        analytics::humanize_until(resets_at, now).replace(' ', "")
-    )
+    let full = analytics::humanize_until(resets_at, now).replace(' ', "");
+    let short = match full.strip_prefix("0h") {
+        Some(minutes) => match minutes.trim_start_matches('0') {
+            "m" => "0m".to_owned(),
+            m => m.to_owned(),
+        },
+        None => full,
+    };
+    format!("5h · {short}")
 }
 
 /// The hover text, two lines (the tooltip has to fit the 44-point window):
@@ -430,7 +435,10 @@ mod tests {
     #[test]
     fn countdown_is_compact() {
         assert_eq!(countdown_text(Some(t(7_140)), t(0)), "5h · 1h59m");
-        assert_eq!(countdown_text(Some(t(300)), t(0)), "5h · 0h05m");
+        assert_eq!(countdown_text(Some(t(600)), t(0)), "5h · 10m");
+        assert_eq!(countdown_text(Some(t(300)), t(0)), "5h · 5m");
+        assert_eq!(countdown_text(Some(t(30)), t(0)), "5h · 0m");
+        assert_eq!(countdown_text(Some(t(3_600 * 30)), t(0)), "5h · 1d6h");
         assert_eq!(countdown_text(None, t(0)), "5h · —");
         assert_eq!(countdown_text(Some(t(0)), t(10)), "5h · now");
     }
