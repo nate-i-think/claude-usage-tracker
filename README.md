@@ -8,16 +8,84 @@ Written in Rust with [egui](https://github.com/emilk/egui). It ships two binarie
 
 ## What it shows
 
-- **Header**: plan label, plus buttons to refresh now, keep the window on top (📌), and open Settings.
-- **Usage windows**: one row per window (5-hour, 7-day, and per-model caps such as Fable) with utilization, a bar color-coded by threshold (green < 50%, yellow ≥ 50%, orange ≥ 75%, red ≥ 90%), and time to reset. 5-hour, 7-day, and Fable show whenever the API reports them; other windows at 0% are hidden unless "Show all buckets" is on.
-- **Burn rate**: a 15-minute rolling rate for all usage (ALL) and for Fable, with a "→ 100% in X" projection. The rate is available right after a restart because it is seeded from the saved history.
-- **Extra usage**: credits used against your monthly limit, and why extra usage is disabled if it is.
-- **Charts**: the current 5-hour window in 30-minute buckets and the last 7 days by weekday, with the Fable share drawn as an orange segment at the bottom of each bar. Side by side when the window is wide, stacked when it is narrow.
-- **Top burners**: the projects using the most tokens in the current 5-hour window, attributed from local Claude Code (`~/.claude/projects/`) and Cowork (`%APPDATA%\Claude\local-agent-mode-sessions\`) session logs.
-- **Projected use** and a "safe to spin up another agent" hint, plus how long ago the last poll was.
-- **Errors**: a failed poll shows an error banner above the last good data, which stays visible. A `permission_error` from the API adds a hint that the client SHA may be stale, with a button to open Settings.
+The window opens at 420x460 (minimum 360x320) in a warm dark theme. From top to bottom:
 
-Window size and position, the theme, and your settings persist across restarts.
+- **Stat chips**: one chip each for the 5-hour window, the 7-day window (all models), and Fable when the API reports it. Each shows the utilization (rounded down, so 99.6% never reads as the cap) in its state color: green below 50%, yellow from 50%, orange from 75%, red from 90%. Next to it is the **pace**: utilization minus the share of the window that has elapsed, so `▲+6` means you are 6 points ahead of an even burn that would land exactly at 100% at the reset, and `▼-4` means 4 points behind. The delta is muted unless it is 10 points or more either way (ahead in amber, behind in green). Hover a chip for the reset time and the pace in words. To the right are three buttons: refresh now (⟳, rests 5 s after a click), pill mode (◱), and Settings (⚙).
+- **Hero timeline**: the current 5-hour window, from its start to the reset, on a 0–100% scale.
+  - The 5-hour utilization as a filled area drawn from the saved samples, in the current state color.
+  - The Fable share as a clay layer at the bottom of the area.
+  - A "now" marker, and a dashed projection from now at the 15-minute burn rate. If the projection reaches 100% before the reset, a red ✕ marks the cap with its time ("cap 4:10p"); otherwise the line ends at the reset with a green "safe". A dashed line marks the 100% cap.
+  - Stretches with no samples (the app was closed, the laptop slept) are bridged with a faint dotted line instead of leaving a hole. A reset still breaks the line.
+  - Hover for a crosshair with the time, the utilization and the Fable share; past "now" it shows the projected value.
+- **Footer strip**:
+  - **7d**: a sparkline of the last 7 days: one bar per day for that day's highest 7-day utilization, on a fixed 0–100% scale, with the Fable share at the bottom of each bar and today outlined. Hover a bar for the day and its value.
+  - **Burn**: the 15-minute rate for all usage ("+0.21%/min") and either "cap in 1h 48m" or "safe till reset". Hover for the full burn line. The rate is available right after a restart, because it is seeded from the saved history.
+  - **Extra**: credits used against your monthly limit as a small gauge ("$23 / $35"), when extra usage is set up. Hover for the details, including why extra usage is disabled if it is.
+- **Details** (click to expand; it stays open or closed across restarts):
+  - The other usage windows (per-model caps beyond Fable). Windows at 0% are hidden unless "Show all buckets" is on.
+  - The ALL and FABLE burn lines in full, and the projected-use advice ("safe to spin up another agent").
+  - **Top burners**: the projects using the most tokens in the current 5-hour window, attributed from local Claude Code (`~/.claude/projects/`) and Cowork (`%APPDATA%\Claude\local-agent-mode-sessions\`) session logs. A project is named after the last folder of the working directory recorded in its session log.
+  - The plan label and how long ago the last poll was.
+- **Errors**: a failed poll shows a banner above the last good data, which stays visible. A `permission_error` from the API adds a hint that the client SHA may be stale, with a button to open Settings.
+
+Numbers and bars glide to their new values on each poll, and the projection draws itself in. When the 5-hour window reaches 90%, its chip breathes three times and then holds a red outline and glow; it re-arms once usage drops below 88% or a new window starts.
+
+The window's size, position, maximized state and mode (full or pill), the theme, the Details state, and your settings persist across restarts.
+
+The theme is dark by default, and a light "cream" theme is built in:
+
+![Light theme](docs/screenshot-light.png)
+
+There is no theme switch in the UI yet. To use the light theme (or follow the system), close the app and change `theme_preference:Dark` to `theme_preference:Light` (or `System`) in the `"egui"` entry of [`app.ron`](#privacy--security).
+
+## Pill mode
+
+![Pill mode](docs/screenshot-pill.png)
+
+A compact 300x44 always-on-top bar for parking in a screen corner: a ring and the 5-hour percentage, the time to reset ("5h · 3h55m", or "5h · 10m" under an hour), the pace, and a state dot. The dot is hollow while polls fail or before the first data, and pulses at 90% like the chip.
+
+- **Enter** it with the ◱ button in the header, or the tray menu's **Pill mode**. Settings → **Start in pill mode** opens the app as the pill every time.
+- **Leave** it with a click on the pill; the full window comes back at its old place and size (maximized, if it was).
+- **Drag** anywhere on the pill to move it. The full window and the pill remember their positions separately, and the pill reopens where you left it.
+- **Right-click** swaps the pill's content for a row of actions: Expand, Refresh, Settings, Quit. Esc, a click on the background, or clicking another window closes the row.
+- **Hover** for a two-line summary: the 5-hour window with its pace and reset, then the 7-day and Fable figures (or "Last poll failed").
+
+## Tray icon
+
+With **Show tray icon** on (the default), the notification area shows a rounded square with the 5-hour percentage in two digits ("08", "46"), colored by state; "!!" means 100% or more and "–" means no data yet. Its tooltip reads "Claude usage · 5h 46% · resets 3:42 PM", plus "last poll failed" while polls fail. The icon keeps updating while the window is hidden.
+
+- **Left-click** hides the window or brings it back.
+- **Right-click** opens the menu: Show / Hide, Pill mode (checked while in the pill), Refresh now, and Quit.
+- **Close to tray**: while the tray icon is on and **Close button hides to tray** is ticked (the default), the window's ✕ button and Alt+F4 hide the window instead of quitting. Polling, the icon and alerts keep running.
+- **To quit**, use **Quit** in the tray menu or in the pill's right-click row, or untick **Close button hides to tray** (or **Show tray icon**) and close the window.
+
+## Alerts
+
+The app sends a Windows notification when the 5-hour window:
+
+- reaches 75%,
+- reaches 90%,
+- is projected to hit the cap before the reset, at least 10 minutes ahead.
+
+Each alert fires at most once per 5-hour window, including across restarts. Each has its own toggle in Settings → Alerts, and **Send test notification** there shows a sample right away.
+
+Notifications appear under the name **Claude Usage Monitor** with a coral "%" icon, in the notification banner and in the notification center. With Windows' **Do not disturb** on, they go to the notification center without a banner. To make the toasts carry that name, the app registers itself under an explicit AppUserModelID (see [Privacy & security](#privacy--security)). That ID also groups the taskbar button, so if you pinned `claude-usage.exe` to the taskbar before this version, the old pin may not group with the running window: unpin it and pin the running window again.
+
+Clicking a notification is meant to bring the window forward, but this has not been confirmed yet (see [Known limitations](#known-limitations)).
+
+## Settings
+
+Open Settings with ⚙. Changes take effect on **Apply**, except **Always on top**, which applies at once.
+
+- **Plan label**: shown in the Details footer line (default "Max").
+- **Poll interval**: default 60 s, minimum 5 s. It accepts plain seconds or a suffix: `30`, `30s`, `2m`, `1h`.
+- **Show all buckets**: list usage windows at 0% in Details too.
+- **Always on top**: keep the full window above other windows. (The pill is always on top.)
+- **Cookie file**: an explicit `cookies.sqlite`; blank means auto-detect (see [Signing in](#signing-in)).
+- **Client SHA**: see [Refreshing the client SHA](#refreshing-the-client-sha). Settings shows which source is in use.
+- **Window**: **Show tray icon**; **Close button hides to tray** (needs the tray icon); **Start in pill mode**.
+- **Alerts**: **5-hour window reaches 75%**; **5-hour window reaches 90%**; **Projected to hit the cap before reset**; **Send test notification**.
+- **Motion**: **Reduce motion** (values snap instead of gliding, and the near-cap chip holds steady instead of pulsing); **Keep pulsing near cap** (the chip and pill dot keep breathing for as long as the 5-hour window is at 90% or more, instead of three breaths. It repaints 15–20 times a second, which costs a few percent of a CPU core while it lasts: about 9% of one core in testing, against about 2.5% when idle).
 
 ## Install
 
@@ -139,7 +207,7 @@ A value that isn't a whole number does not stop the server: it falls back to the
 
 ## Recommended layout
 
-Snap the window to a corner of your screen and turn on **Always on top** (📌). Pair it with [`claude-monitor`](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) for a complete picture: `claude-monitor` shows local per-instance attribution from Claude Code logs; this widget shows the unified server-side meter that's actually about to gate you.
+Snap the window to a corner of your screen and turn on **Always on top** in Settings, or switch to [pill mode](#pill-mode), which always stays on top. With close to tray on, the ✕ button tucks it away and the tray icon keeps showing the 5-hour percentage. Pair it with [`claude-monitor`](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) for a complete picture: `claude-monitor` shows local per-instance attribution from Claude Code logs; this widget shows the unified server-side meter that's actually about to gate you.
 
 ## When it breaks
 
@@ -152,6 +220,8 @@ Common failure modes:
 - **"No browser profile found"**: sign in to `claude.ai` in a supported Firefox-family browser, or set the cookie file explicitly.
 - **`__cf_bm` missing or expired**: visit `claude.ai/settings/usage` in your browser within 30 minutes before polling.
 - **"poller stopped — restart the app"** in the GUI: the background poller exited unexpectedly. Restart the app.
+- **The GUI closed or showed a "crashed" message box**: the details, with a backtrace, are in `crash.log` in the [data directory](#privacy--security). Panics the poller recovers from are logged there too, without a message box. If the tray icon or the notification registration fails, the reason is logged there as well.
+- **The window seems gone**: with close to tray on, ✕ only hides it. Left-click the tray icon (it may be in the taskbar's "^" overflow) to bring it back.
 
 ## Privacy & security
 
@@ -162,6 +232,8 @@ A small amount of state is kept locally in the app's data directory:
 - `history.jsonl`: usage snapshots (percentages and timestamps; no conversation content). Used for the charts and the burn rate.
 - `latest.json`: the most recent full snapshot (every window's utilization and reset time, and the extra-usage block). Read by the MCP server.
 - `anonymous_id`: a random UUID generated per install, sent as a telemetry header to `claude.ai`, as the web client does. Nothing ties one install to another.
+- `crash.log` (GUI): panics and startup failures, with a timestamp and a backtrace.
+- `app-icon.png` (GUI, Windows): the coral "%" icon that notifications show, rewritten only when it changes.
 
 The data directory is:
 
@@ -171,11 +243,15 @@ The data directory is:
 
 This is the same directory the Python version used with python.org (non-Store) Python, so that history carries over as is. If you ran the Python version with Microsoft Store Python, see [Migrating history from the Python version](#migrating-history-from-the-python-version).
 
-The GUI's settings (plan label, poll interval, show-all, always-on-top, cookie file path, client SHA) and its window geometry and theme are stored by eframe in `app.ron`:
+The GUI's settings (everything in the [Settings](#settings) panel, including the cookie file path and client SHA), its window state (full-window and pill positions, size, maximized, current mode, Details open or closed), the per-window alert state, and the theme are stored in eframe's `app.ron`:
 
 - Windows: `%APPDATA%\claude-usage\data\app.ron`
 - macOS: `~/Library/Application Support/claude-usage/app.ron`
 - Linux: `$XDG_DATA_HOME/claude-usage/app.ron` (default `~/.local/share/claude-usage/app.ron`)
+
+The app keeps its own window geometry inside the `"settings"` entry. On the first start of this version it removes the old `"window"` entry that earlier versions let eframe write, so a stale size from before cannot override it.
+
+On Windows the GUI also creates one per-user registry key, `HKCU\Software\Classes\AppUserModelId\ClaudeUsageMonitor`, with the values `DisplayName` ("Claude Usage Monitor") and `IconUri` (the path of `app-icon.png`). Windows uses it to label the app's notifications. The app rewrites it on every start; it needs no admin rights, and you can delete it after removing the app. Windows' own notification settings for the app live under `HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\ClaudeUsageMonitor`.
 
 ## Changes from the Python version
 
@@ -185,7 +261,7 @@ This project used to be a Python terminal dashboard (`claude_usage_tui.py`). The
 - **The TLS-impersonation profile sweep in debug.** The Python version used `curl_cffi` to mimic browser TLS fingerprints, and `--debug` retried with several profiles. The Rust app uses plain rustls with Firefox-like headers, which Cloudflare currently accepts, and `debug` sends one request.
 - **`--no-fullscreen`**, which only made sense for the terminal UI.
 
-Other differences: `--once` and `--debug` became the `once` and `debug` subcommands of `claude-usage-cli`; the poll interval, plan label, cookie file, and client SHA are set in the GUI's Settings instead of on the command line; and the 5-hour chart labels the bucket that contains each hour rather than only buckets starting exactly on the hour.
+Other differences: `--once` and `--debug` became the `once` and `debug` subcommands of `claude-usage-cli`; the poll interval, plan label, cookie file, and client SHA are set in the GUI's Settings instead of on the command line; and the GUI replaces the terminal's bar charts with the timeline, chips and sparkline described in [What it shows](#what-it-shows).
 
 ### Migrating history from the Python version
 
@@ -215,6 +291,12 @@ $sorted = $lines | Sort-Object { [double]([regex]::Match($_, '"ts":\s*([-0-9.eE+
 ```
 
 It leaves the Store Python file untouched, and `history.jsonl.bak` holds the previous destination if you need to undo. Run it once: running it again duplicates the old rows.
+
+## Known limitations
+
+- **Clicking a notification** is wired to bring the window forward, but this has not been confirmed on a real banner yet. It may not work from the notification center after the banner is gone, and Windows may show the window without focusing it.
+- **Windows only**: the tray icon, alerts and the rounded pill corners. Other platforms build without them (and are untested in general).
+- **No theme switch in the UI**: see [What it shows](#what-it-shows) for the `app.ron` edit.
 
 ## Caveats
 
