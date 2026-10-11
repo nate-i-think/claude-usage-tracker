@@ -13,6 +13,9 @@ use crate::poller::Dashboard;
 
 use super::{bar_track_color, tone_color, Tone};
 
+/// Chart titles.
+const FIVE_HOUR_TITLE: &str = "5-hour window";
+const SEVEN_DAY_TITLE: &str = "Last 7 days";
 /// Below this available width the two charts stack vertically.
 pub const SIDE_BY_SIDE_MIN_WIDTH: f32 = 520.0;
 /// Height of each chart's drawing area (axes, bars, labels).
@@ -109,7 +112,7 @@ pub fn five_hour_bars(
         .iter()
         .zip(split_bars(&values, &ceilings))
         .map(|(&(t, value), split)| ChartBar {
-            axis_label: analytics::bucket_label(t),
+            axis_label: analytics::bucket_hour_label(t),
             tip_label: t.with_timezone(&Local).format("%H:%M").to_string(),
             value,
             split,
@@ -143,21 +146,27 @@ pub fn show_charts(ui: &mut Ui, d: &Dashboard) {
     let seven = seven_day_bars(&d.daily_history, &d.fable_daily);
     if side_by_side(ui.available_width()) {
         ui.columns(2, |cols| {
-            chart(&mut cols[0], "5-hour window", &five);
-            chart(&mut cols[1], "Last 7 days", &seven);
+            chart(&mut cols[0], FIVE_HOUR_TITLE, &five);
+            chart(&mut cols[1], SEVEN_DAY_TITLE, &seven);
         });
     } else {
-        chart(ui, "5-hour window", &five);
+        chart(ui, FIVE_HOUR_TITLE, &five);
         ui.add_space(6.0);
-        chart(ui, "Last 7 days", &seven);
+        chart(ui, SEVEN_DAY_TITLE, &seven);
     }
 }
 
 /// One framed chart with its title, like the TUI's panels.
 fn chart(ui: &mut Ui, title: &str, bars: &[ChartBar]) {
     let accent = tone_color(Tone::Accent, ui.visuals());
+    // Dim border while empty, like the TUI's placeholder panel.
+    let border = if bars.is_empty() {
+        ui.visuals().weak_text_color()
+    } else {
+        accent.gamma_multiply(0.6)
+    };
     Frame::group(ui.style())
-        .stroke((1.0, accent.gamma_multiply(0.6)))
+        .stroke((1.0, border))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.vertical_centered(|ui| ui.label(RichText::new(title).color(accent)));
