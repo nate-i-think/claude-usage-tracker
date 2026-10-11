@@ -2,8 +2,8 @@
 //! GUI renders, off the UI thread. No egui here; the GUI wakes itself via the
 //! `notify` callback.
 //!
-//! Port of the claude_usage_tui.py main loop, `record()`, and the inputs to
-//! `render()`.
+//! Ported from the Python claude_usage_tui.py (removed; see git history):
+//! its main loop, `record()`, and the inputs to `render()`.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};

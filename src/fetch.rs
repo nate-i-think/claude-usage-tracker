@@ -1,6 +1,7 @@
 //! HTTP fetch of the claude.ai `/usage` endpoint.
 //!
-//! Port of api.py `STATIC_HEADERS`, `build_headers`, and `fetch_usage`. One
+//! Ported from the Python api.py (removed; see git history):
+//! `STATIC_HEADERS`, `build_headers`, and `fetch_usage`. One
 //! reusable blocking client (rustls over the `ring` provider, which
 //! [`crate::install_crypto_provider`] must have installed first).
 
@@ -23,7 +24,7 @@ pub const USER_AGENT: &str =
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Characters of a 403 body kept in the error message (api.py `text[:200]`).
+/// Characters of a 403 body kept in the error message (the Python api.py's `text[:200]`).
 const FORBIDDEN_BODY_CHARS: usize = 200;
 
 /// Characters of other non-2xx bodies kept in the error message.
@@ -98,7 +99,7 @@ pub fn usage_url(org_id: &str) -> String {
     format!("{USAGE_HOST}/api/organizations/{org_id}/usage")
 }
 
-/// Per-request headers, in order: api.py `STATIC_HEADERS` then the
+/// Per-request headers, in order: the Python api.py's `STATIC_HEADERS` then the
 /// `build_headers` additions. A fresh `x-activity-session-id` (uuid4) is
 /// generated on every call. The Cookie header is not included.
 pub fn build_headers(

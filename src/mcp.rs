@@ -1,7 +1,8 @@
 //! Stdio MCP server exposing the latest usage snapshot to a Claude agent.
 //!
-//! Port of mcp_server.py. The monitor writes latest.json every poll; this
-//! server reads it on demand and offers `get_usage`, `wait` and `wait_test`.
+//! Ported from the Python mcp_server.py (removed; see git history). The
+//! monitor writes latest.json every poll; this server reads it on demand
+//! and offers `get_usage`, `wait` and `wait_test`.
 //! It does no network or auth of its own. The JSON logic lives in plain
 //! functions taking `&Paths` and `now`, so it is testable without the MCP
 //! runtime; the tokio runtime exists only inside [`run_stdio`].

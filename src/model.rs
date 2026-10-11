@@ -1,6 +1,7 @@
 //! Usage data model and parsing of the claude.ai `/usage` response.
 //!
-//! Port of the models and parsing in api.py. Pure: no I/O. Parsing is
+//! Ported from the models and parsing in the Python api.py (removed; see
+//! git history). Pure: no I/O. Parsing is
 //! tolerant in the way Python dict access is: missing keys, nulls, and
 //! values of the wrong type degrade to `None`/defaults instead of failing.
 
@@ -195,7 +196,7 @@ mod tests {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
     }
 
-    /// Trimmed copy of a real /usage packet (2026-07-01); from test_api.py.
+    /// Trimmed copy of a real /usage packet (2026-07-01); from the Python test_api.py (removed).
     fn fable_packet() -> Value {
         json!({
             "five_hour": {"utilization": 12.0, "resets_at": "2026-07-01T21:10:01+00:00"},
@@ -213,7 +214,7 @@ mod tests {
         })
     }
 
-    // --- Ports of test_api.py ---------------------------------------------
+    // --- Ported from the Python test_api.py (removed) ---------------------
 
     #[test]
     fn extracts_fable_window_from_limits_array() {

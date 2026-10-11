@@ -1,7 +1,8 @@
 //! Local persistence: history JSONL, latest snapshot, chart rollups, and
 //! per-instance token attribution from local session JSONLs.
 //!
-//! Port of storage.py. Every function takes its locations explicitly
+//! Ported from the Python storage.py (removed; see git history). Every
+//! function takes its locations explicitly
 //! (`&Paths` or directories) and, where time matters, `now`, so tests are
 //! hermetic and deterministic.
 
