@@ -9,9 +9,7 @@
 //! deterministic. Outputs are structured (levels, numbers, plain strings
 //! without markup); the GUI and the CLI report render them.
 
-use std::fmt::Display;
-
-use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 
 use crate::model::{ExtraUsage, Snapshot, UsageWindow};
 
@@ -34,9 +32,6 @@ pub const HISTORY_LEN: usize = 240;
 
 /// Bar-chart rows; minor ticks (25/50/75/100%) land on 4/8/12/16.
 pub const CHART_HEIGHT: usize = 16;
-
-/// Width of a 5-hour chart bucket.
-pub const CHART_BUCKET_MINUTES: i64 = 30;
 
 /// Claude coral/orange (#d97757) for the Fable overlay, as RGB bytes.
 pub const FABLE_ORANGE: [u8; 3] = [0xd9, 0x77, 0x57];
@@ -468,38 +463,6 @@ pub fn extra_disabled_reason(e: &ExtraUsage) -> Option<String> {
 
 // --- Bar-chart labels ---------------------------------------------------------
 
-/// 5-hour chart label for the 30-minute bucket starting at `t`, in local
-/// time: the hour ("%H") whose HH:00 falls inside the bucket
-/// (`t <= HH:00 < t + 30m`), else empty.
-///
-/// Deviates from Python, which labels only buckets that *start* on the hour:
-/// buckets start at `resets_at - 5h`, rarely on the hour,
-/// which left the axis blank.
-pub fn bucket_hour_label(t: DateTime<Utc>) -> String {
-    bucket_hour_label_in(t, &Local)
-}
-
-/// [`bucket_hour_label`] in an explicit time zone.
-pub fn bucket_hour_label_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
-where
-    Tz::Offset: Display,
-{
-    let local = t.with_timezone(tz);
-    let into_hour = Duration::seconds(i64::from(local.minute() * 60 + local.second()))
-        + Duration::nanoseconds(i64::from(local.nanosecond()));
-    // Time from the bucket start to the first local HH:00 at or after it.
-    let to_hour = if into_hour.is_zero() {
-        Duration::zero()
-    } else {
-        Duration::hours(1) - into_hour
-    };
-    if to_hour < Duration::minutes(CHART_BUCKET_MINUTES) {
-        (t + to_hour).with_timezone(tz).format("%H").to_string()
-    } else {
-        String::new()
-    }
-}
-
 /// 7-day chart label for a (local calendar) day: the weekday ("%a").
 pub fn day_label(d: NaiveDate) -> String {
     d.format("%a").to_string()
@@ -508,7 +471,6 @@ pub fn day_label(d: NaiveDate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::FixedOffset;
 
     const NOW: DateTime<Utc> = DateTime::from_timestamp_nanos(1_791_000_000_000_000_000);
 
@@ -1284,33 +1246,6 @@ mod tests {
     }
 
     // --- Chart labels -------------------------------------------------------------------
-
-    #[test]
-    fn bucket_hour_labels_mark_the_bucket_containing_each_hour() {
-        let t = |h, m| Utc.with_ymd_and_hms(2026, 10, 11, h, m, 0).unwrap();
-        let plus2 = FixedOffset::east_opt(2 * 3600).unwrap();
-        // Starts on the hour: contains it.
-        assert_eq!(bucket_hour_label_in(t(17, 0), &plus2), "19");
-        // :15 to :45 holds no hour; :45 to :15 holds the next one.
-        assert_eq!(bucket_hour_label_in(t(17, 15), &plus2), "");
-        assert_eq!(bucket_hour_label_in(t(17, 45), &plus2), "20");
-        // :30 to :00 excludes the end.
-        assert_eq!(bucket_hour_label_in(t(17, 30), &plus2), "");
-        assert_eq!(
-            bucket_hour_label_in(t(17, 30) + Duration::seconds(1), &plus2),
-            "20"
-        );
-        assert_eq!(bucket_hour_label_in(t(21, 50), &plus2), "00"); // next local day
-                                                                   // Half-hour zone: 17:00Z is 22:30 local, 17:15Z is 22:45 local.
-        let india = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
-        assert_eq!(bucket_hour_label_in(t(17, 0), &india), "");
-        assert_eq!(bucket_hour_label_in(t(17, 15), &india), "23");
-        assert_eq!(bucket_hour_label_in(t(17, 30), &india), "23");
-        assert_eq!(
-            bucket_hour_label(t(17, 45)),
-            bucket_hour_label_in(t(17, 45), &Local)
-        );
-    }
 
     #[test]
     fn day_labels_are_weekday_abbreviations() {
