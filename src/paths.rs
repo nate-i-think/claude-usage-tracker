@@ -41,6 +41,11 @@ impl Paths {
         self.data_dir.join("latest.json")
     }
 
+    /// GUI crash log (panics and startup failures), appended to.
+    pub fn crash_log_file(&self) -> PathBuf {
+        self.data_dir.join("crash.log")
+    }
+
     pub fn anonymous_id_file(&self) -> PathBuf {
         self.data_dir.join("anonymous_id")
     }
