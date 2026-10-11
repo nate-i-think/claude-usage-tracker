@@ -18,7 +18,7 @@ use crate::model::{ExtraUsage, Snapshot};
 use crate::paths::Paths;
 
 /// Width of one chart bucket in the five-hour window.
-const BUCKET_MINUTES: i64 = 30;
+const BUCKET_MINUTES: i64 = crate::analytics::CHART_BUCKET_MINUTES;
 /// Length of the five-hour window, in minutes.
 const WINDOW_MINUTES: i64 = 300;
 
