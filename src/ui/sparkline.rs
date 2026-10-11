@@ -1,6 +1,6 @@
 //! The footer's 7-day sparkline: seven mini rounded bars, one per local day,
-//! each with its orange Fable floor, today's slot outlined, and a tooltip
-//! per day ("Tue · 22%").
+//! on a fixed 0–100% scale, each with its orange Fable floor, today's slot
+//! outlined in a neutral color, and a tooltip per day ("Tue · 22%").
 //!
 //! The bar split (Fable floor vs the rest) is the old "Last 7 days" chart's
 //! rule; the chart itself is gone (see git history for `ui/charts.rs`).
@@ -22,9 +22,6 @@ pub const HEIGHT: f32 = 26.0;
 const STUB: f32 = 2.0;
 /// Gap between a bar's Fable floor and the rest of the bar, in points.
 const FLOOR_GAP: f32 = 1.5;
-/// The bars' full height is at least this % (small weeks still show
-/// shape, a 100% day still fits).
-pub const MIN_SCALE: f64 = 50.0;
 
 /// How one bar is drawn: `orange` (the Fable floor) from 0, then `rest` in
 /// the bar color on top. Both in y-axis %, summing to the bar height.
@@ -110,14 +107,10 @@ pub fn day_tip(bar: &DayBar) -> String {
     }
 }
 
-/// The % that maps to the full bar height: the week's highest value, at
-/// least [`MIN_SCALE`], at most 100.
-pub fn spark_scale(bars: &[DayBar]) -> f64 {
-    bars.iter()
-        .filter_map(|b| b.value)
-        .filter(|v| !v.is_nan())
-        .fold(MIN_SCALE, f64::max)
-        .min(100.0)
+/// Height in points of `pct` on a fixed 0–100% scale (like the timeline),
+/// so a 47% day reads as half full; clamped to the bar area.
+pub fn bar_px(pct: f64, height: f32) -> f32 {
+    ((pct / 100.0).clamp(0.0, 1.0) as f32) * height
 }
 
 /// Whether the floor/rest notch fits: the bar's rest must be taller than
@@ -131,13 +124,12 @@ pub fn width(n: usize) -> f32 {
     n as f32 * BAR_W + n.saturating_sub(1) as f32 * BAR_GAP
 }
 
-/// Paint the bars; `today` gets an accent outline around its slot.
+/// Paint the bars; `today` gets a neutral outline around its slot.
 pub fn show_sparkline(ui: &mut Ui, bars: &[DayBar], today: NaiveDate) -> Response {
     let palette = Palette::for_visuals(ui.visuals());
     let (rect, response) = ui.allocate_exact_size(vec2(width(bars.len()), HEIGHT), Sense::hover());
     let painter = ui.painter();
-    let scale = spark_scale(bars);
-    let px = |pct: f64| (pct / scale) as f32 * rect.height();
+    let px = |pct: f64| bar_px(pct, rect.height());
     let hovered = response.hover_pos().and_then(|p| {
         slot_at(
             p.x,
@@ -152,12 +144,12 @@ pub fn show_sparkline(ui: &mut Ui, bars: &[DayBar], today: NaiveDate) -> Respons
         let slot = Rect::from_x_y_ranges(left..=left + BAR_W, rect.y_range());
         let radius = CornerRadius::same(2);
         if bar.date == today {
-            // Outlined a hair outside the bar so the clay outline never
-            // touches the clay Fable floor.
+            // A neutral outline a hair outside the bar, so today never
+            // competes with the clay Fable floor.
             painter.rect_stroke(
                 slot.expand(2.0),
                 CornerRadius::same(3),
-                Stroke::new(1.0, palette.accent),
+                Stroke::new(1.0, palette.control_border),
                 StrokeKind::Inside,
             );
         }
@@ -318,19 +310,13 @@ mod tests {
     }
 
     #[test]
-    fn scale_follows_the_week_within_bounds() {
-        let bars = |vals: &[Option<f64>]| {
-            let daily: Vec<_> = vals
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (day(5 + i as u32), *v))
-                .collect();
-            day_bars(&daily, &[])
-        };
-        assert_eq!(spark_scale(&bars(&[Some(10.0), None])), MIN_SCALE);
-        assert_eq!(spark_scale(&bars(&[Some(10.0), Some(72.0)])), 72.0);
-        assert_eq!(spark_scale(&bars(&[Some(130.0)])), 100.0);
-        assert_eq!(spark_scale(&[]), MIN_SCALE);
+    fn bars_use_a_fixed_hundred_percent_scale() {
+        assert_eq!(bar_px(100.0, 26.0), 26.0);
+        assert_eq!(bar_px(50.0, 26.0), 13.0);
+        assert!((bar_px(47.0, 26.0) - 12.22).abs() < 1e-4);
+        assert_eq!(bar_px(130.0, 26.0), 26.0);
+        assert_eq!(bar_px(-5.0, 26.0), 0.0);
+        assert_eq!(bar_px(0.0, 26.0), 0.0);
     }
 
     #[test]
