@@ -45,13 +45,19 @@ pub fn footer_items(has_daily: bool, extra_visible: bool) -> Vec<FooterItem> {
 /// The 5-hour burn in brief: "+0.21%/min · cap in 1h 48m" (rate and ETA in
 /// their level colors) when the cap comes before the reset, "+0.34%/min ·
 /// safe till reset" when the reset comes first, "steady", or "need 2
-/// samples".
-pub fn burn_summary(line: Option<&BurnLine>) -> Vec<Run> {
+/// samples". With no known reset (`reset_known` false) the cap time can't
+/// be weighed against one, so only the rate shows, matching the timeline,
+/// which then claims neither "safe" nor a cap.
+pub fn burn_summary(line: Option<&BurnLine>, reset_known: bool) -> Vec<Run> {
     let Some(line) = line else {
         return vec![Run::new("need 2 samples", Tone::Dim)];
     };
     match line.eta {
         Eta::Steady => vec![Run::new("steady", Tone::Level(Level::Green))],
+        Eta::Minutes { .. } if !reset_known => vec![Run::new(
+            analytics::fmt_rate(line.rate),
+            Tone::Level(line.rate_level),
+        )],
         Eta::Minutes {
             lands_after_reset: true,
             ..
@@ -104,7 +110,10 @@ pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
         snap.five_hour_resets_at(),
         now,
     );
-    let mut burn_job = layout_job(&burn_summary(burn.as_ref()), ui);
+    let mut burn_job = layout_job(
+        &burn_summary(burn.as_ref(), snap.five_hour_resets_at().is_some()),
+        ui,
+    );
     let small = eframe::egui::TextStyle::Small.resolve(ui.style());
     let painter = ui.painter().clone();
     let caption =
@@ -264,7 +273,7 @@ mod tests {
                 lands_after_reset: false,
             },
         );
-        let runs = burn_summary(Some(&l));
+        let runs = burn_summary(Some(&l), true);
         assert_eq!(plain_text(&runs), "+0.21%/min · cap in 1h 48m");
         assert!(runs.contains(&Run::new("+0.21%/min", Tone::Level(Level::Orange))));
         assert!(runs.contains(&Run::new("1h 48m", Tone::Level(Level::Yellow))));
@@ -281,17 +290,42 @@ mod tests {
                 lands_after_reset: true,
             },
         );
-        let runs = burn_summary(Some(&l));
+        let runs = burn_summary(Some(&l), true);
         assert_eq!(plain_text(&runs), "+0.34%/min · safe till reset");
         assert!(runs.contains(&Run::new("safe till reset", Tone::Level(Level::Green))));
         assert!(!plain_text(&runs).contains("cap"));
     }
 
     #[test]
+    fn burn_summary_without_a_known_reset_is_the_rate_alone() {
+        let l = line(
+            0.5,
+            Level::Orange,
+            Eta::Minutes {
+                minutes: 60.0,
+                level: Level::Orange,
+                lands_after_reset: false,
+            },
+        );
+        let runs = burn_summary(Some(&l), false);
+        assert_eq!(
+            runs,
+            vec![Run::new("+0.50%/min", Tone::Level(Level::Orange))]
+        );
+        // Steady and unknown read the same either way.
+        let steady = line(0.0, Level::Green, Eta::Steady);
+        assert_eq!(
+            burn_summary(Some(&steady), false),
+            burn_summary(Some(&steady), true)
+        );
+        assert_eq!(burn_summary(None, false), burn_summary(None, true));
+    }
+
+    #[test]
     fn burn_summary_steady_and_unknown() {
-        let runs = burn_summary(Some(&line(0.0, Level::Green, Eta::Steady)));
+        let runs = burn_summary(Some(&line(0.0, Level::Green, Eta::Steady)), true);
         assert_eq!(runs, vec![Run::new("steady", Tone::Level(Level::Green))]);
-        let runs = burn_summary(None);
+        let runs = burn_summary(None, true);
         assert_eq!(runs, vec![Run::new("need 2 samples", Tone::Dim)]);
     }
 
