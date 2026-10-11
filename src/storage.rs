@@ -817,6 +817,19 @@ mod tests {
     }
 
     #[test]
+    fn latest_json_keys_keep_insertion_order() {
+        let (_tmp, paths) = temp_paths();
+        write_latest_snapshot(&paths, &snapshot(utc(2026, 10, 11, 1, 0, 0))).unwrap();
+        let text = fs::read_to_string(paths.latest_file()).unwrap();
+        let at = |k: &str| text.find(&format!("\"{k}\"")).unwrap();
+        assert!(
+            at("fetched_at") < at("windows") && at("windows") < at("extra"),
+            "{text}"
+        );
+        assert!(at("label") < at("utilization") && at("utilization") < at("resets_at"));
+    }
+
+    #[test]
     fn latest_json_concurrent_writers_do_not_collide() {
         let (_tmp, paths) = temp_paths();
         std::thread::scope(|s| {
