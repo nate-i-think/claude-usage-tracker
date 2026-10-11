@@ -216,13 +216,15 @@ fn build_dashboard(
     now: DateTime<Utc>,
 ) -> Dashboard {
     let ws = window_start(&snapshot, now);
+    // One history read feeds all four charts.
+    let rollups = storage::rollups(paths, ws, DAILY_DAYS, now);
     Dashboard {
         history: history.five_hour(),
         fable_history: history.fable(),
-        five_hour_buckets: storage::five_hour_buckets(paths, ws, now),
-        fable_buckets: storage::fable_five_hour_buckets(paths, ws, now),
-        daily_history: storage::daily_history(paths, DAILY_DAYS, now),
-        fable_daily: storage::fable_daily_history(paths, DAILY_DAYS, now),
+        five_hour_buckets: rollups.five_hour,
+        fable_buckets: rollups.fable_five_hour,
+        daily_history: rollups.daily,
+        fable_daily: rollups.fable_daily,
         burners: storage::attribute_recent(&dirs.claude_code, &dirs.cowork, ws),
         window_start: ws,
         persist_error: None,
