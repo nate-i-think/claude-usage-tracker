@@ -222,7 +222,7 @@ pub struct Rollups {
     pub fable_five_hour: Vec<(DateTime<Utc>, Option<f64>)>,
     pub daily: Vec<(NaiveDate, Option<f64>)>,
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
-    /// Every row in `[window_start, window_start + 5h)`, oldest first.
+    /// Every row in `[window_start, window_end)`, oldest first.
     pub window_samples: Vec<WindowSample>,
 }
 
@@ -230,6 +230,7 @@ pub struct Rollups {
 pub fn rollups(
     paths: &Paths,
     window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
     days: usize,
     now: DateTime<Utc>,
 ) -> Rollups {
@@ -243,15 +244,19 @@ pub fn rollups(
         fable_five_hour: window_buckets(&rows, window_start, now, |e| e.fable_7d),
         daily: daily_max(&rows, days, now, |e| e.seven_day),
         fable_daily: daily_max(&rows, days, now, |e| e.fable_7d),
-        window_samples: window_samples(&rows, window_start),
+        window_samples: window_samples(&rows, window_start, window_end),
     }
 }
 
-/// The rows inside the five-hour window starting at `window_start`, as
+/// The rows in the half-open window `[window_start, window_end)`, as
 /// samples, oldest first. `rows` may hold entries outside the window.
-fn window_samples(rows: &[HistoryEntry], window_start: DateTime<Utc>) -> Vec<WindowSample> {
+fn window_samples(
+    rows: &[HistoryEntry],
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Vec<WindowSample> {
     let start_ts = unix_seconds(window_start);
-    let end_ts = unix_seconds(window_start + Duration::minutes(WINDOW_MINUTES));
+    let end_ts = unix_seconds(window_end);
     let mut samples: Vec<WindowSample> = rows
         .iter()
         .filter(|e| e.ts >= start_ts && e.ts < end_ts)
@@ -1057,7 +1062,7 @@ mod tests {
         write_history(&paths, &lines);
 
         for days in [0, 1, 7] {
-            let got = rollups(&paths, ws, days, now);
+            let got = rollups(&paths, ws, ws + Duration::hours(5), days, now);
             assert_eq!(got.five_hour, five_hour_buckets(&paths, ws, now));
             assert_eq!(
                 got.fable_five_hour,
@@ -1068,7 +1073,7 @@ mod tests {
         }
         // Window older than the daily range: the window cutoff wins.
         let old_ws = now - Duration::days(8);
-        let got = rollups(&paths, old_ws, 7, now);
+        let got = rollups(&paths, old_ws, old_ws + Duration::hours(5), 7, now);
         assert_eq!(got.five_hour, five_hour_buckets(&paths, old_ws, now));
         assert!(got.five_hour.iter().any(|(_, v)| v.is_some()));
         assert_eq!(got.daily, daily_history(&paths, 7, now));
@@ -1094,7 +1099,7 @@ mod tests {
             ],
         );
         let before = history_reads();
-        let got = rollups(&paths, ws, 7, now);
+        let got = rollups(&paths, ws, ws + Duration::hours(5), 7, now);
         assert_eq!(history_reads() - before, 1, "rollups reads history once");
         let sample = |m: i64, five, fable| WindowSample {
             t: ws + Duration::minutes(m),
