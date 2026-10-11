@@ -10,9 +10,9 @@ use crate::analytics::{self, BurnLine, Eta, Headroom, BURN_WINDOW_MINUTES};
 use crate::model::{ExtraUsage, UsageWindow};
 use crate::storage::InstanceUsage;
 
-use eframe::egui::{vec2, Align, Color32, Layout, Rect, RichText, Sense, Ui};
+use eframe::egui::{vec2, Align, Color32, Layout, Rect, RichText, Sense, TextStyle, Ui};
 
-use super::{bar_track_color, show_runs, tone_color, Run, Tone};
+use super::{bar_track_color, digits, show_runs, theme, tone_color, Run, Tone};
 
 /// One window's summary row, ready to lay out.
 #[derive(Debug, Clone, PartialEq)]
@@ -59,10 +59,11 @@ pub enum BurnTag {
     Fable,
 }
 
-/// The burn line's tag: cyan "ALL:" or coral "FABLE:".
+/// The burn line's tag: strong "ALL:" or coral "FABLE:" (the accent is
+/// clay too, so ALL stays neutral to keep the two apart).
 pub fn burn_tag(tag: BurnTag) -> Run {
     match tag {
-        BurnTag::All => Run::new("ALL:", Tone::Accent),
+        BurnTag::All => Run::new("ALL:", Tone::Strong),
         BurnTag::Fable => Run::new("FABLE:", Tone::Fable),
     }
 }
@@ -180,7 +181,7 @@ pub fn last_polled(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 /// Label column: fits the longest window label ("Omelette promo").
 const LABEL_WIDTH: f32 = 104.0;
-/// Percentage column ("100.0%" in monospace).
+/// Percentage column ("100.0%" with fixed-width digits).
 const PCT_WIDTH: f32 = 56.0;
 /// Reset countdown column ("23h 59m").
 const RESET_WIDTH: f32 = 64.0;
@@ -211,12 +212,14 @@ fn right() -> Layout {
 pub fn show_window_row(ui: &mut Ui, row: &WindowRow) {
     ui.horizontal(|ui| {
         cell(ui, LABEL_WIDTH, left(), |ui| {
-            ui.label(RichText::new(&row.label).color(tone_color(Tone::Strong, ui.visuals())));
+            let body = TextStyle::Body.resolve(ui.style());
+            ui.label(
+                RichText::new(&row.label)
+                    .font(theme::font_for(Tone::Strong, &body))
+                    .color(tone_color(Tone::Strong, ui.visuals())),
+            );
         });
-        cell(ui, PCT_WIDTH, right(), |ui| {
-            let color = tone_color(row.pct.tone, ui.visuals());
-            ui.label(RichText::new(&row.pct.text).monospace().color(color));
-        });
+        cell(ui, PCT_WIDTH, right(), |ui| number(ui, &row.pct));
         let gap = ui.spacing().item_spacing.x;
         let bar_width = (ui.available_width() - RESET_WIDTH - gap).max(0.0);
         paint_bar(
@@ -225,11 +228,16 @@ pub fn show_window_row(ui: &mut Ui, row: &WindowRow) {
             row.fraction,
             tone_color(row.fill, ui.visuals()),
         );
-        cell(ui, RESET_WIDTH, right(), |ui| {
-            let color = tone_color(row.reset.tone, ui.visuals());
-            ui.label(RichText::new(&row.reset.text).monospace().color(color));
-        });
+        cell(ui, RESET_WIDTH, right(), |ui| number(ui, &row.reset));
     });
+}
+
+/// A run in the body font with fixed-width digits; strong runs semibold.
+fn number(ui: &mut Ui, run: &Run) {
+    let body = TextStyle::Body.resolve(ui.style());
+    let font = theme::font_for(run.tone, &body);
+    let color = tone_color(run.tone, ui.visuals());
+    digits::number_label(ui, run.text.trim_start(), font, color);
 }
 
 /// A rounded track with the filled share painted over it.
@@ -253,9 +261,10 @@ pub fn show_burn_row(ui: &mut Ui, tag: BurnTag, body: &[Run]) {
     ui.horizontal(|ui| {
         cell(ui, TAG_WIDTH, left(), |ui| {
             let tag = burn_tag(tag);
+            let body = TextStyle::Body.resolve(ui.style());
             ui.label(
                 RichText::new(tag.text)
-                    .strong()
+                    .font(theme::semibold(body.size))
                     .color(tone_color(tag.tone, ui.visuals())),
             );
         });
@@ -333,7 +342,7 @@ mod tests {
 
     #[test]
     fn burn_tags() {
-        assert_eq!(burn_tag(BurnTag::All), Run::new("ALL:", Tone::Accent));
+        assert_eq!(burn_tag(BurnTag::All), Run::new("ALL:", Tone::Strong));
         assert_eq!(burn_tag(BurnTag::Fable), Run::new("FABLE:", Tone::Fable));
     }
 

@@ -202,7 +202,11 @@ impl App {
             let message = err.message.clone();
             let mut open_settings = false;
             error_frame(ui, red, |ui| {
-                ui.colored_label(red, RichText::new("claude.ai usage — error").strong());
+                let body = egui::TextStyle::Body.resolve(ui.style());
+                ui.colored_label(
+                    red,
+                    RichText::new("claude.ai usage — error").font(theme::semibold(body.size)),
+                );
                 ui.add(egui::Label::new(RichText::new(message).color(red)).wrap());
                 if hint {
                     ui.horizontal_wrapped(|ui| {
@@ -244,13 +248,13 @@ fn right_then_left(
     });
 }
 
-/// A red-outlined frame across the full width.
+/// A red-outlined card across the full width.
 fn error_frame(ui: &mut Ui, red: Color32, add: impl FnOnce(&mut Ui)) {
     Frame::new()
         .stroke((1.0, red))
-        .fill(red.gamma_multiply(0.08))
-        .corner_radius(4.0)
-        .inner_margin(8.0)
+        .fill(red.gamma_multiply(0.10))
+        .corner_radius(theme::CARD_RADIUS)
+        .inner_margin(10.0)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
