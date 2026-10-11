@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use eframe::egui::{Color32, Context, Id};
 
+use crate::analytics::alerts;
+
 /// How long an eased value takes to reach a new target.
 pub const EASE: Duration = Duration::from_millis(450);
 /// How long the projection line takes to draw in.
@@ -232,15 +234,17 @@ pub fn pulse_at(elapsed: Duration, keep_pulsing: bool) -> Pulse {
 pub struct PulseTracker {
     /// When the current crossing began; kept until re-armed.
     crossed_at: Option<Instant>,
-    /// The 5-hour window (its reset time) last seen.
+    /// The 5-hour window (its reset time) the tracker is in.
     window: Option<DateTime<Utc>>,
 }
 
 impl PulseTracker {
     /// The pulse for the 5-hour `pct` in `window` (its reset time) at
     /// `now`. Re-arms once the % drops below [`PULSE_REARM_BELOW_PCT`] or
-    /// the window changes, so wobbling around 90 doesn't replay the
-    /// breaths. `reduce_motion` holds the steady emphasis without pulsing.
+    /// the window changes ([`alerts::same_window`], so `resets_at` jitter
+    /// is the same window; a poll without a reset time changes nothing),
+    /// so wobbling around 90 doesn't replay the breaths. `reduce_motion`
+    /// holds the steady emphasis without pulsing.
     pub fn update(
         &mut self,
         pct: Option<f64>,
@@ -249,10 +253,16 @@ impl PulseTracker {
         keep_pulsing: bool,
         reduce_motion: bool,
     ) -> Pulse {
-        if window != self.window || pct.is_none_or(|p| p < PULSE_REARM_BELOW_PCT) {
+        let new_window = match (self.window, window) {
+            (Some(was), Some(is)) => !alerts::same_window(was, is),
+            _ => false,
+        };
+        if new_window || pct.is_none_or(|p| p < PULSE_REARM_BELOW_PCT) {
             self.crossed_at = None;
         }
-        self.window = window;
+        if new_window || self.window.is_none() {
+            self.window = window;
+        }
         if pct.is_none_or(|p| p < PULSE_FROM_PCT) {
             return Pulse::NONE;
         }
@@ -575,6 +585,39 @@ mod tests {
         let next = tr.update(Some(92.0), window(5), t0 + ms(21_000), false, false);
         assert!(next.moving);
         assert_eq!(next.level, PULSE_TROUGH);
+    }
+
+    #[test]
+    fn tracker_ignores_reset_time_jitter_and_missing_reset_times() {
+        let t0 = Instant::now();
+        let base = window(0).unwrap();
+        let mut tr = PulseTracker::default();
+        let at = |s: u64| t0 + ms(s * 1_000);
+        assert!(
+            tr.update(Some(93.0), Some(base), at(0), false, false)
+                .moving
+        );
+        // Each poll's resets_at jitters (sub-second, seconds, -290 s), and
+        // one poll lacks it: the breaths run on and end steady.
+        let jitters_ms = [107_492, -400, 3_000, -4_500, -290_000];
+        for (i, j) in jitters_ms.iter().enumerate() {
+            let w = Some(base + chrono::Duration::milliseconds(*j));
+            let p = tr.update(Some(93.0), w, at(6 + i as u64), false, false);
+            assert_eq!(p, Pulse::STEADY, "restarted at jitter {j} ms");
+        }
+        assert_eq!(
+            tr.update(Some(93.0), None, at(12), false, false),
+            Pulse::STEADY
+        );
+        assert_eq!(
+            tr.update(Some(93.0), Some(base), at(13), false, false),
+            Pulse::STEADY
+        );
+        // The next window, 5 hours later: re-armed.
+        let next = Some(base + chrono::Duration::hours(5));
+        let p = tr.update(Some(93.0), next, at(14), false, false);
+        assert!(p.moving);
+        assert_eq!(p.level, PULSE_TROUGH);
     }
 
     #[test]
