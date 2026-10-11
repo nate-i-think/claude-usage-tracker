@@ -640,7 +640,12 @@ pub fn show_timeline(
         pct: motion::eased(&ctx, Id::new("timeline-now-pct"), pct),
         projection: p,
         label: end_label(reset_known, &p, now),
-        share: motion::draw_in(&ctx, Id::new("timeline-projection"), p.end_pct),
+        share: motion::draw_in(
+            &ctx,
+            Id::new("timeline-projection"),
+            d.snapshot.fetched_at.timestamp_millis(),
+            p.end_pct,
+        ),
     });
     paint_now(&painter, &axes, palette, state, now, ends, &font);
 

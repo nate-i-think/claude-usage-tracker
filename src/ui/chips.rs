@@ -43,6 +43,8 @@ pub struct Chip {
     /// [`analytics::pace`]); `None` without a reset time.
     pub pace: Option<f64>,
     pub resets_at: Option<DateTime<Utc>>,
+    /// Shows the near-cap pulse (the 5-hour chip).
+    pub pulses: bool,
 }
 
 /// The chips for this snapshot: 5-hour and 7-day all always, Fable only
@@ -65,6 +67,7 @@ pub fn chips(
             .and(five_pct)
             .and_then(|u| analytics::pace(u, window_start, window_end, now)),
         resets_at: five_reset,
+        pulses: true,
     }];
     let weekly = |label: &'static str| {
         let w = snap.window(label);
@@ -75,6 +78,7 @@ pub fn chips(
             pct,
             pace: analytics::seven_day_pace(pct, resets_at, now),
             resets_at,
+            pulses: false,
         }
     };
     out.push(weekly("7-day all"));
@@ -228,8 +232,9 @@ pub fn pace_color(tone: PaceTone, palette: &Palette) -> Color32 {
 }
 
 /// The chips, packed into as many rows as the width needs. Percentages
-/// and their state colors ease to each poll's values; the 5-hour chip's
-/// border and glow show `pulse` (a [`motion::Pulse`] level, 0 = none).
+/// and their state colors ease to each poll's values; the border and glow
+/// of the chip that [`Chip::pulses`] show `pulse` (a [`motion::Pulse`]
+/// level, 0 = none).
 pub fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
     let palette = Palette::for_visuals(ui.visuals());
     let ctx = ui.ctx().clone();
@@ -257,7 +262,7 @@ pub fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
         for count in rows {
             ui.horizontal(|ui| {
                 for ((chip, m), (_, color)) in items.by_ref().take(count) {
-                    let glow = if chip.label == "5-hour" { pulse } else { 0.0 };
+                    let glow = if chip.pulses { pulse } else { 0.0 };
                     paint_chip(ui, m, palette, glow, color)
                         .on_hover_text(tooltip_in(chip, now, &Local));
                 }
@@ -358,6 +363,8 @@ mod tests {
         assert_eq!(c[0].pct, Some(46.0));
         assert!((c[0].pace.unwrap() - -14.0).abs() < 1e-9);
         assert_eq!(c[0].resets_at, Some(t(14, 0)));
+        assert!(c[0].pulses, "the 5-hour chip shows the near-cap pulse");
+        assert!(!c[1].pulses);
         // 7-day: 4 of 7 days gone -> 13 - 57.14.
         assert_eq!(c[1].label, "7-day all");
         assert!((c[1].pace.unwrap() - (13.0 - 400.0 / 7.0)).abs() < 1e-9);
@@ -448,6 +455,7 @@ mod tests {
             pct: Some(46.0),
             pace: Some(6.0),
             resets_at: Some(t(13, 59)),
+            pulses: true,
         };
         assert_eq!(
             tooltip_in(&chip, t(12, 0), &tz),

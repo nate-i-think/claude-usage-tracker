@@ -200,13 +200,10 @@ impl App {
     /// the window is shown, so the three pulses play where they are seen.
     fn update_motion(&mut self, ctx: &egui::Context) {
         motion::set_reduce_motion(ctx, self.settings.reduce_motion);
-        let pct = self
-            .state
-            .data
-            .as_ref()
-            .and_then(|d| d.snapshot.five_hour_pct());
+        let snap = self.state.data.as_ref().map(|d| &d.snapshot);
         self.pulse = self.pulse_tracker.update(
-            pct,
+            snap.and_then(|s| s.five_hour_pct()),
+            snap.and_then(|s| s.five_hour_resets_at()),
             Instant::now(),
             self.settings.keep_pulsing,
             self.settings.reduce_motion,
