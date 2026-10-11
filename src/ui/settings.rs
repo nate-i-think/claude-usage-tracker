@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, Align, Color32, Frame, Layout, RichText, TextEdit, Ui};
+use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit, Ui};
 
 use crate::analytics::Level;
 use crate::config::{
@@ -16,7 +16,7 @@ use crate::config::{
 };
 use crate::poller::PollMsg;
 
-use super::level_color;
+use super::{level_color, theme};
 
 /// The panel's text fields, edited freely until Apply.
 #[derive(Debug, Clone, PartialEq)]
@@ -219,9 +219,10 @@ impl SettingsPanel {
         let green = level_color(Level::Green, ui.visuals());
         let orange = level_color(Level::Orange, ui.visuals());
         let mut action = PanelAction::None;
-        Frame::group(ui.style()).show(ui, |ui| {
+        let palette = theme::Palette::for_visuals(ui.visuals());
+        theme::card(palette).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.strong("Settings");
+            ui.heading("Settings");
             ui.add_space(4.0);
 
             field(ui, "Plan label", |ui| {

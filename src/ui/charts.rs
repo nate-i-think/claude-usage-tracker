@@ -6,12 +6,14 @@
 //! which are simpler to draw directly than to pin down in a plot widget.
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
-use eframe::egui::{pos2, vec2, Align2, Frame, Rect, RichText, Sense, Stroke, TextStyle, Ui};
+use eframe::egui::{
+    pos2, vec2, Align2, CornerRadius, Rect, RichText, Sense, Stroke, TextStyle, Ui,
+};
 
 use crate::analytics::{self, CHART_HEIGHT, FABLE_TO_WEEKLY_ALL_RATIO, FABLE_WEEKLY_TO_5H_RATIO};
 use crate::poller::Dashboard;
 
-use super::{bar_track_color, tone_color, Tone};
+use super::theme::{self, Palette};
 
 /// Chart titles.
 const FIVE_HOUR_TITLE: &str = "5-hour window";
@@ -156,26 +158,19 @@ pub fn show_charts(ui: &mut Ui, d: &Dashboard) {
     }
 }
 
-/// One framed chart with its title, like the TUI's panels.
+/// One chart on a card with its title.
 fn chart(ui: &mut Ui, title: &str, bars: &[ChartBar]) {
-    let accent = tone_color(Tone::Accent, ui.visuals());
-    // Dim border while empty, like the TUI's placeholder panel.
-    let border = if bars.is_empty() {
-        ui.visuals().weak_text_color()
-    } else {
-        accent.gamma_multiply(0.6)
-    };
-    Frame::group(ui.style())
-        .stroke((1.0, border))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| ui.label(RichText::new(title).color(accent)));
-            if bars.is_empty() {
-                ui.vertical_centered(|ui| ui.weak("no data yet"));
-            } else {
-                plot(ui, bars);
-            }
-        });
+    let palette = Palette::for_visuals(ui.visuals());
+    let title_font = theme::semibold(TextStyle::Body.resolve(ui.style()).size);
+    theme::card(palette).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).font(title_font).color(palette.text));
+        if bars.is_empty() {
+            ui.vertical_centered(|ui| ui.weak("no data yet"));
+        } else {
+            plot(ui, bars);
+        }
+    });
 }
 
 /// Axes, gridlines, bars and labels, with hover text per slot.
@@ -185,12 +180,13 @@ fn plot(ui: &mut Ui, bars: &[ChartBar]) {
         Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    let visuals = ui.visuals();
+    let palette = Palette::for_visuals(ui.visuals());
     let font = TextStyle::Small.resolve(ui.style());
-    let dim = visuals.weak_text_color();
-    let grid = bar_track_color(visuals);
-    let bar_color = tone_color(Tone::Accent, visuals);
-    let orange = tone_color(Tone::Fable, visuals);
+    let dim = palette.text_muted;
+    let grid = palette.grid;
+    // Neutral bars, so the coral Fable floor stands out.
+    let bar_color = palette.text_muted;
+    let orange = palette.fable;
 
     let y_label_w = painter
         .layout_no_wrap("100%".to_owned(), font.clone(), dim)
@@ -232,18 +228,29 @@ fn plot(ui: &mut Ui, bars: &[ChartBar]) {
         if hovered == Some(i) {
             let slot =
                 Rect::from_x_y_ranges((cx - slot_w / 2.0)..=(cx + slot_w / 2.0), area.y_range());
-            painter.rect_filled(slot, 0.0, grid.gamma_multiply(0.5));
+            painter.rect_filled(slot, 4.0, palette.raised);
         }
         if let Some(s) = bar.split {
             let half = slot_w * BAR_FILL / 2.0;
             let column = |from: f64, to: f64| {
                 Rect::from_x_y_ranges((cx - half)..=(cx + half), y_at(to)..=y_at(from))
             };
+            // Round the top of whichever segment is the bar's top.
+            let top = CornerRadius {
+                nw: 2,
+                ne: 2,
+                ..CornerRadius::ZERO
+            };
             if s.orange > 0.0 {
-                painter.rect_filled(column(0.0, s.orange), 0.0, orange);
+                let corners = if s.rest > 0.0 {
+                    CornerRadius::ZERO
+                } else {
+                    top
+                };
+                painter.rect_filled(column(0.0, s.orange), corners, orange);
             }
             if s.rest > 0.0 {
-                painter.rect_filled(column(s.orange, s.orange + s.rest), 0.0, bar_color);
+                painter.rect_filled(column(s.orange, s.orange + s.rest), top, bar_color);
             }
         }
         if !bar.axis_label.is_empty() {
@@ -257,8 +264,11 @@ fn plot(ui: &mut Ui, bars: &[ChartBar]) {
             painter.galley(pos, galley, dim);
         }
     }
-    painter.hline(area.x_range(), area.bottom(), Stroke::new(1.0, dim));
-    painter.vline(area.left(), area.y_range(), Stroke::new(1.0, dim));
+    painter.hline(
+        area.x_range(),
+        area.bottom(),
+        Stroke::new(1.0, palette.border),
+    );
 
     if let Some(i) = hovered {
         let bar = &bars[i];
