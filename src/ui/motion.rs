@@ -10,6 +10,7 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use eframe::egui::{Color32, Context, Id};
 
 /// How long an eased value takes to reach a new target.
@@ -21,6 +22,15 @@ pub const DRAW_IN: Duration = Duration::from_millis(600);
 pub const REDRAW_POINTS: f64 = 5.0;
 /// The 5-hour % at and above which the chip (and the pill's dot) pulse.
 pub const PULSE_FROM_PCT: f64 = 90.0;
+/// Once pulsed, the 5-hour % must drop below this (or the window change)
+/// before crossing [`PULSE_FROM_PCT`] pulses again, so hovering around 90
+/// doesn't replay the breaths.
+pub const PULSE_REARM_BELOW_PCT: f64 = 88.0;
+/// An eased value not drawn for longer than this (the window was hidden
+/// or minimized, a section was collapsed) snaps to its new value instead
+/// of gliding from a stale one. The 1 s tick keeps a shown value well
+/// inside it.
+pub const HIDDEN_GAP: Duration = Duration::from_secs(2);
 /// One pulse, trough to trough.
 pub const PULSE_PERIOD: Duration = Duration::from_millis(2_000);
 /// Pulses shown when the threshold is first crossed, before holding steady.
@@ -67,8 +77,8 @@ impl Lerp for Color32 {
     }
 }
 
-/// One eased value: snaps on its first value and whenever it was not shown
-/// on the previous pass, otherwise glides from where it is to each new
+/// One eased value: snaps on its first value and after going undrawn for
+/// more than [`HIDDEN_GAP`], otherwise glides from where it is to each new
 /// target over [`EASE`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tween<T> {
@@ -76,30 +86,31 @@ pub struct Tween<T> {
     to: T,
     /// When the current glide began; `None` once settled.
     start: Option<Instant>,
-    /// The egui pass this was last updated on.
-    last_pass: u64,
+    /// When this was last drawn.
+    last_seen: Instant,
 }
 
 impl<T: Lerp> Tween<T> {
-    /// A tween resting at `value`, first shown on `pass`.
-    pub fn new(value: T, pass: u64) -> Self {
+    /// A tween resting at `value`, drawn at `now`.
+    pub fn new(value: T, now: Instant) -> Self {
         Self {
             from: value,
             to: value,
             start: None,
-            last_pass: pass,
+            last_seen: now,
         }
     }
 
-    /// Point the tween at `target` on `pass` and return the value to show
-    /// now. A new target starts a glide from the current value; the same
-    /// target keeps going (or stays put). `animate == false` (reduce
-    /// motion) or a skipped pass (the value was hidden) snaps.
-    pub fn update(&mut self, target: T, now: Instant, pass: u64, animate: bool) -> T {
-        let shown_last_pass = pass <= self.last_pass.saturating_add(1);
-        self.last_pass = pass;
-        if !animate || !shown_last_pass {
-            *self = Self::new(target, pass);
+    /// Point the tween at `target` at `now` and return the value to show.
+    /// A new target starts a glide from the current value; the same target
+    /// keeps going (or stays put). `animate == false` (reduce motion) or
+    /// more than [`HIDDEN_GAP`] since the last draw (the window was hidden,
+    /// a section collapsed) snaps.
+    pub fn update(&mut self, target: T, now: Instant, animate: bool) -> T {
+        let hidden = now.saturating_duration_since(self.last_seen) > HIDDEN_GAP;
+        self.last_seen = now;
+        if !animate || hidden {
+            *self = Self::new(target, now);
         } else if target != self.to {
             self.from = self.value(now);
             self.to = target;
@@ -126,23 +137,33 @@ impl<T: Lerp> Tween<T> {
 }
 
 /// The projection line's draw-in: from nothing to full over [`DRAW_IN`]
-/// the first time a projection appears, and again whenever its end moves
-/// by more than [`REDRAW_POINTS`] from one update to the next (a poll
-/// changed the picture; the slow drift between polls never does).
+/// the first time a projection appears, and again when a new poll moves
+/// its end by more than [`REDRAW_POINTS`] from where the previous poll put
+/// it. Between polls the end drifts with the clock; that never redraws.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct DrawIn {
+    /// The poll the end was last taken from (its identity, e.g. fetch
+    /// time in ms).
+    last_poll: Option<i64>,
     last_end: Option<f64>,
     start: Option<Instant>,
 }
 
 impl DrawIn {
-    /// Feed the projection's end % and get the share of the line to draw,
-    /// 0..=1, eased. `animate == false` always draws it whole.
-    pub fn update(&mut self, end_pct: f64, now: Instant, animate: bool) -> f32 {
-        let moved = self
-            .last_end
-            .is_none_or(|last| (end_pct - last).abs() > REDRAW_POINTS);
-        self.last_end = Some(end_pct);
+    /// Feed the projection's end % as of `poll` (an identity that changes
+    /// with each poll) and get the share of the line to draw, 0..=1, eased.
+    /// The end is compared only when `poll` changes. `animate == false`
+    /// always draws it whole.
+    pub fn update(&mut self, poll: i64, end_pct: f64, now: Instant, animate: bool) -> f32 {
+        let new_poll = self.last_poll != Some(poll);
+        let moved = new_poll
+            && self
+                .last_end
+                .is_none_or(|last| (end_pct - last).abs() > REDRAW_POINTS);
+        if new_poll {
+            self.last_poll = Some(poll);
+            self.last_end = Some(end_pct);
+        }
         if !animate {
             self.start = None;
         } else if moved {
@@ -209,22 +230,30 @@ pub fn pulse_at(elapsed: Duration, keep_pulsing: bool) -> Pulse {
 /// draw the same [`Pulse`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PulseTracker {
+    /// When the current crossing began; kept until re-armed.
     crossed_at: Option<Instant>,
+    /// The 5-hour window (its reset time) last seen.
+    window: Option<DateTime<Utc>>,
 }
 
 impl PulseTracker {
-    /// The pulse for the 5-hour `pct` at `now`. Dropping below the
-    /// threshold (a new window) re-arms it. `reduce_motion` holds the
-    /// steady emphasis without pulsing.
+    /// The pulse for the 5-hour `pct` in `window` (its reset time) at
+    /// `now`. Re-arms once the % drops below [`PULSE_REARM_BELOW_PCT`] or
+    /// the window changes, so wobbling around 90 doesn't replay the
+    /// breaths. `reduce_motion` holds the steady emphasis without pulsing.
     pub fn update(
         &mut self,
         pct: Option<f64>,
+        window: Option<DateTime<Utc>>,
         now: Instant,
         keep_pulsing: bool,
         reduce_motion: bool,
     ) -> Pulse {
-        if pct.is_none_or(|p| p < PULSE_FROM_PCT) {
+        if window != self.window || pct.is_none_or(|p| p < PULSE_REARM_BELOW_PCT) {
             self.crossed_at = None;
+        }
+        self.window = window;
+        if pct.is_none_or(|p| p < PULSE_FROM_PCT) {
             return Pulse::NONE;
         }
         let crossed = *self.crossed_at.get_or_insert(now);
@@ -272,19 +301,18 @@ pub fn animate_enabled(ctx: &Context) -> bool {
         .reduce_motion
 }
 
-/// `target` eased per `id`: snaps the first time `id` is shown (and after
-/// it was hidden), glides to each new target, and keeps frames coming only
-/// until it lands.
+/// `target` eased per `id`: snaps the first time `id` is drawn (and after
+/// [`HIDDEN_GAP`] undrawn), glides to each new target, and keeps frames
+/// coming only until it lands.
 pub fn eased<T>(ctx: &Context, id: Id, target: T) -> T
 where
     T: Lerp + Send + Sync + 'static,
 {
     let now = Instant::now();
-    let pass = ctx.cumulative_pass_nr();
     let animate = animate_enabled(ctx);
     let (value, moving) = ctx.data_mut(|d| {
-        let tween = d.get_temp_mut_or_insert_with(id, || Tween::new(target, pass));
-        let value = tween.update(target, now, pass, animate);
+        let tween = d.get_temp_mut_or_insert_with(id, || Tween::new(target, now));
+        let value = tween.update(target, now, animate);
         (value, tween.animating(now))
     });
     if moving {
@@ -293,14 +321,14 @@ where
     value
 }
 
-/// The share of the projection line to draw for its current `end_pct`
-/// (see [`DrawIn`]).
-pub fn draw_in(ctx: &Context, id: Id, end_pct: f64) -> f32 {
+/// The share of the projection line to draw for its end `end_pct` as of
+/// `poll` (see [`DrawIn`]).
+pub fn draw_in(ctx: &Context, id: Id, poll: i64, end_pct: f64) -> f32 {
     let now = Instant::now();
     let animate = animate_enabled(ctx);
     let (share, moving) = ctx.data_mut(|d| {
         let state = d.get_temp_mut_or_insert_with(id, DrawIn::default);
-        let share = state.update(end_pct, now, animate);
+        let share = state.update(poll, end_pct, now, animate);
         (share, state.animating(now))
     });
     if moving {
@@ -336,18 +364,18 @@ mod tests {
     #[test]
     fn tween_snaps_on_its_first_value() {
         let t0 = Instant::now();
-        let mut tw = Tween::new(46.0_f64, 1);
-        assert_eq!(tw.update(46.0, t0, 1, true), 46.0);
+        let mut tw = Tween::new(46.0_f64, t0);
+        assert_eq!(tw.update(46.0, t0, true), 46.0);
         assert!(!tw.animating(t0));
     }
 
     #[test]
     fn tween_same_target_never_animates() {
         let t0 = Instant::now();
-        let mut tw = Tween::new(46.0_f64, 1);
-        for pass in 2..10 {
-            let now = t0 + ms(16 * pass);
-            assert_eq!(tw.update(46.0, now, pass, true), 46.0);
+        let mut tw = Tween::new(46.0_f64, t0);
+        for i in 1..10 {
+            let now = t0 + ms(16 * i);
+            assert_eq!(tw.update(46.0, now, true), 46.0);
             assert!(!tw.animating(now));
         }
     }
@@ -355,87 +383,103 @@ mod tests {
     #[test]
     fn tween_glides_and_settles_exactly_on_target() {
         let t0 = Instant::now();
-        let mut tw = Tween::new(40.0_f64, 1);
+        let mut tw = Tween::new(40.0_f64, t0);
         // A poll moves the target: starts at the old value.
-        assert_eq!(tw.update(52.3, t0, 2, true), 40.0);
+        assert_eq!(tw.update(52.3, t0, true), 40.0);
         assert!(tw.animating(t0));
-        let mid = tw.update(52.3, t0 + ms(225), 3, true);
+        let mid = tw.update(52.3, t0 + ms(225), true);
         assert!(
             mid > 40.0 + 6.15,
             "ease-out is past halfway at half time: {mid}"
         );
         assert!(mid < 52.3);
         let end = t0 + EASE;
-        assert_eq!(tw.update(52.3, end, 4, true), 52.3, "exactly the target");
+        assert_eq!(tw.update(52.3, end, true), 52.3, "exactly the target");
         assert!(!tw.animating(end));
-        assert_eq!(tw.update(52.3, end + ms(5_000), 5, true), 52.3);
+        assert_eq!(tw.update(52.3, end + ms(1_000), true), 52.3);
     }
 
     #[test]
     fn tween_retargets_from_where_it_is() {
         let t0 = Instant::now();
-        let mut tw = Tween::new(0.0_f32, 1);
-        tw.update(100.0, t0, 2, true);
-        let at = tw.update(100.0, t0 + ms(100), 3, true);
+        let mut tw = Tween::new(0.0_f32, t0);
+        tw.update(100.0, t0, true);
+        let at = tw.update(100.0, t0 + ms(100), true);
         // New target mid-glide: continues from the current value.
-        assert_eq!(tw.update(50.0, t0 + ms(100), 4, true), at);
-        assert_eq!(tw.update(50.0, t0 + ms(100) + EASE, 5, true), 50.0);
+        assert_eq!(tw.update(50.0, t0 + ms(100), true), at);
+        assert_eq!(tw.update(50.0, t0 + ms(100) + EASE, true), 50.0);
     }
 
     #[test]
-    fn tween_snaps_with_reduce_motion_and_after_being_hidden() {
+    fn tween_snaps_with_reduce_motion() {
         let t0 = Instant::now();
-        let mut tw = Tween::new(10.0_f64, 1);
-        assert_eq!(tw.update(80.0, t0, 2, false), 80.0, "reduce motion snaps");
+        let mut tw = Tween::new(10.0_f64, t0);
+        assert_eq!(tw.update(80.0, t0, false), 80.0);
         assert!(!tw.animating(t0));
-        // Not shown on passes 3..=9: the new value snaps.
-        assert_eq!(tw.update(20.0, t0 + ms(10), 10, true), 20.0);
-        assert!(!tw.animating(t0 + ms(10)));
-        // Shown again next pass: glides.
-        assert_eq!(tw.update(30.0, t0 + ms(20), 11, true), 20.0);
-        assert!(tw.animating(t0 + ms(20)));
+    }
+
+    #[test]
+    fn tween_snaps_after_being_hidden_and_glides_while_shown() {
+        let t0 = Instant::now();
+        let mut tw = Tween::new(10.0_f64, t0);
+        // Drawn every second (the idle tick): a new value glides.
+        assert_eq!(tw.update(10.0, t0 + ms(1_000), true), 10.0);
+        assert_eq!(tw.update(20.0, t0 + ms(2_000), true), 10.0);
+        assert!(tw.animating(t0 + ms(2_000)));
+        // Undrawn for longer than HIDDEN_GAP (hidden to the tray): snaps.
+        let back = t0 + ms(2_000) + HIDDEN_GAP + ms(1);
+        assert_eq!(tw.update(70.0, back, true), 70.0);
+        assert!(!tw.animating(back));
+        // Exactly HIDDEN_GAP still glides.
+        assert_eq!(tw.update(80.0, back + HIDDEN_GAP, true), 70.0);
+        assert!(tw.animating(back + HIDDEN_GAP));
     }
 
     #[test]
     fn tween_colors_land_on_the_target() {
         let t0 = Instant::now();
-        let mut tw = Tween::new(Color32::RED, 1);
-        tw.update(Color32::GREEN, t0, 2, true);
+        let mut tw = Tween::new(Color32::RED, t0);
+        tw.update(Color32::GREEN, t0, true);
         assert_ne!(tw.value(t0 + ms(200)), Color32::GREEN);
         assert_eq!(tw.value(t0 + EASE), Color32::GREEN);
     }
 
     #[test]
-    fn draw_in_on_first_projection_and_big_moves_only() {
+    fn draw_in_on_first_projection_and_on_polls_that_move_it() {
         let t0 = Instant::now();
         let mut d = DrawIn::default();
-        assert_eq!(d.update(70.0, t0, true), 0.0, "first projection draws in");
+        assert_eq!(
+            d.update(1, 70.0, t0, true),
+            0.0,
+            "first projection draws in"
+        );
         assert!(d.animating(t0));
-        let half = d.update(70.5, t0 + ms(300), true);
+        let half = d.update(1, 70.5, t0 + ms(300), true);
         assert!(half > 0.5 && half < 1.0, "{half}");
-        assert_eq!(d.update(71.0, t0 + DRAW_IN, true), 1.0);
+        assert_eq!(d.update(1, 71.0, t0 + DRAW_IN, true), 1.0);
         assert!(!d.animating(t0 + DRAW_IN));
-        // Drifting a little each update never redraws, even over 5 total.
-        let mut end = 71.0;
-        for i in 1..=20 {
-            end += 0.5;
-            assert_eq!(d.update(end, t0 + DRAW_IN + ms(i * 16), true), 1.0);
+        // The same poll drifting with the clock never redraws, however far.
+        for i in 1..=40 {
+            let end = 70.0 + 0.5 * i as f64;
+            assert_eq!(d.update(1, end, t0 + DRAW_IN + ms(i * 16), true), 1.0);
         }
-        // A jump of more than 5 points (a poll) redraws.
+        // A new poll more than 5 points from the last poll's end redraws.
         let t1 = t0 + ms(10_000);
-        assert_eq!(d.update(end + 5.5, t1, true), 0.0);
-        assert_eq!(d.update(end + 5.5, t1 + DRAW_IN, true), 1.0);
-        // Exactly 5 points does not.
-        assert_eq!(d.update(end + 0.5, t1 + DRAW_IN + ms(16), true), 1.0);
+        assert_eq!(d.update(2, 75.5, t1, true), 0.0);
+        assert_eq!(d.update(2, 75.5, t1 + DRAW_IN, true), 1.0);
+        // A new poll exactly 5 points away does not.
+        assert_eq!(d.update(3, 80.5, t1 + DRAW_IN + ms(16), true), 1.0);
+        // Nor does a new poll that only matches the drift.
+        assert_eq!(d.update(4, 82.0, t1 + DRAW_IN + ms(32), true), 1.0);
     }
 
     #[test]
     fn draw_in_whole_with_reduce_motion() {
         let t0 = Instant::now();
         let mut d = DrawIn::default();
-        assert_eq!(d.update(70.0, t0, false), 1.0);
+        assert_eq!(d.update(1, 70.0, t0, false), 1.0);
         assert!(!d.animating(t0));
-        assert_eq!(d.update(90.0, t0 + ms(16), false), 1.0);
+        assert_eq!(d.update(2, 90.0, t0 + ms(16), false), 1.0);
     }
 
     #[test]
@@ -468,37 +512,79 @@ mod tests {
         assert!((pulse_at(ms(61_000), true).level - 1.0).abs() < 1e-4);
     }
 
+    fn window(h: i64) -> Option<DateTime<Utc>> {
+        DateTime::from_timestamp(1_791_000_000 + h * 3_600, 0)
+    }
+
     #[test]
     fn tracker_pulses_once_per_crossing() {
         let t0 = Instant::now();
+        let w = window(0);
         let mut tr = PulseTracker::default();
-        assert_eq!(tr.update(Some(89.9), t0, false, false), Pulse::NONE);
-        assert_eq!(tr.update(None, t0, false, false), Pulse::NONE);
+        assert_eq!(tr.update(Some(89.9), w, t0, false, false), Pulse::NONE);
+        assert_eq!(tr.update(None, w, t0, false, false), Pulse::NONE);
         // Crossing starts the breaths from the trough.
-        let first = tr.update(Some(90.0), t0 + ms(1), false, false);
+        let first = tr.update(Some(90.0), w, t0 + ms(1), false, false);
         assert!(first.moving);
         assert_eq!(first.level, PULSE_TROUGH);
         // Higher polls do not restart it.
-        assert!(tr.update(Some(95.0), t0 + ms(2_001), false, false).moving);
+        assert!(
+            tr.update(Some(95.0), w, t0 + ms(2_001), false, false)
+                .moving
+        );
         assert_eq!(
-            tr.update(Some(96.0), t0 + ms(5_001), false, false),
+            tr.update(Some(96.0), w, t0 + ms(5_001), false, false),
             Pulse::STEADY
         );
-        // A new window drops below: re-armed, the next crossing pulses again.
+    }
+
+    #[test]
+    fn tracker_rearms_below_88_or_in_a_new_window() {
+        let t0 = Instant::now();
+        let w = window(0);
+        let mut tr = PulseTracker::default();
+        tr.update(Some(91.0), w, t0, false, false);
         assert_eq!(
-            tr.update(Some(3.0), t0 + ms(9_000), false, false),
+            tr.update(Some(91.0), w, t0 + ms(6_000), false, false),
+            Pulse::STEADY
+        );
+        // Wobbling down to 89 and back: no emphasis below 90, no replay.
+        assert_eq!(
+            tr.update(Some(89.0), w, t0 + ms(7_000), false, false),
             Pulse::NONE
         );
-        assert!(tr.update(Some(91.0), t0 + ms(9_500), false, false).moving);
+        assert_eq!(
+            tr.update(Some(88.0), w, t0 + ms(8_000), false, false),
+            Pulse::NONE
+        );
+        assert_eq!(
+            tr.update(Some(90.5), w, t0 + ms(9_000), false, false),
+            Pulse::STEADY
+        );
+        // Below 88: re-armed, the next crossing pulses again.
+        tr.update(Some(87.9), w, t0 + ms(10_000), false, false);
+        assert!(
+            tr.update(Some(90.0), w, t0 + ms(11_000), false, false)
+                .moving
+        );
+        // A new window re-arms even without dropping below 88.
+        assert_eq!(
+            tr.update(Some(92.0), w, t0 + ms(20_000), false, false),
+            Pulse::STEADY
+        );
+        let next = tr.update(Some(92.0), window(5), t0 + ms(21_000), false, false);
+        assert!(next.moving);
+        assert_eq!(next.level, PULSE_TROUGH);
     }
 
     #[test]
     fn tracker_reduce_motion_holds_steady() {
         let t0 = Instant::now();
+        let w = window(0);
         let mut tr = PulseTracker::default();
-        assert_eq!(tr.update(Some(93.0), t0, false, true), Pulse::STEADY);
-        assert_eq!(tr.update(Some(93.0), t0, true, true), Pulse::STEADY);
-        assert_eq!(tr.update(Some(50.0), t0, true, true), Pulse::NONE);
+        assert_eq!(tr.update(Some(93.0), w, t0, false, true), Pulse::STEADY);
+        assert_eq!(tr.update(Some(93.0), w, t0, true, true), Pulse::STEADY);
+        assert_eq!(tr.update(Some(50.0), w, t0, true, true), Pulse::NONE);
     }
 
     #[test]
