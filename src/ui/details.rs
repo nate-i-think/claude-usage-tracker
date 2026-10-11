@@ -14,7 +14,7 @@ use crate::storage::InstanceUsage;
 use super::layout::{right_then_left, GAP};
 use super::rows::{self, BurnTag};
 use super::theme::{self, Palette};
-use super::{digits, show_runs};
+use super::{digits, motion, show_runs};
 
 /// How many burners the list shows.
 pub const TOP_BURNERS: usize = 5;
@@ -170,9 +170,11 @@ fn burner_line(ui: &mut Ui, row: &BurnerRow, palette: &Palette) {
             let track = Rect::from_center_size(rect.center(), vec2(BURNER_BAR_W, BURNER_BAR_H));
             ui.painter()
                 .rect_filled(track, BURNER_BAR_H / 2.0, palette.track);
-            if row.fraction > 0.0 {
+            let id = egui::Id::new(("burner-bar", &row.name));
+            let fraction = motion::eased(ui.ctx(), id, row.fraction);
+            if fraction > 0.0 {
                 let mut fill = track;
-                fill.set_width((BURNER_BAR_W * row.fraction).max(BURNER_BAR_H));
+                fill.set_width((BURNER_BAR_W * fraction).max(BURNER_BAR_H));
                 ui.painter()
                     .rect_filled(fill, BURNER_BAR_H / 2.0, palette.bar);
             }

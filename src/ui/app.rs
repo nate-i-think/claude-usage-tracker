@@ -21,7 +21,7 @@ use super::banners::{banner, BannerKind};
 use super::layout::{self, right_then_left, GAP};
 use super::settings::{self, PanelAction, SettingsPanel};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
-use super::{chips, details, footer, theme, timeline};
+use super::{chips, details, footer, motion, theme, timeline};
 
 /// Key eframe stores egui's memory (including the theme preference) under
 /// (private `STORAGE_EGUI_MEMORY_KEY` in eframe's native/epi_integration.rs).
@@ -103,6 +103,11 @@ pub struct App {
     /// The settings panel, while open.
     settings_panel: Option<SettingsPanel>,
     last_refresh: Option<Instant>,
+    /// The near-cap pulse's schedule; drawn by the 5-hour chip (and the
+    /// pill's state dot).
+    pulse_tracker: motion::PulseTracker,
+    /// This frame's pulse, from [`App::update_motion`].
+    pulse: motion::Pulse,
 }
 
 impl App {
@@ -136,6 +141,8 @@ impl App {
             state: PollState::default(),
             settings_panel: None,
             last_refresh: None,
+            pulse_tracker: motion::PulseTracker::default(),
+            pulse: motion::Pulse::NONE,
         }
     }
 
@@ -187,6 +194,29 @@ impl App {
     /// tray icon (Task 9) and threshold alerts (Task 10) hook in here.
     fn background_hooks(&mut self, _now: Instant) {}
 
+    /// Hand this frame's motion preferences to the widgets and advance the
+    /// near-cap pulse; asks for the next pulse frame only while it moves
+    /// and the window is visible. Called from `ui()`, which only runs while
+    /// the window is shown, so the three pulses play where they are seen.
+    fn update_motion(&mut self, ctx: &egui::Context) {
+        motion::set_reduce_motion(ctx, self.settings.reduce_motion);
+        let pct = self
+            .state
+            .data
+            .as_ref()
+            .and_then(|d| d.snapshot.five_hour_pct());
+        self.pulse = self.pulse_tracker.update(
+            pct,
+            Instant::now(),
+            self.settings.keep_pulsing,
+            self.settings.reduce_motion,
+        );
+        let visible = ctx.input(|i| i.viewport().visible()) != Some(false);
+        if let Some(after) = motion::pulse_repaint(self.pulse, visible) {
+            ctx.request_repaint_after(after);
+        }
+    }
+
     /// Stat chips on the left (wrapping as needed), refresh, pill and
     /// settings buttons on the right.
     fn header(&mut self, ui: &mut Ui) {
@@ -196,6 +226,7 @@ impl App {
             .data
             .as_ref()
             .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now));
+        let pulse = self.pulse.level;
         right_then_left(
             ui,
             Align::Min,
@@ -223,7 +254,7 @@ impl App {
             },
             |ui| {
                 if let Some(chips) = &chips {
-                    chips::show_chips(ui, chips, now);
+                    chips::show_chips(ui, chips, now, pulse);
                 }
             },
         );
@@ -360,6 +391,7 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.update_motion(ui.ctx());
         let frame = Frame::central_panel(ui.style()).inner_margin(Margin::same(layout::OUTER_PAD));
         CentralPanel::default().frame(frame).show(ui, |ui| {
             // A solid scrollbar takes its own space instead of overlaying

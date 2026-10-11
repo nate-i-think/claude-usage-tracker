@@ -12,6 +12,7 @@ pub mod details;
 pub mod digits;
 pub mod footer;
 pub mod layout;
+pub mod motion;
 pub mod rows;
 pub mod settings;
 pub mod sparkline;

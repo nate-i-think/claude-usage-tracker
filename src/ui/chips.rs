@@ -9,8 +9,8 @@ use std::fmt::Display;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use eframe::egui::{
-    epaint::Shadow, pos2, vec2, Align2, Color32, FontId, Rect, Response, Sense, Stroke, TextStyle,
-    Ui,
+    epaint::Shadow, pos2, vec2, Align2, Color32, FontId, Id, Rect, Response, Sense, Stroke,
+    TextStyle, Ui,
 };
 
 use crate::analytics::{self, alerts::fmt_clock_in, Level};
@@ -18,6 +18,7 @@ use crate::model::Snapshot;
 
 use super::digits;
 use super::layout::{self, GAP};
+use super::motion;
 use super::theme::{self, Palette};
 
 /// Chip corner radius.
@@ -186,13 +187,20 @@ struct Measured {
     size: eframe::egui::Vec2,
 }
 
-fn measure(ui: &Ui, chip: &Chip, palette: &Palette) -> Measured {
+/// `chip` measured with its percentage shown as `pct` (eased) in
+/// `pct_color` (eased state color).
+fn measure(
+    ui: &Ui,
+    chip: &Chip,
+    pct: Option<f64>,
+    pct_color: Color32,
+    palette: &Palette,
+) -> Measured {
     let painter = ui.painter();
     let small = TextStyle::Small.resolve(ui.style());
     let big = TextStyle::Name(theme::CHIP.into()).resolve(ui.style());
     let label = painter.layout_no_wrap(chip.label.to_owned(), small.clone(), palette.text_muted);
-    let pct_color = palette.level(analytics::color_for(chip.pct));
-    let pct = digits::number_galley(painter, &pct_text(chip.pct), big, pct_color);
+    let pct = digits::number_galley(painter, &pct_text(pct), big, pct_color);
     let delta = chip.pace.filter(|_| chip.pct.is_some()).map(|d| {
         let font = FontId::new(small.size, small.family.clone());
         painter.layout_no_wrap(pace_text(d), font, pace_color(pace_tone(d), palette))
@@ -219,26 +227,53 @@ pub fn pace_color(tone: PaceTone, palette: &Palette) -> Color32 {
     }
 }
 
-/// The chips, packed into as many rows as the width needs.
-pub fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>) {
+/// The chips, packed into as many rows as the width needs. Percentages
+/// and their state colors ease to each poll's values; the 5-hour chip's
+/// border and glow show `pulse` (a [`motion::Pulse`] level, 0 = none).
+pub fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
     let palette = Palette::for_visuals(ui.visuals());
-    let measured: Vec<Measured> = chips.iter().map(|c| measure(ui, c, palette)).collect();
+    let ctx = ui.ctx().clone();
+    let shown: Vec<(Option<f64>, Color32)> = chips
+        .iter()
+        .map(|c| {
+            let color = palette.level(analytics::color_for(c.pct));
+            (
+                c.pct
+                    .map(|p| motion::eased(&ctx, Id::new(("chip-pct", c.label)), p)),
+                motion::eased(&ctx, Id::new(("chip-color", c.label)), color),
+            )
+        })
+        .collect();
+    let measured: Vec<Measured> = chips
+        .iter()
+        .zip(&shown)
+        .map(|(c, &(pct, color))| measure(ui, c, pct, color, palette))
+        .collect();
     let widths: Vec<f32> = measured.iter().map(|m| m.size.x).collect();
     let rows = layout::pack_rows(&widths, ui.available_width(), GAP);
-    let mut items = chips.iter().zip(measured);
+    let mut items = chips.iter().zip(measured).zip(shown);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(GAP, GAP);
         for count in rows {
             ui.horizontal(|ui| {
-                for (chip, m) in items.by_ref().take(count) {
-                    paint_chip(ui, m, palette).on_hover_text(tooltip_in(chip, now, &Local));
+                for ((chip, m), (_, color)) in items.by_ref().take(count) {
+                    let glow = if chip.label == "5-hour" { pulse } else { 0.0 };
+                    paint_chip(ui, m, palette, glow, color)
+                        .on_hover_text(tooltip_in(chip, now, &Local));
                 }
             });
         }
     });
 }
 
-fn paint_chip(ui: &mut Ui, m: Measured, palette: &Palette) -> Response {
+/// The chip's border: the theme's border, drawn toward `color` (the chip's
+/// state color) and thicker as `glow` rises to 1.
+pub fn glow_stroke(glow: f32, color: Color32, palette: &Palette) -> Stroke {
+    let glow = glow.clamp(0.0, 1.0);
+    Stroke::new(1.0 + 0.5 * glow, palette.border.lerp_to_gamma(color, glow))
+}
+
+fn paint_chip(ui: &mut Ui, m: Measured, palette: &Palette, glow: f32, color: Color32) -> Response {
     let (rect, response) = ui.allocate_exact_size(m.size, Sense::hover());
     let painter = ui.painter();
     let shadow = Shadow {
@@ -248,11 +283,20 @@ fn paint_chip(ui: &mut Ui, m: Measured, palette: &Palette) -> Response {
         color: palette.shadow,
     };
     painter.add(shadow.as_shape(rect, CHIP_RADIUS));
+    if glow > 0.0 {
+        let halo = Shadow {
+            offset: [0, 0],
+            blur: 12,
+            spread: 1,
+            color: color.gamma_multiply(0.45 * glow.min(1.0)),
+        };
+        painter.add(halo.as_shape(rect, CHIP_RADIUS));
+    }
     painter.rect(
         rect,
         CHIP_RADIUS,
         palette.surface,
-        Stroke::new(1.0, palette.border),
+        glow_stroke(glow, color, palette),
         eframe::egui::StrokeKind::Inside,
     );
     let inner = rect.shrink2(vec2(PAD_X, PAD_Y));
@@ -383,6 +427,17 @@ mod tests {
             reset_tip_in(t(20, 0), t(12, 0), &ist),
             "resets Mon 1:30 AM · in 8h 00m"
         );
+    }
+
+    #[test]
+    fn glow_border_from_theme_to_state_color() {
+        let palette = &theme::DARK;
+        let red = palette.danger;
+        let none = glow_stroke(0.0, red, palette);
+        assert_eq!(none, Stroke::new(1.0, palette.border));
+        let full = glow_stroke(1.0, red, palette);
+        assert_eq!(full, Stroke::new(1.5, red));
+        assert_eq!(glow_stroke(3.0, red, palette), full, "clamped");
     }
 
     #[test]
