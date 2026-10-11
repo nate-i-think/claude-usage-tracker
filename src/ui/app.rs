@@ -18,7 +18,7 @@ use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 use super::charts;
 use super::rows::{self, BurnTag};
 use super::settings::{self, PanelAction, SettingsPanel};
-use super::{install_fonts, level_color, show_runs, tone_color, Tone};
+use super::{level_color, show_runs, theme, tone_color, Tone};
 
 /// eframe storage key for [`Settings`].
 const SETTINGS_KEY: &str = "settings";
@@ -87,7 +87,7 @@ impl App {
         if first_run(cc.storage) {
             ctx.set_theme(egui::ThemePreference::Dark);
         }
-        install_fonts(&ctx);
+        theme::install(&ctx);
         if settings.always_on_top {
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(settings::window_level(true)));
         }
