@@ -99,6 +99,8 @@ pub struct App {
     /// The full-mode window as of the last pass that showed it; saved into
     /// [`Settings::full_rect`] / [`Settings::full_maximized`] by `save()`.
     tracked: TrackedWindow,
+    /// eframe's stale window key has been dropped from storage (first pass).
+    storage_cleaned: bool,
     state: PollState,
     /// The settings panel, while open.
     settings_panel: Option<SettingsPanel>,
@@ -132,6 +134,7 @@ impl App {
             persisted: settings.clone(),
             settings,
             tracked: TrackedWindow::default(),
+            storage_cleaned: false,
             state: PollState::default(),
             settings_panel: None,
             last_refresh: None,
@@ -160,6 +163,14 @@ impl App {
     /// Hand settings changes (from the panel, the pin, later the tray) to
     /// the poller and to storage.
     fn sync_settings(&mut self, frame: &mut eframe::Frame) {
+        if !self.storage_cleaned {
+            self.storage_cleaned = true;
+            if let Some(storage) = frame.storage_mut() {
+                if window::remove_stale_window_key(storage) {
+                    storage.flush();
+                }
+            }
+        }
         let sync = settings_sync(&self.settings, &self.poller_settings, &self.persisted);
         if let Some(msg) = sync.poller {
             self.poller.send(msg);
