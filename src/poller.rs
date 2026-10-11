@@ -46,8 +46,8 @@ pub struct Dashboard {
     /// End of the current five-hour window: its `resets_at`, else
     /// `window_start + 5h`.
     pub window_end: DateTime<Utc>,
-    /// Every history sample in `[window_start, window_start + 5h)`, oldest
-    /// first, including this poll's.
+    /// Every history sample in `[window_start, window_end)`, oldest first,
+    /// including this poll's.
     pub window_samples: Vec<WindowSample>,
     /// Saving this poll to history.jsonl failed; the data above is still
     /// fresh. Shown as a warning.
@@ -226,7 +226,7 @@ fn build_dashboard(
         .five_hour_resets_at()
         .unwrap_or(ws + ChronoDuration::hours(5));
     // One history read feeds all four charts and the window samples.
-    let rollups = storage::rollups(paths, ws, DAILY_DAYS, now);
+    let rollups = storage::rollups(paths, ws, window_end, DAILY_DAYS, now);
     let window_samples = with_current_sample(rollups.window_samples, &snapshot, ws, window_end);
     Dashboard {
         history: history.five_hour(),
@@ -246,7 +246,8 @@ fn build_dashboard(
 
 /// `samples` with this poll's sample at its exact fetch time, whether or not
 /// it reached history.jsonl (the persist can fail, and the file keeps only
-/// microseconds). Kept only when it falls inside the window.
+/// microseconds). Kept only when it falls inside the half-open window
+/// `[window_start, window_end)`, like the persisted samples.
 fn with_current_sample(
     mut samples: Vec<WindowSample>,
     snap: &Snapshot,
@@ -254,7 +255,7 @@ fn with_current_sample(
     window_end: DateTime<Utc>,
 ) -> Vec<WindowSample> {
     let t = snap.fetched_at;
-    if t < window_start || t > window_end {
+    if t < window_start || t >= window_end {
         return samples;
     }
     // The persisted copy of this poll, if any, rounded to microseconds.
@@ -864,6 +865,12 @@ mod tests {
             now - ChronoDuration::hours(1),
         );
         assert!(with_current_sample(vec![], &s, start, end).is_empty());
+        // Half-open like storage: the start is in, the end is out.
+        assert_eq!(
+            with_current_sample(vec![], &s, now, end + ChronoDuration::hours(9)),
+            [current]
+        );
+        assert!(with_current_sample(vec![], &s, start, now).is_empty());
     }
 
     #[test]
