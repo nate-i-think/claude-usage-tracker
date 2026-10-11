@@ -176,6 +176,8 @@ pub enum PanelAction {
     Apply(Settings),
     /// Discard the draft.
     Cancel,
+    /// Send a sample toast; the panel stays open.
+    TestNotification,
 }
 
 /// Adapted from the README section "Refreshing client_sha.txt".
@@ -346,6 +348,13 @@ impl SettingsPanel {
                 &mut d.alerts.projected_cap,
                 "Projected to hit the cap before reset",
             );
+            if ui
+                .button("Send test notification")
+                .on_hover_text("Shows a sample alert now, as real alerts are sent")
+                .clicked()
+            {
+                action = PanelAction::TestNotification;
+            }
 
             group_heading(ui, "Motion");
             theme::checkbox(ui, &mut d.reduce_motion, "Reduce motion");

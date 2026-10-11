@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"]
 
 use claude_usage::paths::Paths;
-use claude_usage::ui::{window, App};
+use claude_usage::ui::{notify, window, App};
 
 fn main() -> eframe::Result {
     // No console under windows_subsystem: make panics and startup failures
@@ -10,6 +10,8 @@ fn main() -> eframe::Result {
     claude_usage::install_crypto_provider();
     // The first window gets our own saved geometry; eframe's window
     // persistence is off (see ui::window).
+    // Toasts show under our own name and icon (per-user AUMID key).
+    let toast_app = notify::register(&Paths::platform_default());
     let settings = window::load_settings_early();
     let viewport = window::viewport_builder(&settings, window::PlaceBy::for_platform());
     let ours = viewport.clone();
@@ -24,7 +26,7 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         window::TITLE,
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, toast_app)))),
     );
     if let Err(e) = &result {
         claude_usage::crash::report(
