@@ -14,6 +14,7 @@ pub mod footer;
 pub mod layout;
 pub mod mode;
 pub mod motion;
+pub mod pill;
 pub mod rows;
 pub mod settings;
 pub mod sparkline;
