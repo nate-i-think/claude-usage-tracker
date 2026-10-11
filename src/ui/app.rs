@@ -15,6 +15,7 @@ use crate::model::UsageWindow;
 use crate::paths::Paths;
 use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 
+use super::charts;
 use super::rows::{self, BurnTag};
 use super::{install_fonts, level_color, show_runs, tone_color, Tone};
 
@@ -283,7 +284,8 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &Settings) {
         show_runs(ui, &rows::extra_runs(extra));
     }
 
-    // Charts (5-hour window, last 7 days) go here.
+    ui.add_space(8.0);
+    charts::show_charts(ui, d);
     ui.add_space(8.0);
 
     show_runs(ui, &rows::burners_runs(&d.burners));

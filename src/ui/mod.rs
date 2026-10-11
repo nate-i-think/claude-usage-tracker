@@ -6,6 +6,7 @@
 //! module is the one place tones and severity [`Level`]s become colors.
 
 pub mod app;
+pub mod charts;
 pub mod rows;
 
 pub use app::App;
