@@ -3,8 +3,10 @@
 pub mod analytics;
 pub mod config;
 pub mod cookies;
+pub mod fetch;
 pub mod model;
 pub mod paths;
+pub mod poller;
 pub mod storage;
 
 /// Install the rustls `ring` crypto provider as the process default.

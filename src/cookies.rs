@@ -5,6 +5,7 @@
 //! restricted to browsers that store cookies in `cookies.sqlite`.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -81,8 +82,8 @@ const BROWSERS: &[BrowserDef] = &[
 ];
 
 /// One cookie row. `expiry` is seconds since the epoch (normalized), `None`
-/// for a session cookie.
-#[derive(Debug, Clone, PartialEq)]
+/// for a session cookie. `Debug` shows the value only as its length.
+#[derive(Clone, PartialEq)]
 pub struct Cookie {
     pub host: String,
     pub name: String,
@@ -91,9 +92,22 @@ pub struct Cookie {
     pub expiry: Option<f64>,
 }
 
+impl fmt::Debug for Cookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cookie")
+            .field("host", &self.host)
+            .field("name", &self.name)
+            .field("value_len", &self.value.len())
+            .field("path", &self.path)
+            .field("expiry", &self.expiry)
+            .finish()
+    }
+}
+
 impl Cookie {
+    /// Exactly `claude.ai` or a subdomain of it (not `evilclaude.ai`).
     fn is_claude(&self) -> bool {
-        self.host.ends_with(CLAUDE_HOST)
+        is_claude_host(&self.host)
     }
 
     fn is_expired(&self, now: f64) -> bool {
@@ -101,12 +115,19 @@ impl Cookie {
     }
 }
 
+fn is_claude_host(host: &str) -> bool {
+    host == CLAUDE_HOST
+        || host
+            .strip_suffix(CLAUDE_HOST)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
 /// Ordering key for expiry: a session cookie (no expiry) counts as latest.
 fn expiry_rank(expiry: Option<f64>) -> f64 {
     expiry.unwrap_or(f64::INFINITY)
 }
 
-/// The claude.ai cookies read from one profile.
+/// The claude.ai cookies read from one profile. `Debug` never shows values.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CookieJar {
     pub cookies: Vec<Cookie>,
@@ -115,14 +136,14 @@ pub struct CookieJar {
 impl CookieJar {
     /// The `lastActiveOrg` cookie value (latest-expiring row if duplicated).
     pub fn org_id(&self) -> Result<String> {
-        self.latest_named("lastActiveOrg", false)
+        self.latest_named("lastActiveOrg")
             .map(|c| c.value.clone())
             .ok_or_else(|| anyhow!("No lastActiveOrg cookie. Visit claude.ai/settings/usage."))
     }
 
     /// The claude.ai `anthropic-device-id` cookie value, if present.
     pub fn device_id(&self) -> Option<&str> {
-        self.latest_named("anthropic-device-id", true)
+        self.latest_named("anthropic-device-id")
             .map(|c| c.value.as_str())
     }
 
@@ -155,10 +176,10 @@ impl CookieJar {
             .join("; ")
     }
 
-    fn latest_named(&self, name: &str, claude_only: bool) -> Option<&Cookie> {
+    fn latest_named(&self, name: &str) -> Option<&Cookie> {
         self.cookies
             .iter()
-            .filter(|c| c.name == name && (!claude_only || c.is_claude()))
+            .filter(|c| c.name == name && c.is_claude())
             .max_by(|a, b| expiry_rank(a.expiry).total_cmp(&expiry_rank(b.expiry)))
     }
 }
@@ -287,7 +308,10 @@ pub fn read_cookie_file(path: &Path) -> Result<CookieJar> {
                 expiry: row.get::<_, Option<f64>>(4)?.and_then(normalize_expires),
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+        let mut cookies = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        // The SQL LIKE also matches look-alikes such as evilclaude.ai.
+        cookies.retain(Cookie::is_claude);
+        cookies
     };
     // Close before the temp dir is removed (Windows will not delete open files).
     drop(conn);
@@ -578,6 +602,63 @@ mod tests {
             cookie(".claude.ai", "gone", "v", Some(NOW)),
         ]);
         assert_eq!(j.cookie_header(NOW), "sessionKey=longer-value; a=same2");
+    }
+
+    #[test]
+    fn debug_shows_value_lengths_not_values() {
+        let secret = "sk-very-secret-session-value";
+        let j = jar(vec![cookie(".claude.ai", SESSION_KEY, secret, Some(NOW))]);
+        let out = format!("{j:?}");
+        assert!(!out.contains(secret), "{out}");
+        assert!(out.contains(SESSION_KEY), "{out}");
+        assert!(out.contains(&secret.len().to_string()), "{out}");
+        let pretty = format!("{:#?}", j.cookies[0]);
+        assert!(!pretty.contains(secret), "{pretty}");
+    }
+
+    #[test]
+    fn lookalike_hosts_are_not_claude() {
+        let j = jar(vec![
+            cookie("evilclaude.ai", "evil", "x", None),
+            cookie(".evilclaude.ai", "evil2", "x", None),
+            cookie(
+                "evilclaude.ai",
+                "lastActiveOrg",
+                "evil-org",
+                Some(NOW + DAY),
+            ),
+            cookie("evilclaude.ai", "anthropic-device-id", "evil-dev", None),
+            cookie("claude.ai", "a", "1", None),
+            cookie(".claude.ai", "b", "2", None),
+            cookie("www.claude.ai", "c", "3", None),
+        ]);
+        assert_eq!(j.cookie_header(NOW), "a=1; b=2; c=3");
+        assert!(j.org_id().is_err());
+        assert_eq!(j.device_id(), None);
+
+        let only_evil = jar(vec![cookie(
+            "evilclaude.ai",
+            SESSION_KEY,
+            "v",
+            Some(NOW + DAY),
+        )]);
+        assert_eq!(score(&only_evil, NOW), (0, None));
+    }
+
+    #[test]
+    fn read_drops_lookalike_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = make_db(
+            tmp.path(),
+            "p",
+            &[
+                ("a", "1", ".claude.ai", 0),
+                ("evil", "x", "evilclaude.ai", 0),
+            ],
+        );
+        let j = read_cookie_file(&path).unwrap();
+        let names: Vec<_> = j.cookies.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a"]);
     }
 
     #[test]
