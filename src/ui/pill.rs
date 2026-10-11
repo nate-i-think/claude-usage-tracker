@@ -290,7 +290,12 @@ fn action_row(ui: &mut Ui, rect: Rect, refresh_ready: bool) -> Option<PillAction
         let x = inner.left() + i as f32 * (w + gap);
         let slot = Rect::from_min_size(pos2(x, inner.top()), vec2(w, inner.height()));
         let button = egui::Button::new(RichText::new(label).size(12.5));
-        if ui.put(slot, button.sense(Sense::click())).clicked() && enabled {
+        // Disabled (dimmed, no click) while not allowed: the refresh cooldown.
+        let clicked = ui
+            .add_enabled_ui(enabled, |ui| ui.put(slot, button))
+            .inner
+            .clicked();
+        if clicked {
             picked = Some(a);
         }
     }

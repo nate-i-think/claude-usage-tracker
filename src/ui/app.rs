@@ -214,6 +214,10 @@ impl App {
         }
         self.settle.start();
         self.pill.menu_open = false;
+        if to == UiMode::Pill {
+            // The pill can't show the panel; don't leave a draft behind it.
+            self.settings_panel = None;
+        }
         ctx.request_repaint();
     }
 
