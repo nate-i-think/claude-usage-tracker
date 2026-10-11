@@ -26,6 +26,8 @@ const CHART_AREA_HEIGHT: f32 = 180.0;
 const Y_MARKS: [f64; 4] = [25.0, 50.0, 75.0, 100.0];
 /// Bar width as a share of its slot.
 const BAR_FILL: f32 = 0.6;
+/// Gap between a bar's Fable floor and the rest of the bar, in points.
+const FLOOR_GAP: f32 = 1.5;
 
 /// How one bar is drawn: `orange` (the Fable floor) from 0, then `rest` in
 /// the bar color on top. Both in y-axis %, summing to the bar height.
@@ -184,8 +186,8 @@ fn plot(ui: &mut Ui, bars: &[ChartBar]) {
     let font = TextStyle::Small.resolve(ui.style());
     let dim = palette.text_muted;
     let grid = palette.grid;
-    // Neutral bars, so the coral Fable floor stands out.
-    let bar_color = palette.text_muted;
+    // Neutral bars, a lightness step away from the coral Fable floor.
+    let bar_color = palette.bar;
     let orange = palette.fable;
 
     let y_label_w = painter
@@ -251,6 +253,13 @@ fn plot(ui: &mut Ui, bars: &[ChartBar]) {
             }
             if s.rest > 0.0 {
                 painter.rect_filled(column(s.orange, s.orange + s.rest), top, bar_color);
+            }
+            if s.orange > 0.0 && s.rest > 0.0 {
+                // A notch in the card color between the floor and the bar, so
+                // the split doesn't rely on hue alone.
+                let y = y_at(s.orange);
+                let notch = Rect::from_x_y_ranges((cx - half)..=(cx + half), (y - FLOOR_GAP)..=y);
+                painter.rect_filled(notch, 0.0, palette.surface);
             }
         }
         if !bar.axis_label.is_empty() {

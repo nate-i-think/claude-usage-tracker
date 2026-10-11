@@ -246,10 +246,9 @@ impl SettingsPanel {
                 }
             });
 
-            ui.checkbox(&mut self.draft.show_all, "Show all buckets");
+            theme::checkbox(ui, &mut self.draft.show_all, "Show all buckets");
             let mut on_top = live.always_on_top;
-            if ui
-                .checkbox(&mut on_top, "Always on top")
+            if theme::checkbox(ui, &mut on_top, "Always on top")
                 .on_hover_text("Applies immediately (same as the 📌 button)")
                 .changed()
             {
