@@ -27,3 +27,6 @@ anonymous_id
 # OS clutter
 Thumbs.db
 desktop.ini
+
+# Rust
+target/
