@@ -5,7 +5,7 @@
 
 use std::fmt::Display;
 
-use chrono::{DateTime, Duration, Local, TimeZone, Utc};
+use chrono::{DateTime, Duration, DurationRound, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{humanize_until, Projection};
@@ -14,20 +14,26 @@ use super::{humanize_until, Projection};
 /// not a warning.
 pub const CAP_WARNING_MIN_LEAD_MINUTES: i64 = 10;
 
+/// Window keys this close together name the same window. The API's
+/// `resets_at` jitters from poll to poll (sub-second and occasionally by
+/// seconds) while windows are 5 hours apart.
+pub const WINDOW_KEY_TOLERANCE_MINUTES: i64 = 5;
+
 /// An alert to deliver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertKind {
-    /// The 5-hour window reached 75%.
-    Crossed75,
-    /// The 5-hour window reached 90%.
-    Crossed90,
+    /// The 5-hour window reached 75%; `pct` is the usage then, rounded.
+    Crossed75 { pct: u32 },
+    /// The 5-hour window reached 90%; `pct` is the usage then, rounded.
+    Crossed90 { pct: u32 },
     /// At the current burn rate the 5-hour window hits 100% at `at`, before
     /// it resets.
     ProjectedCap { at: DateTime<Utc> },
 }
 
 /// Which alert edges were already consumed in one 5-hour window, keyed by
-/// that window's `resets_at`. Serializable so it can be persisted.
+/// that window's `resets_at` rounded to the minute. Serializable so it can
+/// be persisted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AlertState {
@@ -59,9 +65,11 @@ impl Default for AlertToggles {
 /// The alerts to deliver for this poll, recording them in `state` so each
 /// fires at most once per window.
 ///
-/// - `window_key` is the 5-hour `resets_at`; a key different from the one
-///   in `state` starts a fresh window. No key: nothing fires and `state` is
-///   left alone.
+/// - `window_key` is the 5-hour `resets_at`. It is rounded to the nearest
+///   minute, and a key within [`WINDOW_KEY_TOLERANCE_MINUTES`] of the stored
+///   one is the same window (the API's `resets_at` jitters between polls);
+///   anything further starts a fresh window. No key: nothing fires and
+///   `state` is left alone.
 /// - [`AlertKind::Crossed75`] / [`AlertKind::Crossed90`] fire when `pct`
 ///   first reaches 75 / 90 in the window. When both edges are new at once
 ///   (a jump straight past 90), only `Crossed90` fires, or `Crossed75` if
@@ -82,10 +90,12 @@ pub fn evaluate(
     now: DateTime<Utc>,
     enabled: AlertToggles,
 ) -> Vec<AlertKind> {
-    let Some(key) = window_key else {
+    let Some(key) = window_key.map(normalize_key) else {
         return Vec::new();
     };
-    if state.window != Some(key) {
+    let tolerance = Duration::minutes(WINDOW_KEY_TOLERANCE_MINUTES);
+    let same_window = state.window.is_some_and(|w| (w - key).abs() <= tolerance);
+    if !same_window {
         *state = AlertState {
             window: Some(key),
             ..AlertState::default()
@@ -98,10 +108,11 @@ pub fn evaluate(
     let new_90 = reached(90.0) && !state.crossed_90;
     state.crossed_75 |= new_75;
     state.crossed_90 |= new_90;
+    let shown = pct.map_or(0, |p| p.round() as u32); // `as` saturates
     if new_90 && enabled.crossed_90 {
-        fired.push(AlertKind::Crossed90);
+        fired.push(AlertKind::Crossed90 { pct: shown });
     } else if new_75 && enabled.crossed_75 {
-        fired.push(AlertKind::Crossed75);
+        fired.push(AlertKind::Crossed75 { pct: shown });
     }
 
     if let Some(at) = projection.cap_at {
@@ -114,6 +125,11 @@ pub fn evaluate(
         }
     }
     fired
+}
+
+/// `resets_at` rounded to the nearest minute.
+fn normalize_key(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.duration_round(Duration::minutes(1)).unwrap_or(t)
 }
 
 /// Toast copy for one alert.
@@ -131,7 +147,9 @@ pub fn alert_copy(kind: AlertKind, resets_at: DateTime<Utc>, now: DateTime<Utc>)
 /// Title and body for `kind`, for the 5-hour window resetting at
 /// `resets_at`, with clock times in `tz`:
 ///
-/// - "5-hour usage at 75%" / "Resets in 1h 59m" (likewise 90%);
+/// - "5-hour usage at 78%" / "Resets in 1h 59m" for either threshold, with
+///   the usage when it fired (so a jump to 95% with the 90% alert off
+///   still reads "at 95%");
 /// - "On pace to hit the 5-hour cap at 4:10 PM" / "Resets at 4:42 PM —
 ///   consider pausing agents".
 pub fn alert_copy_in<Tz: TimeZone>(
@@ -144,13 +162,10 @@ where
     Tz::Offset: Display,
 {
     match kind {
-        AlertKind::Crossed75 | AlertKind::Crossed90 => {
-            let threshold = if kind == AlertKind::Crossed75 { 75 } else { 90 };
-            AlertCopy {
-                title: format!("5-hour usage at {threshold}%"),
-                body: format!("Resets in {}", humanize_until(Some(resets_at), now)),
-            }
-        }
+        AlertKind::Crossed75 { pct } | AlertKind::Crossed90 { pct } => AlertCopy {
+            title: format!("5-hour usage at {pct}%"),
+            body: format!("Resets in {}", humanize_until(Some(resets_at), now)),
+        },
         AlertKind::ProjectedCap { at } => AlertCopy {
             title: format!("On pace to hit the 5-hour cap at {}", fmt_clock_in(at, tz)),
             body: format!(
@@ -217,9 +232,15 @@ mod tests {
     fn crossed_75_then_90_each_once() {
         let mut s = AlertState::default();
         assert!(eval(&mut s, key(0), 74.9).is_empty());
-        assert_eq!(eval(&mut s, key(0), 75.0), [AlertKind::Crossed75]);
+        assert_eq!(
+            eval(&mut s, key(0), 75.0),
+            [AlertKind::Crossed75 { pct: 75 }]
+        );
         assert!(eval(&mut s, key(0), 80.0).is_empty(), "no double fire");
-        assert_eq!(eval(&mut s, key(0), 90.0), [AlertKind::Crossed90]);
+        assert_eq!(
+            eval(&mut s, key(0), 90.0),
+            [AlertKind::Crossed90 { pct: 90 }]
+        );
         assert!(eval(&mut s, key(0), 99.0).is_empty());
         assert!(eval(&mut s, key(0), 75.0).is_empty());
     }
@@ -227,7 +248,10 @@ mod tests {
     #[test]
     fn jump_past_90_fires_only_90() {
         let mut s = AlertState::default();
-        assert_eq!(eval(&mut s, key(0), 95.0), [AlertKind::Crossed90]);
+        assert_eq!(
+            eval(&mut s, key(0), 95.0),
+            [AlertKind::Crossed90 { pct: 95 }]
+        );
         assert!(eval(&mut s, key(0), 96.0).is_empty());
     }
 
@@ -240,22 +264,71 @@ mod tests {
             ..AlertToggles::default()
         };
         let got = evaluate(&mut s, key(0), Some(95.0), &no_cap(now), now, only_75);
-        assert_eq!(got, [AlertKind::Crossed75]);
+        assert_eq!(got, [AlertKind::Crossed75 { pct: 95 }]);
+    }
+
+    #[test]
+    fn fired_pct_is_rounded_current_usage() {
+        let mut s = AlertState::default();
+        assert_eq!(
+            eval(&mut s, key(0), 77.6),
+            [AlertKind::Crossed75 { pct: 78 }]
+        );
+        assert_eq!(
+            eval(&mut s, key(0), 99.5),
+            [AlertKind::Crossed90 { pct: 100 }]
+        );
+    }
+
+    #[test]
+    fn jittering_key_is_the_same_window() {
+        let base = key(0).unwrap();
+        let mut s = AlertState::default();
+        assert_eq!(
+            eval(&mut s, Some(base + Duration::microseconds(107_492)), 80.0),
+            [AlertKind::Crossed75 { pct: 80 }]
+        );
+        // Sub-second and few-second jitter on later polls: no re-fire.
+        for jitter_ms in [989_019 / 1000, -400, 3_000, -4_500, 61_000, -290_000] {
+            let k = base + Duration::milliseconds(jitter_ms);
+            assert!(
+                eval(&mut s, Some(k), 81.0).is_empty(),
+                "re-fired at {jitter_ms} ms"
+            );
+        }
+        // The stored key is the normalized (whole-minute) one.
+        assert_eq!(s.window, Some(base));
+        // The next window, 5 hours later: fresh.
+        let next = base + Duration::hours(5) + Duration::milliseconds(250);
+        assert_eq!(
+            eval(&mut s, Some(next), 80.0),
+            [AlertKind::Crossed75 { pct: 80 }]
+        );
+        assert_eq!(s.window, Some(base + Duration::hours(5)));
     }
 
     #[test]
     fn new_window_resets_state() {
         let mut s = AlertState::default();
-        assert_eq!(eval(&mut s, key(0), 80.0), [AlertKind::Crossed75]);
+        assert_eq!(
+            eval(&mut s, key(0), 80.0),
+            [AlertKind::Crossed75 { pct: 80 }]
+        );
         // Reset: back to low usage in the new window, then crossing again.
         assert!(eval(&mut s, key(1), 2.0).is_empty());
-        assert_eq!(eval(&mut s, key(1), 76.0), [AlertKind::Crossed75]);
+        assert_eq!(
+            eval(&mut s, key(1), 76.0),
+            [AlertKind::Crossed75 { pct: 76 }]
+        );
     }
 
     #[test]
     fn no_window_key_fires_nothing_and_keeps_state() {
         let mut s = AlertState::default();
-        assert_eq!(eval(&mut s, key(0), 80.0), [AlertKind::Crossed75]);
+        assert_eq!(
+            eval(&mut s, key(0), 80.0),
+            [AlertKind::Crossed75 { pct: 80 }]
+        );
         let before = s.clone();
         let now = t(12, 0);
         let got = evaluate(
@@ -283,7 +356,10 @@ mod tests {
             AlertToggles::default(),
         );
         assert!(got.is_empty());
-        assert_eq!(eval(&mut s, key(0), 75.0), [AlertKind::Crossed75]);
+        assert_eq!(
+            eval(&mut s, key(0), 75.0),
+            [AlertKind::Crossed75 { pct: 75 }]
+        );
     }
 
     #[test]
@@ -333,7 +409,13 @@ mod tests {
             now,
             AlertToggles::default(),
         );
-        assert_eq!(got, [AlertKind::Crossed75, AlertKind::ProjectedCap { at }]);
+        assert_eq!(
+            got,
+            [
+                AlertKind::Crossed75 { pct: 80 },
+                AlertKind::ProjectedCap { at }
+            ]
+        );
     }
 
     #[test]
@@ -352,7 +434,7 @@ mod tests {
         assert!(evaluate(&mut s, key(0), Some(85.0), &cap(at), now, on).is_empty());
         assert_eq!(
             evaluate(&mut s, key(0), Some(91.0), &cap(at), now, on),
-            [AlertKind::Crossed90]
+            [AlertKind::Crossed90 { pct: 91 }]
         );
     }
 
@@ -398,15 +480,20 @@ mod tests {
         let resets = t(20, 42);
         let now = resets - Duration::minutes(119);
         assert_eq!(
-            alert_copy_in(AlertKind::Crossed75, resets, now, &tz()),
+            alert_copy_in(AlertKind::Crossed75 { pct: 75 }, resets, now, &tz()),
             AlertCopy {
                 title: "5-hour usage at 75%".into(),
                 body: "Resets in 1h 59m".into(),
             }
         );
         assert_eq!(
-            alert_copy_in(AlertKind::Crossed90, resets, now, &tz()).title,
-            "5-hour usage at 90%"
+            alert_copy_in(AlertKind::Crossed90 { pct: 92 }, resets, now, &tz()).title,
+            "5-hour usage at 92%"
+        );
+        // The 90% alert off and a jump to 95%: the 75% alert says 95%.
+        assert_eq!(
+            alert_copy_in(AlertKind::Crossed75 { pct: 95 }, resets, now, &tz()).title,
+            "5-hour usage at 95%"
         );
     }
 
