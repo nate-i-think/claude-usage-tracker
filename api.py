@@ -58,7 +58,10 @@ BUCKET_LABELS = [
     ("iguana_necktie",       "Iguana"),
     ("omelette_promotional", "Omelette promo"),
 ]
-ALWAYS_SHOW = {"five_hour", "seven_day", "seven_day_sonnet"}
+# Fable (and any future per-model cap) now arrives via the `limits` array, not a
+# top-level key — see parse_model_limits. Its always-shown pin lives in
+# ui.ALWAYS_SHOWN_LABELS ("Fable"), so no top-level key belongs here for it.
+ALWAYS_SHOW = {"five_hour", "seven_day"}
 
 
 # --- Models ---------------------------------------------------------------
@@ -77,6 +80,7 @@ class ExtraUsage:
     used_credits: float
     utilization: float
     currency: str
+    disabled_reason: Optional[str] = None
 
 
 @dataclass
@@ -341,6 +345,32 @@ def _parse_window(label: str, raw) -> UsageWindow:
                        _parse_dt(raw.get("resets_at")))
 
 
+def parse_model_limits(data: dict) -> List[UsageWindow]:
+    """Extract per-model usage windows from the `limits` array.
+
+    As of 2026-07 Anthropic moved per-model caps out of the top-level
+    seven_day_* keys (now null) into a `limits` list. Model-scoped entries carry
+    a scope.model.display_name (e.g. "Fable"); each becomes a UsageWindow
+    labeled by that display name, with `percent` as its utilization. `resets_at`
+    is null until the model is actually used, so it maps to None. Non-model
+    entries (kind "session"/"weekly_all", scope null) are skipped.
+    """
+    windows: List[UsageWindow] = []
+    for entry in data.get("limits") or []:
+        scope = entry.get("scope") or {}
+        model = scope.get("model") or {}
+        name = model.get("display_name")
+        if not name:
+            continue
+        pct = entry.get("percent")
+        windows.append(UsageWindow(
+            name,
+            float(pct) if pct is not None else None,
+            _parse_dt(entry.get("resets_at")),
+        ))
+    return windows
+
+
 def fetch_usage(session: requests.Session,
                 cookie_file: Optional[str] = None,
                 impersonate: Optional[str] = None) -> Snapshot:
@@ -365,6 +395,10 @@ def fetch_usage(session: requests.Session,
         if key in ALWAYS_SHOW or w.utilization is not None:
             windows.append(w)
 
+    # Per-model caps (Fable, and any future model-scoped limit) live in the
+    # `limits` array rather than a top-level key.
+    windows.extend(parse_model_limits(data))
+
     extra = None
     if (er := data.get("extra_usage")):
         # API returns dollar amounts in cents.
@@ -374,6 +408,7 @@ def fetch_usage(session: requests.Session,
             used_credits=float(er.get("used_credits") or 0) / 100,
             utilization=float(er.get("utilization") or 0),
             currency=er.get("currency") or "USD",
+            disabled_reason=er.get("disabled_reason"),
         )
 
     return Snapshot(datetime.now(timezone.utc), windows, extra)

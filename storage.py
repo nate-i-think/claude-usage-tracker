@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +18,7 @@ class HistoryEntry:
     ts: float
     five_hour: Optional[float]
     seven_day: Optional[float]
-    sonnet_7d: Optional[float]
+    fable_7d: Optional[float]
     extra_pct: Optional[float]
 
 
@@ -35,16 +36,65 @@ def append_snapshot(snap: Snapshot) -> None:
     f = paths.history_file()
     f.parent.mkdir(parents=True, exist_ok=True)
     seven = snap.window("7-day all")
-    sonnet = snap.window("Sonnet 7d")
+    fable = snap.window("Fable")
     entry = HistoryEntry(
         ts=snap.fetched_at.timestamp(),
         five_hour=snap.five_hour_pct,
         seven_day=seven.utilization if seven else None,
-        sonnet_7d=sonnet.utilization if sonnet else None,
+        fable_7d=fable.utilization if fable else None,
         extra_pct=snap.extra.utilization if snap.extra else None,
     )
     with f.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(asdict(entry)) + "\n")
+
+    # Also persist the full snapshot for out-of-process readers (the MCP
+    # server). Best-effort: a write failure here must never break the monitor.
+    try:
+        write_latest_snapshot(snap)
+    except OSError:
+        pass
+
+
+# --- Latest full snapshot (for the MCP server) ----------------------------
+
+def write_latest_snapshot(snap: Snapshot) -> None:
+    """Persist the complete latest snapshot to latest.json, atomically.
+
+    history.jsonl only keeps a few utilization numbers; this keeps every
+    window's resets_at and the extra-usage block too, so a separate process
+    (mcp_server.py) can report "what the stats were at the most recent ping".
+    Written via a temp file + os.replace so a concurrent reader never sees a
+    half-written file.
+    """
+    f = paths.latest_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fetched_at": snap.fetched_at.isoformat(),
+        "windows": [
+            {
+                "label": w.label,
+                "utilization": w.utilization,
+                "resets_at": w.resets_at.isoformat() if w.resets_at else None,
+            }
+            for w in snap.windows
+        ],
+        "extra": asdict(snap.extra) if snap.extra else None,
+    }
+    tmp = f.parent / (f.name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, f)
+
+
+def read_latest_snapshot() -> Optional[dict]:
+    """Return the most recent snapshot dict written by write_latest_snapshot,
+    or None if the file is missing or unreadable/corrupt."""
+    f = paths.latest_file()
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def read_recent(since: datetime) -> List[HistoryEntry]:
@@ -53,12 +103,15 @@ def read_recent(since: datetime) -> List[HistoryEntry]:
         return []
     cutoff = since.timestamp()
     out: List[HistoryEntry] = []
+    fields = HistoryEntry.__dataclass_fields__
     with f.open(encoding="utf-8") as fh:
         for line in fh:
             try:
                 d = json.loads(line)
                 if d.get("ts", 0) >= cutoff:
-                    out.append(HistoryEntry(**d))
+                    # Tolerate schema drift (e.g. legacy rows with `sonnet_7d`):
+                    # keep only known fields, default the rest to None.
+                    out.append(HistoryEntry(**{k: d.get(k) for k in fields}))
             except (json.JSONDecodeError, TypeError):
                 continue
     return out
@@ -66,11 +119,11 @@ def read_recent(since: datetime) -> List[HistoryEntry]:
 
 # --- Rollups for charts ---------------------------------------------------
 
-def five_hour_buckets(window_start: datetime,
-                      bucket_minutes: int = 30
-                      ) -> List[Tuple[datetime, Optional[float]]]:
-    """Bucket the current 5h window. Future buckets stay None; past buckets
-    with no sample carry forward (utilization is monotonic within a window).
+def _window_buckets(window_start: datetime, field: str,
+                    bucket_minutes: int = 30
+                    ) -> List[Tuple[datetime, Optional[float]]]:
+    """Bucket `field` over the current 5h window. Future buckets stay None; past
+    buckets with no sample carry forward (utilization is monotonic in a window).
     """
     n = 300 // bucket_minutes
     times = [window_start + timedelta(minutes=bucket_minutes * i) for i in range(n)]
@@ -80,14 +133,15 @@ def five_hour_buckets(window_start: datetime,
     buckets: List[Optional[float]] = [None] * n
 
     for e in entries:
-        if e.five_hour is None:
+        val = getattr(e, field)
+        if val is None:
             continue
         if e.ts < window_start.timestamp() or e.ts >= window_end_ts:
             continue
         idx = int((e.ts - window_start.timestamp()) / 60 / bucket_minutes)
         if 0 <= idx < n:
             cur = buckets[idx]
-            buckets[idx] = e.five_hour if cur is None else max(cur, e.five_hour)
+            buckets[idx] = val if cur is None else max(cur, val)
 
     last: Optional[float] = None
     for i in range(n):
@@ -99,6 +153,19 @@ def five_hour_buckets(window_start: datetime,
             last = buckets[i]
 
     return list(zip(times, buckets))
+
+
+def five_hour_buckets(window_start: datetime, bucket_minutes: int = 30
+                      ) -> List[Tuple[datetime, Optional[float]]]:
+    """5-hour utilization bucketed over the current window."""
+    return _window_buckets(window_start, "five_hour", bucket_minutes)
+
+
+def fable_five_hour_buckets(window_start: datetime, bucket_minutes: int = 30
+                            ) -> List[Tuple[datetime, Optional[float]]]:
+    """Fable weekly-% sampled at the same buckets as five_hour_buckets, so the
+    5-hour chart can show the Fable rise across the window (aligned indices)."""
+    return _window_buckets(window_start, "fable_7d", bucket_minutes)
 
 
 def daily_history(days: int = 7) -> List[Tuple[datetime, Optional[float]]]:
@@ -113,6 +180,28 @@ def daily_history(days: int = 7) -> List[Tuple[datetime, Optional[float]]]:
         day = datetime.fromtimestamp(e.ts).replace(
             hour=0, minute=0, second=0, microsecond=0)
         by_day[day] = max(by_day.get(day, 0), e.seven_day)
+    return [(today - timedelta(days=i),
+             by_day.get(today - timedelta(days=i)))
+            for i in reversed(range(days))]
+
+
+def fable_daily_history(days: int = 7) -> List[Tuple[datetime, Optional[float]]]:
+    """Last N days of Fable 7-day utilization, max per day, oldest first.
+
+    Mirrors daily_history but reads e.fable_7d, so the day indices align with it
+    (used for the per-day orange Fable floor on the 7-day chart). Legacy rows
+    predating Fable have fable_7d=None and simply contribute no value.
+    """
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    since = today - timedelta(days=days - 1)
+    entries = read_recent(since)
+    by_day: dict = {}
+    for e in entries:
+        if e.fable_7d is None:
+            continue
+        day = datetime.fromtimestamp(e.ts).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        by_day[day] = max(by_day.get(day, 0), e.fable_7d)
     return [(today - timedelta(days=i),
              by_day.get(today - timedelta(days=i)))
             for i in reversed(range(days))]
