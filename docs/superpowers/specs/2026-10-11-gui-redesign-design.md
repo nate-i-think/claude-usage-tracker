@@ -119,3 +119,73 @@ Open questions I'll rule on during execution unless Nathan objects:
 - Idle CPU over 60 s in full mode, pill mode, and hidden-to-tray, near zero outside animations; pulse only at ≥ 90%.
 - Alerts: unit tests for edge triggering; one forced manual toast.
 - Tray: hide to tray, keep polling (icon % updates), restore, quit from menu.
+
+## Implementation notes (as built)
+
+Where the branch differs from the design text above, and why. Sources: the spike report and the task reports under `.superpowers/sdd/2026-10-11-gui-redesign/`.
+
+### Window, persistence, background work
+
+- **Hide to tray is minimize + hide.** `Visible(false)` alone keeps eframe running the full `ui()` pass on every repaint (`ViewportInfo::visible()` comes from minimized/occluded, not from `IsWindowVisible`). Hide sends `Minimized(true)` then `Visible(false)`; show sends `Visible(true)`, `Minimized(false)`, `Focus`. Only then does eframe take its logic-only path while hidden.
+- **Own window persistence.** `persist_window: false`. The app stores its geometry in `Settings` (`full_rect`, `full_maximized`, `pill_pos`, `ui_mode`) and reads `app.ron` before `run_native` to build the `ViewportBuilder` for the saved mode, so a pill restart paints the pill on frame 1 with no flash. The spike showed eframe's own persistence is not flash-free.
+  - Positions are the outer top-left in **physical pixels**; sizes are in points. On Windows the builder gets no position: `App::new` moves the still-hidden window with `SetWindowPos`, in two passes so a cross-DPI move is re-checked, and keeps it on the work area of the monitor its title band overlaps (`MonitorFromRect` + `rcWork`). Maximize goes through winit's `set_maximized` afterwards.
+  - A stale eframe `"window"` key from earlier versions would still be applied at creation, so `keep_our_geometry` is installed as `NativeOptions::window_builder` to put our size and position back, and `remove_stale_window_key` deletes the key on the first `logic()` pass.
+  - The runtime `MinInnerSize` from the design is only used when switching modes. At startup the builder is made for the saved mode (full: min 360x320; pill: no minimum, undecorated, fixed size, always on top).
+- **`logic()` order**: track window → close request → drain poller events → tray sync → alert hook and toast clicks → settings sync (poller update, and an `app.ron` flush when the live settings differ from the saved ones) → 1 s tick. `ui()` only draws. The Settings panel's Apply only edits `self.settings`; the sync step does the rest.
+- **Crash dialog (Task 1)**: recoverable regions run under `crash::catch_recoverable`, a `catch_unwind` wrapper that sets a thread-local flag the panic hook reads. Every panic is logged to `crash.log`; only unguarded ones get the message box, and the box is not re-entrant. This is a general mechanism, not a check on the poller thread's name.
+
+### Theme
+
+- Palette roles beyond the design: `control_border` (input, checkbox and button outlines at ≥ 3:1), `accent_text` (clay text that passes 4.5:1 on cards), `bar` (neutral chart bars that stand apart from the Fable clay), plus `field`, `raised_hover`, `text_faint`, `grid`, `track` and `shadow`. `high` became #ECA04A (dark) and #864700 (light), so the high state is at least 1.3:1 in luminance from the Fable clay. `danger` and `fable` still differ by hue only.
+- Accent and Fable are the same clay, so non-Fable items (the ALL tag, chart bars, today's sparkline outline) use neutral colors.
+- Inter v4.1 (variable) is bundled; the semibold family is the same file pinned to wght 600 via `FontTweak::coords`. Numbers go through a fixed-width digit-cell helper (`ui::digits`).
+- **✕ is drawn with two painter lines.** No font in the chain renders U+2715.
+
+### Timeline
+
+- **Gap bridging.** A gap of more than 10 minutes without samples still ends the solid segment, but segments separated only by time are joined by a dimmed dotted line over a faint area (and a faint Fable fill when both ends have a value). Hovering a bridge reads "no samples 1:10–1:45 PM". Only a reset (a drop of more than 5 points) or missing values leave a real break. Without this, sparse polling (app closed, laptop asleep) fragmented the chart.
+- Thinning keeps the min and max per pixel column (up to two points), so spikes survive. An isolated single sample is drawn as a dot.
+- The Fable layer has a 1 px surface-colored separator along its top, so it does not rely on hue next to the orange high state.
+- **End label placement**: "cap h:mmp" / "safe" sits on a surface-colored pad at the first of six candidate spots that neither the dashed line nor the ✕ keep-out box touches, and the dash stops short of the label. With an unknown reset there is no ✕ and no label (the line is still drawn), and the footer shows only the rate.
+- Hover picks, in order: the projection beyond now, the nearest sample within 12 px, a bridge, else just the time.
+
+### Layout
+
+- The "claude.ai usage · plan" title and the 📌 button are gone from the header. Always-on-top lives in Settings only; the plan label moved to the Details footer line ("Max plan · last polled Ns ago").
+- Chip % is floored (99.6 never reads 100). The pace delta is muted below 10 points; ahead is amber, behind green. Chips wrap to a second row when they don't fit (the Fable chip wraps at 360 pt).
+- **The sparkline uses a fixed 0–100% scale.** A scale relative to the week's maximum made a 47% day look near the cap.
+- **Footer burn copy**: "+0.21%/min · cap in 1h 48m" when the cap lands before the reset, **"+0.34%/min · safe till reset"** when it lands after (`Eta::Minutes` carries a `lands_after_reset` flag from the shared helper), and the rate alone when the reset is unknown.
+- **Burner names come from the session JSONL `cwd`** (the last path component of the latest timestamped entry), with `prettify_project` only as the fallback: the folder-name encoding is ambiguous (`__tomos` → `tomos-…`). Long names are cut at the front so the tail stays.
+- The content column is capped at 720 pt and centered; `layout::pack_rows` wraps chips and footer items.
+
+### Motion
+
+- Tweens are 0.45 s ease-out and only start from poll data. A value not drawn for more than 2 s (hidden window, collapsed Details) snaps instead of gliding. Reduce motion snaps everything.
+- The projection draw-in (0.6 s) runs on the first projection, and again only when a **new poll** (keyed by `fetched_at`) moves the end by more than 5 points. The end mark and label fade in over the last 30%.
+- **Pulse: three breaths, then steady.** At ≥ 90% the 5-hour chip (and the pill dot) breathes three times over about 5 s, then holds the peak level with no extra repaints beyond the 1 s tick. It re-arms only below **88%** or in a new window. "Keep pulsing near cap" keeps it breathing at a 66 ms repaint; that measured about 9.35% of one core against about 2.5% idle, so it is opt-in.
+- **Jitter-tolerant window identity.** The API's `resets_at` jitters from poll to poll (usually sub-second, occasionally minutes). `analytics::alerts::same_window` rounds both values to the minute and treats keys within 5 minutes as the same window. The alert state and the pulse tracker both use it.
+
+### Pill
+
+- 300x44 pt, with DWM rounded corners (`DWMWCP_ROUND`, set once at startup).
+- **Right-click shows an inline action row** (Expand / Refresh / Settings / Quit) in place of the pill's content, not a popup menu: an egui popup cannot leave the 44 pt window. Esc, a background click or focus loss closes it. The hover tooltip is two short lines for the same reason.
+- Position sanity: positions more than 16384 px from the origin are dropped (three 4K monitors reach x = 11520), not 10000 as briefed. With no usable position, the pill goes to the bottom-right corner of the saved full rect. The required visible strip is capped at the window's own size, so a pill parked flush on the taskbar edge stays put.
+- Entering the pill closes the Settings panel. Pill → Settings expands first and then opens the panel.
+
+### Tray
+
+- Left-click toggles show/hide (the design only had the menu item). The menu is Show / Hide, Pill mode (check), Refresh now, a separator, Quit. The app never calls `show_menu()`: without a user gesture it hangs `logic()`.
+- The icon is drawn at `SM_CXSMICON` (36 px at 225%) with a 3x5 pixel font in whole-pixel blocks, on the light palette's state colors whatever the app theme, with white digits. Single digits render as "08"; ≥ 100% shows "!!", unknown "–". The tooltip adds "· last poll failed" while polls fail.
+- Quit sets a `quitting` flag before `Close`, so close-to-tray lets it through; the pill's Quit uses the same path.
+- tray-icon and muda keep their event handlers in a `OnceCell`, so the handlers are installed once per process in `App::new` and the channel belongs to the app. Re-creating the icon (toggling "Show tray icon") reuses it.
+
+### Alerts
+
+- Alert copy floors the percentage ("5-hour usage at 89%" for 89.5) and carries the usage at firing time, so a 75% alert fired at 95% (with the 90% toggle off) says 95%.
+- An edge reached while its toggle is off still counts as consumed. A projected cap less than 10 minutes away is skipped and not recorded, so it can fire later. The edge state is persisted in `Settings::alert_state`, so a restart does not re-fire.
+- Toasts go out under the registered AUMID `ClaudeUsageMonitor`, with `DisplayName` and an `IconUri` pointing at a generated coral "%" PNG (`app-icon.png` in the data dir), from a dedicated notifier thread. If registration fails, one line goes to `crash.log` and toasts fall back to `Toast::POWERSHELL_APP_ID`. Settings has a "Send test notification" button.
+- Clicking a toast is wired (`on_activated` → show the window) but unverified. The explicit AUMID also changes taskbar grouping, so an older taskbar pin of the exe may need re-pinning (the README says so).
+
+### Still open for a human check
+
+Real tray clicks, pill drag feel and click-vs-drag, the pill's right-click row, hover tooltips and the crosshair, a toast banner with Do not disturb off, toast click → show, and mixed-DPI pill placement. Each task report lists the exact steps.
