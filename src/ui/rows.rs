@@ -354,6 +354,7 @@ mod tests {
             eta: Eta::Minutes {
                 minutes: 185.4,
                 level: Level::Yellow,
+                lands_after_reset: false,
             },
             span_minutes: 12.4,
             samples: 9,

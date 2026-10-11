@@ -182,7 +182,13 @@ pub enum Eta {
     /// Minutes until 100% at the current pace, with its color: green when it
     /// lands after the window resets (won't hit the cap first), else red
     /// under 30, orange under 60, yellow otherwise.
-    Minutes { minutes: f64, level: Level },
+    Minutes {
+        minutes: f64,
+        level: Level,
+        /// The cap lands strictly after the known reset, so the window
+        /// resets first ([`lands_after`]); false when the reset is unknown.
+        lands_after_reset: bool,
+    },
 }
 
 impl Eta {
@@ -264,7 +270,11 @@ pub fn burn_line(
             } else {
                 Level::Yellow
             };
-            Eta::Minutes { minutes, level }
+            Eta::Minutes {
+                minutes,
+                level,
+                lands_after_reset,
+            }
         }
     };
 
@@ -730,6 +740,7 @@ mod tests {
                 eta: Eta::Minutes {
                     minutes: 152.0, // (100 - 24) / 0.5, before the 180m reset
                     level: Level::Yellow,
+                    lands_after_reset: false
                 },
                 span_minutes: 8.0,
                 samples: 2,
@@ -778,15 +789,30 @@ mod tests {
             line.eta,
             Eta::Minutes {
                 minutes: 152.0,
-                level: Level::Green
+                level: Level::Green,
+                lands_after_reset: true
             }
         );
         // Reset exactly at the ETA is not "after": the risk colors apply.
         let line = burn_line(&hist, Some(24.0), Some(NOW + minutes(152.0)), NOW).unwrap();
         assert_eq!(line.eta.level(), Level::Yellow);
-        // No reset known: risk colors apply.
+        assert!(matches!(
+            line.eta,
+            Eta::Minutes {
+                lands_after_reset: false,
+                ..
+            }
+        ));
+        // No reset known: risk colors apply, and it never counts as after.
         let line = burn_line(&hist, Some(24.0), None, NOW).unwrap();
         assert_eq!(line.eta.level(), Level::Yellow);
+        assert!(matches!(
+            line.eta,
+            Eta::Minutes {
+                lands_after_reset: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -797,35 +823,40 @@ mod tests {
             eta_at(71.0),
             Eta::Minutes {
                 minutes: 29.0,
-                level: Level::Red
+                level: Level::Red,
+                lands_after_reset: false
             }
         );
         assert_eq!(
             eta_at(70.0),
             Eta::Minutes {
                 minutes: 30.0,
-                level: Level::Orange
+                level: Level::Orange,
+                lands_after_reset: false
             }
         );
         assert_eq!(
             eta_at(41.0),
             Eta::Minutes {
                 minutes: 59.0,
-                level: Level::Orange
+                level: Level::Orange,
+                lands_after_reset: false
             }
         );
         assert_eq!(
             eta_at(40.0),
             Eta::Minutes {
                 minutes: 60.0,
-                level: Level::Yellow
+                level: Level::Yellow,
+                lands_after_reset: false
             }
         );
         assert_eq!(
             eta_at(10.0),
             Eta::Minutes {
                 minutes: 90.0,
-                level: Level::Yellow
+                level: Level::Yellow,
+                lands_after_reset: false
             }
         );
     }
