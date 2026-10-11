@@ -1,16 +1,20 @@
 //! The eframe app: owns the poller, drains its events, and lays out the
 //! dashboard top to bottom.
+//!
+//! Work that must go on while the window is hidden (draining poll events,
+//! telling the poller about settings changes, persisting settings, the 1 s
+//! tick, tracking the window rect) runs in [`eframe::App::logic`], which
+//! eframe calls every pass, even when it skips the UI. `ui()` only draws.
 
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use eframe::egui::{
-    self, style::ScrollStyle, Align, CentralPanel, Color32, Frame, Layout, RichText, ScrollArea,
-    Ui, ViewportCommand,
+    self, style::ScrollStyle, Align, CentralPanel, Color32, Frame, Layout, RichText, ScrollArea, Ui,
 };
 
 use crate::analytics::{self, Level};
-use crate::config::Settings;
+use crate::config::{SavedRect, Settings, UiMode};
 use crate::model::UsageWindow;
 use crate::paths::Paths;
 use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
@@ -18,10 +22,9 @@ use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 use super::charts;
 use super::rows::{self, BurnTag};
 use super::settings::{self, PanelAction, SettingsPanel};
+use super::window::{self, SETTINGS_KEY};
 use super::{level_color, show_runs, theme, tone_color, Tone};
 
-/// eframe storage key for [`Settings`].
-const SETTINGS_KEY: &str = "settings";
 /// Key eframe stores egui's memory (including the theme preference) under
 /// (private `STORAGE_EGUI_MEMORY_KEY` in eframe's native/epi_integration.rs).
 const EGUI_MEMORY_KEY: &str = "egui";
@@ -59,6 +62,25 @@ pub fn refresh_ready(last_click: Option<Instant>, now: Instant) -> bool {
     last_click.is_none_or(|t| now.saturating_duration_since(t) >= REFRESH_COOLDOWN)
 }
 
+/// What one logic pass must do with the settings.
+#[derive(Debug)]
+pub struct SettingsSync {
+    /// Tell the poller (it has `sent`, the settings now differ in what it
+    /// uses).
+    pub poller: Option<PollMsg>,
+    /// Write the settings to storage now (they differ from what was last
+    /// persisted).
+    pub persist: bool,
+}
+
+/// Compare the live settings with what the poller and storage last got.
+pub fn settings_sync(current: &Settings, sent: &Settings, persisted: &Settings) -> SettingsSync {
+    SettingsSync {
+        poller: settings::poller_update(sent, current),
+        persist: current != persisted,
+    }
+}
+
 /// True when eframe has no persisted egui memory yet (first launch), so no
 /// theme preference has been saved.
 pub fn first_run(storage: Option<&dyn eframe::Storage>) -> bool {
@@ -69,7 +91,15 @@ pub struct App {
     /// The one poller for the app's lifetime; settings changes go to it as
     /// [`PollMsg::UpdateSettings`].
     poller: Poller,
+    /// The live settings; the UI edits them, `logic()` propagates changes.
     settings: Settings,
+    /// The settings the poller was last given.
+    poller_settings: Settings,
+    /// The settings last written to storage.
+    persisted: Settings,
+    /// The full-mode window rect as of the last pass that had one; saved
+    /// into [`Settings::full_rect`] by `save()`.
+    last_full_rect: Option<SavedRect>,
     state: PollState,
     /// The settings panel, while open.
     settings_panel: Option<SettingsPanel>,
@@ -88,16 +118,18 @@ impl App {
             ctx.set_theme(egui::ThemePreference::Dark);
         }
         theme::install(&ctx);
-        if settings.always_on_top {
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(settings::window_level(true)));
-        }
+        // The window level, size and position come from the viewport
+        // builder (window::viewport_builder), built from these settings.
         let notify_ctx = ctx.clone();
         let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
             notify_ctx.request_repaint()
         });
         Self {
             poller,
+            poller_settings: settings.clone(),
+            persisted: settings.clone(),
             settings,
+            last_full_rect: None,
             state: PollState::default(),
             settings_panel: None,
             last_refresh: None,
@@ -109,6 +141,41 @@ impl App {
             self.state.apply(event);
         }
     }
+
+    /// Remember the window rect for the current mode while egui reports one
+    /// (not while minimized or hidden).
+    fn track_window(&mut self, ctx: &egui::Context) {
+        match self.settings.ui_mode {
+            UiMode::Full => {
+                if let Some(rect) = ctx.input(|i| window::full_rect_of(i.viewport())) {
+                    self.last_full_rect = Some(rect);
+                }
+            }
+            // Task 8 tracks the pill position here.
+            UiMode::Pill => {}
+        }
+    }
+
+    /// Hand settings changes (from the panel, the pin, later the tray) to
+    /// the poller and to storage.
+    fn sync_settings(&mut self, frame: &mut eframe::Frame) {
+        let sync = settings_sync(&self.settings, &self.poller_settings, &self.persisted);
+        if let Some(msg) = sync.poller {
+            self.poller.send(msg);
+            self.poller_settings = self.settings.clone();
+        }
+        if sync.persist {
+            if let Some(storage) = frame.storage_mut() {
+                eframe::set_value(storage, SETTINGS_KEY, &self.settings);
+                storage.flush();
+            }
+            self.persisted = self.settings.clone();
+        }
+    }
+
+    /// Runs every pass after the poll results are in, visible or not: the
+    /// tray icon (Task 9) and threshold alerts (Task 10) hook in here.
+    fn background_hooks(&mut self, _now: Instant) {}
 
     /// "claude.ai usage · {plan}" with refresh, pin, and settings buttons.
     fn header(&mut self, ui: &mut Ui) {
@@ -168,7 +235,7 @@ impl App {
 
     /// The settings panel, if open; Apply commits, saves, and tells the
     /// poller.
-    fn settings_panel(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+    fn settings_panel(&mut self, ui: &mut Ui) {
         let Some(panel) = self.settings_panel.as_mut() else {
             return;
         };
@@ -176,15 +243,10 @@ impl App {
             PanelAction::None => {}
             PanelAction::Cancel => self.settings_panel = None,
             PanelAction::Apply(new) => {
-                if let Some(msg) = settings::poller_update(&self.settings, &new) {
-                    self.poller.send(msg);
-                }
+                // logic() tells the poller and persists on the next pass.
                 self.settings = new;
                 self.settings_panel = None;
-                if let Some(storage) = frame.storage_mut() {
-                    eframe::set_value(storage, SETTINGS_KEY, &self.settings);
-                    storage.flush();
-                }
+                ui.ctx().request_repaint();
             }
         }
     }
@@ -321,10 +383,18 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &Settings) {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let now = Instant::now();
+        self.track_window(ctx);
         self.drain_events();
-        ui.ctx().request_repaint_after(TICK);
+        self.sync_settings(frame);
+        self.background_hooks(now);
+        // Keeps "last polled" and the countdowns ticking; eframe throttles
+        // it while the window is hidden.
+        ctx.request_repaint_after(TICK);
+    }
 
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         CentralPanel::default().show(ui, |ui| {
             // A solid scrollbar takes its own space instead of overlaying
             // content at narrow widths.
@@ -332,7 +402,7 @@ impl eframe::App for App {
             ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 self.header(ui);
                 ui.separator();
-                self.settings_panel(ui, frame);
+                self.settings_panel(ui);
                 self.banners(ui);
                 match &self.state.data {
                     Some(d) => dashboard(ui, d, &self.settings),
@@ -348,7 +418,11 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if self.settings.ui_mode == UiMode::Full && self.last_full_rect.is_some() {
+            self.settings.full_rect = self.last_full_rect;
+        }
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
+        self.persisted = self.settings.clone();
     }
 }
 
@@ -444,6 +518,51 @@ mod tests {
         assert!(first_run(Some(&storage)));
         storage.set_string(EGUI_MEMORY_KEY, "{}".to_owned());
         assert!(!first_run(Some(&storage)));
+    }
+
+    #[test]
+    fn settings_sync_tells_poller_and_storage_only_about_changes() {
+        let base = Settings::default();
+        let idle = settings_sync(&base, &base, &base);
+        assert!(idle.poller.is_none() && !idle.persist);
+
+        // UI-only change (pin, a toggle): persist, poller not bothered.
+        let pinned = Settings {
+            always_on_top: true,
+            reduce_motion: true,
+            ..base.clone()
+        };
+        let sync = settings_sync(&pinned, &base, &base);
+        assert!(sync.poller.is_none() && sync.persist);
+
+        // Interval change: both.
+        let faster = Settings {
+            interval_secs: 30,
+            ..base.clone()
+        };
+        let sync = settings_sync(&faster, &base, &base);
+        assert!(sync.persist);
+        match sync.poller {
+            Some(PollMsg::UpdateSettings(sent)) => assert_eq!(sent, faster),
+            other => panic!("expected UpdateSettings, got {other:?}"),
+        }
+
+        // Already sent and persisted: nothing more.
+        let done = settings_sync(&faster, &faster, &faster);
+        assert!(done.poller.is_none() && !done.persist);
+
+        // save() wrote a new rect: persisted matches, the poller ignores it.
+        let moved = Settings {
+            full_rect: Some(SavedRect {
+                x: 5.0,
+                y: 6.0,
+                w: 420.0,
+                h: 460.0,
+            }),
+            ..base.clone()
+        };
+        let sync = settings_sync(&moved, &base, &moved);
+        assert!(sync.poller.is_none() && !sync.persist);
     }
 
     #[test]
