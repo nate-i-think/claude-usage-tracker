@@ -5,7 +5,10 @@
 //! [`Mesh`] in the state color with a stroked line), the Fable layer under
 //! it, a "now" marker with a dot at the current %, the dashed projection to
 //! the reset or the cap (with a ✕ and "cap 4:10p", or a "safe" end label),
-//! the dashed 100% cap line, and a hover crosshair with a tooltip.
+//! the dashed 100% cap line, and a hover crosshair with a tooltip. Time
+//! gaps in the samples (the app was closed) are bridged with a faint dotted
+//! line: 5-hour utilization only rises within a window, so the straight
+//! line is the best guess; only resets and missing values truly break.
 //!
 //! Geometry (mapping, segmenting, thinning, dashes, ticks, hover lookup) is
 //! in pure functions tested without a GPU; [`show_timeline`] only paints.
@@ -20,15 +23,15 @@ use eframe::egui::{
     TextStyle, Ui,
 };
 
-use crate::analytics::{self, Projection, WindowSample};
+use crate::analytics::{self, alerts::fmt_clock_in, Projection, WindowSample};
 use crate::poller::Dashboard;
 
 use super::theme::Palette;
 
 /// Height of the timeline in full mode.
 pub const FULL_HEIGHT: f32 = 180.0;
-/// A gap between samples longer than this breaks the line (the app was
-/// closed or polls failed).
+/// A gap between samples longer than this ends a solid line (the app was
+/// closed or polls failed); its two ends are joined by a [`Bridge`].
 pub const GAP_BREAK_MINUTES: i64 = 10;
 /// A drop of more than this many points between samples is a reset and
 /// breaks the line (the rule of [`analytics::recent_window`]).
@@ -51,6 +54,14 @@ const CAP_MARK: f32 = 4.0;
 const DOT_RADIUS: f32 = 3.5;
 /// Radius of the dot marking an isolated sample.
 const LONE_RADIUS: f32 = 1.5;
+/// Bridge line opacity, and its fills relative to the normal fills.
+const BRIDGE_LINE_ALPHA: f32 = 0.40;
+const BRIDGE_FILL_SCALE: f32 = 1.0 / 3.0;
+/// Dot and gap lengths of the dotted bridge line.
+const DOT: f32 = 2.0;
+const DOT_GAP: f32 = 3.0;
+/// Hover snaps to a sample at most this far away horizontally.
+pub const SNAP_PX: f32 = 12.0;
 
 /// Maps the window's time and 0–100% onto the plot rectangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,10 +108,10 @@ impl Axes {
     }
 }
 
-/// Index ranges of `samples` drawn as one connected line each: only samples
+/// Index ranges of `samples` drawn as one solid line each: only samples
 /// with a 5-hour value, broken where a value is missing, the time between
-/// neighbors exceeds [`GAP_BREAK_MINUTES`], or the value drops by more than
-/// [`RESET_DROP`] points. Single-sample ranges are kept.
+/// neighbors exceeds [`GAP_BREAK_MINUTES`] (see [`bridges`]), or the value
+/// drops by more than [`RESET_DROP`] points. Single-sample ranges are kept.
 pub fn segments(samples: &[WindowSample]) -> Vec<Range<usize>> {
     let max_gap = Duration::minutes(GAP_BREAK_MINUTES);
     let mut out = Vec::new();
@@ -126,6 +137,29 @@ pub fn segments(samples: &[WindowSample]) -> Vec<Range<usize>> {
     }
     out.extend(current);
     out
+}
+
+/// A stretch without samples between two sampled points, drawn faintly
+/// dotted: the sample indices of its two ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bridge {
+    pub from: usize,
+    pub to: usize,
+}
+
+/// Bridges between consecutive `segs` (from [`segments`]) that only a time
+/// gap separates: none where a missing value or a reset broke the line.
+pub fn bridges(samples: &[WindowSample], segs: &[Range<usize>]) -> Vec<Bridge> {
+    segs.windows(2)
+        .filter_map(|pair| {
+            let (from, to) = (pair[0].end - 1, pair[1].start);
+            if to != from + 1 {
+                return None; // missing values in between
+            }
+            let (a, b) = (samples[from].five_hour?, samples[to].five_hour?);
+            (a - b <= RESET_DROP).then_some(Bridge { from, to })
+        })
+        .collect()
 }
 
 /// The runs of `Some` in `values[within]`, as index ranges into `values`.
@@ -263,12 +297,19 @@ where
     format!("{}{suffix}", local.format("%-I:%M"))
 }
 
-/// Local time for tooltips: "1:35 PM".
-pub fn tooltip_time_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
+/// Tooltip over a bridge: "no samples 1:10–1:45 PM", or with both
+/// meridiems when they differ ("11:50 AM–12:20 PM").
+pub fn gap_tip_in<Tz: TimeZone>(from: DateTime<Utc>, to: DateTime<Utc>, tz: &Tz) -> String
 where
     Tz::Offset: Display,
 {
-    t.with_timezone(tz).format("%-I:%M %p").to_string()
+    let (a, b) = (from.with_timezone(tz), to.with_timezone(tz));
+    let start = if (a.hour() < 12) == (b.hour() < 12) {
+        a.format("%-I:%M").to_string()
+    } else {
+        fmt_clock_in(from, tz)
+    };
+    format!("no samples {start}–{}", fmt_clock_in(to, tz))
 }
 
 /// The sample with a 5-hour value nearest in time to `t`.
@@ -309,6 +350,48 @@ pub fn sample_tip(time: &str, pct: f64, fable: Option<f64>) -> String {
 /// Tooltip for a point on the projection: "3:10 PM · projected 71%".
 pub fn projected_tip(time: &str, pct: f64) -> String {
     format!("{time} · projected {pct:.0}%")
+}
+
+/// What the pointer at `x` points at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HoverTarget {
+    /// The projection beyond now, at `t`.
+    Projected { t: DateTime<Utc>, pct: f64 },
+    /// A sample within [`SNAP_PX`].
+    Sample(usize),
+    /// A bridged gap.
+    Gap(Bridge),
+    /// Nothing nearby: just the time under the pointer.
+    Time(DateTime<Utc>),
+}
+
+/// The hover target at `x`: the projection beyond now, else the nearest
+/// sample within [`SNAP_PX`], else a bridge spanning the pointer, else the
+/// bare time. `projection` is `(pct now, line)`.
+pub fn hover_target(
+    axes: &Axes,
+    samples: &[WindowSample],
+    bridges: &[Bridge],
+    now: DateTime<Utc>,
+    projection: Option<(f64, Projection)>,
+    x: f32,
+) -> HoverTarget {
+    let t = axes.t_at(x);
+    if let Some(pct) = projection.and_then(|(pct, p)| projected_pct(now, pct, &p, t)) {
+        return HoverTarget::Projected { t, pct };
+    }
+    if let Some(i) = nearest_sample(samples, t) {
+        if (axes.x_at(samples[i].t) - x).abs() <= SNAP_PX {
+            return HoverTarget::Sample(i);
+        }
+    }
+    match bridges
+        .iter()
+        .find(|b| samples[b.from].t < t && t < samples[b.to].t)
+    {
+        Some(b) => HoverTarget::Gap(*b),
+        None => HoverTarget::Time(t),
+    }
 }
 
 /// Left edge for a label `width` wide centered on `center`, kept inside
@@ -369,7 +452,10 @@ pub fn show_timeline(
     let pct = d.snapshot.five_hour_pct();
     let state = palette.level(analytics::color_for(pct));
     let fable = analytics::fable_layer(samples);
-    paint_areas(&painter, &axes, palette, state, samples, &fable, &segs);
+    let gaps = bridges(samples, &segs);
+    paint_areas(
+        &painter, &axes, palette, state, samples, &fable, &segs, &gaps,
+    );
 
     let projection = pct.map(|p| {
         let rate = analytics::compute_rate(&d.history, now);
@@ -379,12 +465,9 @@ pub fn show_timeline(
 
     if let Some(pointer) = response.hover_pos() {
         if axes.plot.x_range().contains(pointer.x) {
-            let tip = paint_hover(
-                &painter, &axes, palette, now, samples, &fable, projection, pointer,
-            );
-            if let Some(tip) = tip {
-                return response.on_hover_text_at_pointer(tip);
-            }
+            let target = hover_target(&axes, samples, &gaps, now, projection, pointer.x);
+            let tip = paint_hover(&painter, &axes, palette, samples, &fable, target, pointer.x);
+            return response.on_hover_text_at_pointer(tip);
         }
     }
     response
@@ -447,8 +530,10 @@ fn paint_time_axis(painter: &Painter, axes: &Axes, palette: &Palette, font: &Fon
     painter.galley(pos2(reset_left, y), reset, palette.text_muted);
 }
 
-/// The usage area per segment (gradient fill), the Fable layer over its
-/// base with a surface-colored separator on top, then the usage line.
+/// The faint bridge fills (usage and Fable), the usage area per segment
+/// (gradient fill), the Fable layer over its base with a surface-colored
+/// separator on top, then the usage lines and the dotted bridge lines.
+#[allow(clippy::too_many_arguments)]
 fn paint_areas(
     painter: &Painter,
     axes: &Axes,
@@ -457,11 +542,28 @@ fn paint_areas(
     samples: &[WindowSample],
     fable: &[Option<f64>],
     segs: &[Range<usize>],
+    gaps: &[Bridge],
 ) {
     let baseline = axes.plot.bottom();
     let top = state.gamma_multiply(AREA_TOP_ALPHA);
     let bottom = state.gamma_multiply(AREA_BASE_ALPHA);
     let fable_fill = palette.fable.gamma_multiply(FABLE_ALPHA);
+    let five = |i: usize| axes.pos(samples[i].t, samples[i].five_hour.unwrap_or(0.0));
+    for b in gaps {
+        let ends = [five(b.from), five(b.to)];
+        let scale = BRIDGE_FILL_SCALE;
+        painter.add(area_mesh(
+            &ends,
+            baseline,
+            top.gamma_multiply(scale),
+            bottom.gamma_multiply(scale),
+        ));
+        if let (Some(a), Some(z)) = (fable[b.from], fable[b.to]) {
+            let ends = [axes.pos(samples[b.from].t, a), axes.pos(samples[b.to].t, z)];
+            let faint = fable_fill.gamma_multiply(scale);
+            painter.add(area_mesh(&ends, baseline, faint, faint));
+        }
+    }
     let mut raw = Vec::new();
     let mut lines = Vec::with_capacity(segs.len());
     for seg in segs {
@@ -485,10 +587,16 @@ fn paint_areas(
         }
         lines.push(line);
     }
+    let dotted = Stroke::new(1.5, state.gamma_multiply(BRIDGE_LINE_ALPHA));
+    for b in gaps {
+        for seg in dashes(five(b.from), five(b.to), DOT, DOT_GAP) {
+            painter.line_segment(seg, dotted);
+        }
+    }
     for line in lines {
         match line[..] {
             [] => {}
-            // An isolated sample (gaps on both sides): a dot, not a line.
+            // A lone sample between gaps or breaks: a dot, not a line.
             [p] => {
                 painter.circle_filled(p, LONE_RADIUS, state);
             }
@@ -555,37 +663,46 @@ fn paint_now(
     painter.circle(from, DOT_RADIUS, state, Stroke::new(1.5, palette.surface));
 }
 
-/// Crosshair at the hovered sample (or projection point beyond now) and
-/// its tooltip text.
-#[allow(clippy::too_many_arguments)]
+/// Crosshair for the hover `target` and its tooltip text: a full
+/// crosshair on a sample or the projection, a vertical line over a gap or
+/// an empty spot.
 fn paint_hover(
     painter: &Painter,
     axes: &Axes,
     palette: &Palette,
-    now: DateTime<Utc>,
     samples: &[WindowSample],
     fable: &[Option<f64>],
-    projection: Option<(f64, Projection)>,
-    pointer: Pos2,
-) -> Option<String> {
-    let t = axes.t_at(pointer.x);
-    let projected = projection.and_then(|(pct, p)| Some((t, projected_pct(now, pct, &p, t)?)));
-    let (at, pct, tip) = match projected {
-        Some((t, pct)) => (t, pct, projected_tip(&tooltip_time_in(t, &Local), pct)),
-        None => {
-            let i = nearest_sample(samples, t)?;
+    target: HoverTarget,
+    pointer_x: f32,
+) -> String {
+    let point = |t: DateTime<Utc>, pct: f64| Some(axes.pos(t, pct));
+    let (x, point, tip) = match target {
+        HoverTarget::Projected { t, pct } => (
+            axes.x_at(t),
+            point(t, pct),
+            projected_tip(&fmt_clock_in(t, &Local), pct),
+        ),
+        HoverTarget::Sample(i) => {
             let s = &samples[i];
-            let pct = s.five_hour?;
-            let time = tooltip_time_in(s.t, &Local);
-            (s.t, pct, sample_tip(&time, pct, fable[i]))
+            let pct = s.five_hour.unwrap_or(0.0);
+            let tip = sample_tip(&fmt_clock_in(s.t, &Local), pct, fable[i]);
+            (axes.x_at(s.t), point(s.t, pct), tip)
         }
+        HoverTarget::Gap(b) => {
+            let (from, to) = (samples[b.from].t, samples[b.to].t);
+            (pointer_x, None, gap_tip_in(from, to, &Local))
+        }
+        HoverTarget::Time(t) => (pointer_x, None, fmt_clock_in(t, &Local)),
     };
-    let p = axes.pos(at, pct);
     let stroke = Stroke::new(1.0, palette.text_muted.gamma_multiply(0.7));
-    painter.vline(p.x, axes.plot.y_range(), stroke);
-    painter.hline(axes.plot.x_range(), p.y, stroke);
-    painter.circle(p, 3.0, palette.surface, Stroke::new(1.5, palette.text));
-    Some(tip)
+    if let Some(p) = point {
+        painter.vline(p.x, axes.plot.y_range(), stroke);
+        painter.hline(axes.plot.x_range(), p.y, stroke);
+        painter.circle(p, 3.0, palette.surface, Stroke::new(1.5, palette.text));
+    } else {
+        painter.vline(x, axes.plot.y_range(), stroke);
+    }
+    tip
 }
 
 fn paint_dashed(painter: &Painter, a: Pos2, b: Pos2, stroke: Stroke) {
@@ -724,6 +841,46 @@ mod tests {
         assert!(present_runs(&values, 1..2).is_empty());
     }
 
+    #[test]
+    fn bridges_span_time_gaps() {
+        let samples = [
+            s(0, Some(1.0)),
+            s(5, Some(2.0)),
+            s(30, Some(4.0)), // 25 min gap: bridged
+            s(35, Some(5.0)),
+            s(80, Some(6.0)), // 45 min gap to a lone sample: bridged
+        ];
+        let segs = segments(&samples);
+        assert_eq!(segs, vec![0..2, 2..4, 4..5]);
+        assert_eq!(
+            bridges(&samples, &segs),
+            vec![Bridge { from: 1, to: 2 }, Bridge { from: 3, to: 4 }]
+        );
+    }
+
+    #[test]
+    fn bridges_not_across_resets_or_missing_values() {
+        let samples = [
+            s(0, Some(40.0)),
+            s(30, Some(2.0)), // gap and a reset: no bridge
+            s(31, Some(3.0)),
+            s(32, None), // missing value: no bridge
+            s(33, Some(4.0)),
+            s(34, Some(5.0)),
+            s(60, Some(1.0)), // gap with a drop of exactly 4: bridged
+        ];
+        let segs = segments(&samples);
+        assert_eq!(segs, vec![0..1, 1..3, 4..6, 6..7]);
+        assert_eq!(bridges(&samples, &segs), vec![Bridge { from: 5, to: 6 }]);
+    }
+
+    #[test]
+    fn bridges_need_two_segments() {
+        assert!(bridges(&[], &[]).is_empty());
+        let samples = [s(0, Some(1.0)), s(1, Some(2.0))];
+        assert!(bridges(&samples, &segments(&samples)).is_empty());
+    }
+
     // --- thinning -----------------------------------------------------------
 
     #[test]
@@ -754,7 +911,12 @@ mod tests {
             .map(|i| pos2(i as f32 * 0.1, (i % 7) as f32))
             .collect();
         let thin = thin_columns(&points);
-        assert!(thin.len() <= 200, "{}", thin.len());
+        let mut per_column = std::collections::HashMap::new();
+        for p in &thin {
+            *per_column.entry(p.x.floor() as i32).or_insert(0) += 1;
+        }
+        assert_eq!(per_column.len(), 100, "every column keeps a point");
+        assert!(per_column.values().all(|&n| n <= 2), "{per_column:?}");
         assert!(thin.windows(2).all(|w| w[0].x <= w[1].x));
     }
 
@@ -773,7 +935,19 @@ mod tests {
             assert_eq!((line.pos, line.color), (*p, top));
             assert_eq!((base.pos, base.color), (pos2(p.x, 50.0), bottom));
         }
-        assert!(mesh.indices.iter().all(|&i| (i as usize) < 6));
+        // Two triangles per column pair: (line, base, next line) and
+        // (base, next base, next line).
+        assert_eq!(mesh.indices, [0, 1, 2, 1, 3, 2, 2, 3, 4, 3, 5, 4]);
+        // Every triangle winds the same way (no flipped faces).
+        let signed_area = |t: &[u32]| {
+            let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[t[k] as usize].pos);
+            (b - a).x * (c - a).y - (b - a).y * (c - a).x
+        };
+        let areas: Vec<f32> = mesh.indices.chunks(3).map(signed_area).collect();
+        assert!(
+            areas.iter().all(|&a| a < 0.0) || areas.iter().all(|&a| a > 0.0),
+            "{areas:?}"
+        );
     }
 
     #[test]
@@ -867,12 +1041,23 @@ mod tests {
     fn short_and_tooltip_times() {
         let t = Utc.with_ymd_and_hms(2026, 10, 11, 15, 42, 9).unwrap();
         assert_eq!(short_time_in(t, &Utc), "3:42p");
-        assert_eq!(tooltip_time_in(t, &Utc), "3:42 PM");
         let morning = Utc.with_ymd_and_hms(2026, 10, 11, 0, 5, 0).unwrap();
         assert_eq!(short_time_in(morning, &Utc), "12:05a");
-        assert_eq!(tooltip_time_in(morning, &Utc), "12:05 AM");
         let ist = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
         assert_eq!(short_time_in(t, &ist), "9:12p");
+    }
+
+    #[test]
+    fn gap_tips() {
+        let t = |h, m| Utc.with_ymd_and_hms(2026, 10, 11, h, m, 0).unwrap();
+        assert_eq!(
+            gap_tip_in(t(13, 10), t(13, 45), &Utc),
+            "no samples 1:10–1:45 PM"
+        );
+        assert_eq!(
+            gap_tip_in(t(11, 50), t(12, 20), &Utc),
+            "no samples 11:50 AM–12:20 PM"
+        );
     }
 
     #[test]
@@ -905,6 +1090,52 @@ mod tests {
         assert_eq!(nearest_sample(&samples, at(500)), Some(3));
         assert_eq!(nearest_sample(&[s(0, None)], at(0)), None);
         assert_eq!(nearest_sample(&[], at(0)), None);
+    }
+
+    #[test]
+    fn hover_snaps_within_snap_px_then_gaps_then_time() {
+        // One px per minute.
+        let a = axes();
+        let samples = [s(0, Some(1.0)), s(10, Some(2.0)), s(60, Some(5.0))];
+        let gaps = bridges(&samples, &segments(&samples));
+        assert_eq!(gaps, vec![Bridge { from: 1, to: 2 }]);
+        let now = at(100);
+        let x = |m: f32| a.plot.left() + m;
+        let target = |m| hover_target(&a, &samples, &gaps, now, None, x(m));
+        assert_eq!(target(3.0), HoverTarget::Sample(0));
+        assert_eq!(
+            target(10.0 + SNAP_PX),
+            HoverTarget::Sample(1),
+            "at the edge"
+        );
+        assert_eq!(target(60.0 - SNAP_PX), HoverTarget::Sample(2));
+        assert_eq!(target(35.0), HoverTarget::Gap(gaps[0]));
+        assert_eq!(target(85.0), HoverTarget::Time(at(85)), "nothing near");
+    }
+
+    #[test]
+    fn hover_beyond_now_is_the_projection() {
+        let a = axes();
+        let samples = [s(0, Some(10.0)), s(5, Some(12.0))];
+        let p = Projection {
+            end_t: at(300),
+            end_pct: 60.0,
+            cap_at: None,
+        };
+        let now = at(100);
+        let x = |m: f32| a.plot.left() + m;
+        let target = |m| hover_target(&a, &samples, &[], now, Some((10.0, p)), x(m));
+        assert_eq!(
+            target(200.0),
+            HoverTarget::Projected {
+                t: at(200),
+                pct: 35.0
+            }
+        );
+        assert_eq!(target(4.0), HoverTarget::Sample(1));
+        // Without a projection, beyond now is just the time.
+        let bare = hover_target(&a, &samples, &[], now, None, x(200.0));
+        assert_eq!(bare, HoverTarget::Time(at(200)));
     }
 
     #[test]
