@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use claude_usage::config::{self, ClientShaSource, Settings};
 use claude_usage::debug_report::{self as report, Probe};
 use claude_usage::fetch::{self, FetchError};
+use claude_usage::mcp::McpConfig;
 use claude_usage::paths::Paths;
 use claude_usage::poller::{self, BurnHistory, HttpSource, SessionDirs};
 use claude_usage::{cookies, text_report};
@@ -52,10 +53,7 @@ fn main() -> ExitCode {
             show_all,
         } => once(cookie_file, plan, show_all),
         Command::Debug { cookie_file } => debug(cookie_file.as_deref()),
-        Command::Mcp => {
-            eprintln!("not implemented yet");
-            ExitCode::FAILURE
-        }
+        Command::Mcp => mcp(),
     }
 }
 
@@ -100,6 +98,19 @@ fn once(cookie_file: Option<PathBuf>, plan: String, show_all: bool) -> ExitCode 
                     config::CLIENT_SHA_ENV
                 );
             }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Serve the MCP tools over stdio from latest.json (written by the GUI or
+/// `once`). Only protocol messages go to stdout; errors go to stderr.
+fn mcp() -> ExitCode {
+    let paths = Paths::platform_default();
+    match claude_usage::mcp::run_stdio(paths, McpConfig::from_env()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
     }
