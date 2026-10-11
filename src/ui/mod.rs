@@ -7,7 +7,6 @@
 
 pub mod app;
 pub mod banners;
-pub mod charts;
 pub mod chips;
 pub mod details;
 pub mod digits;

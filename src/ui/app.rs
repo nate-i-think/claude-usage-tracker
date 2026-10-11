@@ -10,20 +10,18 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use eframe::egui::{
-    self, style::ScrollStyle, Align, CentralPanel, Color32, Frame, Layout, RichText, ScrollArea, Ui,
+    self, style::ScrollStyle, Align, CentralPanel, Frame, Margin, RichText, ScrollArea, Ui,
 };
 
-use crate::analytics::{self, Level};
 use crate::config::{Settings, UiMode};
-use crate::model::UsageWindow;
 use crate::paths::Paths;
 use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 
-use super::charts;
-use super::rows::{self, BurnTag};
+use super::banners::{banner, BannerKind};
+use super::layout::{self, right_then_left, GAP};
 use super::settings::{self, PanelAction, SettingsPanel};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
-use super::{level_color, show_runs, theme, timeline, tone_color, Tone};
+use super::{chips, details, footer, theme, timeline};
 
 /// Key eframe stores egui's memory (including the theme preference) under
 /// (private `STORAGE_EGUI_MEMORY_KEY` in eframe's native/epi_integration.rs).
@@ -189,39 +187,32 @@ impl App {
     /// tray icon (Task 9) and threshold alerts (Task 10) hook in here.
     fn background_hooks(&mut self, _now: Instant) {}
 
-    /// "claude.ai usage · {plan}" with refresh, pin, and settings buttons.
+    /// Stat chips on the left (wrapping as needed), refresh, pill and
+    /// settings buttons on the right.
     fn header(&mut self, ui: &mut Ui) {
-        let title = rows::header_runs(&self.settings.plan);
-        // Buttons first (right to left), so the title wraps in what's left.
+        let now = Utc::now();
+        let chips = self
+            .state
+            .data
+            .as_ref()
+            .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now));
         right_then_left(
             ui,
-            Align::Center,
+            Align::Min,
             |ui| {
-                if ui
-                    .add(egui::Button::selectable(self.settings_panel.is_some(), "⚙"))
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().button_padding = egui::vec2(4.0, 4.0);
+                if icon_button(ui, self.settings_panel.is_some(), true, "⚙")
                     .on_hover_text("Settings")
                     .clicked()
                 {
                     self.toggle_settings();
                 }
-
-                let pinned = self.settings.always_on_top;
-                let pin_tip = if pinned {
-                    "Stop keeping on top"
-                } else {
-                    "Keep on top"
-                };
-                if ui
-                    .add(egui::Button::selectable(pinned, "📌"))
-                    .on_hover_text(pin_tip)
-                    .clicked()
-                {
-                    settings::set_always_on_top(ui.ctx(), &mut self.settings, !pinned);
-                }
-
+                // Task 8 wires pill mode; until then the button is a stub.
+                icon_button(ui, false, false, "◱")
+                    .on_disabled_hover_text("Compact pill mode — coming soon");
                 let ready = refresh_ready(self.last_refresh, Instant::now());
-                if ui
-                    .add_enabled(ready, egui::Button::selectable(false, "🔄"))
+                if icon_button(ui, false, ready, "⟳")
                     .on_hover_text("Refresh now")
                     .on_disabled_hover_text("Refreshed just now")
                     .clicked()
@@ -231,7 +222,9 @@ impl App {
                 }
             },
             |ui| {
-                show_runs(ui, &title);
+                if let Some(chips) = &chips {
+                    chips::show_chips(ui, chips, now);
+                }
             },
         );
     }
@@ -263,25 +256,28 @@ impl App {
         }
     }
 
-    /// Poller-stopped, fetch-error, and persist-error notices.
+    /// Poller-stopped, fetch-error, persist-error and loading notices.
     fn banners(&mut self, ui: &mut Ui) {
-        let red = level_color(Level::Red, ui.visuals());
+        let palette = theme::Palette::for_visuals(ui.visuals());
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let title = |text: &str, color| {
+            RichText::new(text)
+                .font(theme::semibold(body.size))
+                .color(color)
+        };
         if !self.poller.is_alive() {
-            error_frame(ui, red, |ui| {
-                ui.colored_label(red, "poller stopped — restart the app");
+            banner(ui, BannerKind::Error, |ui| {
+                ui.label(title("Poller stopped", palette.danger));
+                ui.label(RichText::new("Restart the app to resume polling.").color(palette.text));
             });
         }
         if let Some(err) = &self.state.error {
             let hint = err.stale_sha_hint;
             let message = err.message.clone();
             let mut open_settings = false;
-            error_frame(ui, red, |ui| {
-                let body = egui::TextStyle::Body.resolve(ui.style());
-                ui.colored_label(
-                    red,
-                    RichText::new("claude.ai usage — error").font(theme::semibold(body.size)),
-                );
-                ui.add(egui::Label::new(RichText::new(message).color(red)).wrap());
+            banner(ui, BannerKind::Error, |ui| {
+                ui.label(title("claude.ai usage — error", palette.danger));
+                ui.add(egui::Label::new(RichText::new(message).color(palette.text)).wrap());
                 if hint {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Your client SHA may be stale — update it in Settings");
@@ -299,107 +295,56 @@ impl App {
             .as_ref()
             .and_then(|d| d.persist_error.as_ref())
         {
-            let color = level_color(Level::Orange, ui.visuals());
-            ui.add(egui::Label::new(RichText::new(persist).color(color)).wrap());
+            banner(ui, BannerKind::Warning, |ui| {
+                ui.label(title("History not saved", palette.high));
+                ui.add(egui::Label::new(RichText::new(persist).color(palette.text)).wrap());
+            });
+        }
+        // While the first poll is failing, the error banner says it all.
+        if self.state.data.is_none() && self.state.error.is_none() {
+            banner(ui, BannerKind::Loading, |ui| {
+                ui.label(RichText::new("Loading usage…").color(palette.text_muted));
+            });
         }
     }
 }
 
-/// One row: `right` laid out first from the right edge, then `left` from the
-/// left edge in the remaining width, so wrapping text on the left never runs
-/// under the right-hand widgets.
-fn right_then_left(
-    ui: &mut Ui,
-    align: Align,
-    right: impl FnOnce(&mut Ui),
-    left: impl FnOnce(&mut Ui),
-) {
-    ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(align), |ui| {
-            right(ui);
-            ui.with_layout(Layout::left_to_right(align), left);
-        });
-    });
+/// A square header button; the theme gives it a frame only when hovered or
+/// selected.
+fn icon_button(ui: &mut Ui, selected: bool, enabled: bool, icon: &str) -> egui::Response {
+    let font = egui::FontId::proportional(17.0);
+    let button = egui::Button::selectable(selected, RichText::new(icon).font(font))
+        .min_size(egui::vec2(26.0, 28.0));
+    ui.add_enabled(enabled, button)
 }
 
-/// A red-outlined card across the full width.
-fn error_frame(ui: &mut Ui, red: Color32, add: impl FnOnce(&mut Ui)) {
-    Frame::new()
-        .stroke((1.0, red))
-        .fill(red.gamma_multiply(0.10))
-        .corner_radius(theme::CARD_RADIUS)
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        });
-    ui.add_space(4.0);
-}
-
-/// The dashboard body for one successful poll.
-fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &Settings) {
+/// The dashboard body for one successful poll: hero timeline, footer
+/// strip, Details.
+fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
     let now = Utc::now();
-    let snap = &d.snapshot;
-    let order = analytics::ordered_windows(snap);
-    let show_rows = |ui: &mut Ui, windows: &[&UsageWindow]| {
-        for w in windows {
-            if analytics::window_visible(w, settings.show_all) {
-                rows::show_window_row(ui, &rows::window_row(w, now));
-            }
-        }
-    };
-
-    show_rows(ui, &order.primary);
-    ui.add_space(4.0);
-    let all = analytics::burn_line(
-        &d.history,
-        snap.five_hour_pct(),
-        snap.five_hour_resets_at(),
-        now,
-    );
-    rows::show_burn_row(ui, BurnTag::All, &rows::burn_body(all.as_ref()));
-    if let Some(fable) = snap.window("Fable") {
-        let line = analytics::burn_line(&d.fable_history, fable.utilization, fable.resets_at, now);
-        rows::show_burn_row(ui, BurnTag::Fable, &rows::burn_body(line.as_ref()));
-    }
-    if !order.rest.is_empty() {
-        ui.add_space(4.0);
-        show_rows(ui, &order.rest);
-    }
-
-    if let Some(extra) = analytics::visible_extra(snap) {
-        ui.add_space(6.0);
-        show_runs(ui, &rows::extra_runs(extra));
-    }
-
-    ui.add_space(8.0);
-    // Temporary placement until Task 6's layout: the hero timeline where the
-    // 5-hour bar chart was.
     let palette = theme::Palette::for_visuals(ui.visuals());
     theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());
         timeline::show_timeline(ui, d, now, palette, timeline::FULL_HEIGHT);
     });
-    ui.add_space(6.0);
-    charts::show_seven_day(ui, d);
-    ui.add_space(8.0);
+    footer::show_footer(ui, d, now);
+    details::show_details(ui, d, settings, now);
+}
 
-    show_runs(ui, &rows::burners_runs(&d.burners));
-    // "last polled" first (right), so projected use wraps in what's left.
-    right_then_left(
-        ui,
-        Align::Min,
-        |ui| {
-            let dim = tone_color(Tone::Dim, ui.visuals());
-            ui.colored_label(dim, rows::last_polled(snap.fetched_at, now));
-        },
-        |ui| {
-            let rate = analytics::compute_rate(&d.history, now);
-            if let Some(h) = analytics::headroom(snap, rate, now) {
-                show_runs(ui, &rows::headroom_runs(&h));
-            }
-        },
-    );
+/// Lay `add` out in the content column: at most
+/// [`layout::MAX_CONTENT_WIDTH`] wide, centered, sections [`GAP`] apart.
+fn content_column(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    let available = ui.available_width();
+    let width = layout::content_width(available);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(layout::centered_inset(available));
+        ui.vertical(|ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+            add(ui);
+        });
+    });
 }
 
 impl eframe::App for App {
@@ -415,24 +360,20 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        CentralPanel::default().show(ui, |ui| {
+        let frame = Frame::central_panel(ui.style()).inner_margin(Margin::same(layout::OUTER_PAD));
+        CentralPanel::default().frame(frame).show(ui, |ui| {
             // A solid scrollbar takes its own space instead of overlaying
             // content at narrow widths.
             ui.spacing_mut().scroll = ScrollStyle::solid();
             ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                self.header(ui);
-                ui.separator();
-                self.settings_panel(ui);
-                self.banners(ui);
-                match &self.state.data {
-                    Some(d) => dashboard(ui, d, &self.settings),
-                    // While the first poll is failing, the error banner says it all.
-                    None if self.state.error.is_some() => {}
-                    None => {
-                        ui.add_space(40.0);
-                        ui.vertical_centered(|ui| ui.weak("loading…"));
+                content_column(ui, |ui| {
+                    self.header(ui);
+                    self.settings_panel(ui);
+                    self.banners(ui);
+                    if let Some(d) = &self.state.data {
+                        dashboard(ui, d, &mut self.settings);
                     }
-                }
+                });
             });
         });
     }
@@ -448,7 +389,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Snapshot;
+    use crate::model::{Snapshot, UsageWindow};
     use chrono::DateTime;
     use eframe::Storage;
 
