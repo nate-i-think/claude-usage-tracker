@@ -186,7 +186,7 @@ pub enum Eta {
         minutes: f64,
         level: Level,
         /// The cap lands strictly after the known reset, so the window
-        /// resets first ([`lands_after`]); false when the reset is unknown.
+        /// resets first (`lands_after`); false when the reset is unknown.
         lands_after_reset: bool,
     },
 }
