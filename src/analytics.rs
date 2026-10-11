@@ -439,31 +439,12 @@ pub fn extra_disabled_reason(e: &ExtraUsage) -> Option<String> {
 
 // --- Bar-chart labels ---------------------------------------------------------
 
-/// 5-hour chart label for a bucket, in local time: the hour ("%H") only for
-/// on-the-hour buckets, else empty, to avoid duplicates like "10 10".
-pub fn bucket_label(t: DateTime<Utc>) -> String {
-    bucket_label_in(t, &Local)
-}
-
-/// [`bucket_label`] in an explicit time zone.
-pub fn bucket_label_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
-where
-    Tz::Offset: Display,
-{
-    let local = t.with_timezone(tz);
-    if local.minute() == 0 {
-        local.format("%H").to_string()
-    } else {
-        String::new()
-    }
-}
-
 /// 5-hour chart label for the 30-minute bucket starting at `t`, in local
 /// time: the hour ("%H") whose HH:00 falls inside the bucket
 /// (`t <= HH:00 < t + 30m`), else empty.
 ///
-/// Deviates from Python, which labels only buckets that *start* on the hour
-/// ([`bucket_label`]): buckets start at `resets_at - 5h`, rarely on the hour,
+/// Deviates from Python, which labels only buckets that *start* on the hour:
+/// buckets start at `resets_at - 5h`, rarely on the hour,
 /// which left the axis blank.
 pub fn bucket_hour_label(t: DateTime<Utc>) -> String {
     bucket_hour_label_in(t, &Local)
@@ -1274,25 +1255,6 @@ mod tests {
     }
 
     // --- Chart labels -------------------------------------------------------------------
-
-    #[test]
-    fn bucket_labels_hour_only_on_the_hour_in_local_time() {
-        let t = |h, m| Utc.with_ymd_and_hms(2026, 10, 11, h, m, 0).unwrap();
-        let plus2 = FixedOffset::east_opt(2 * 3600).unwrap();
-        assert_eq!(bucket_label_in(t(17, 0), &plus2), "19");
-        assert_eq!(bucket_label_in(t(17, 30), &plus2), "");
-        assert_eq!(bucket_label_in(t(17, 10), &plus2), "");
-        assert_eq!(bucket_label_in(t(23, 0), &plus2), "01"); // zero-padded, next local day
-        assert_eq!(bucket_label_in(t(7, 0), &Utc), "07");
-        // Half-hour zones: the local minute decides.
-        let india = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
-        assert_eq!(bucket_label_in(t(17, 30), &india), "23");
-        assert_eq!(bucket_label_in(t(17, 0), &india), "");
-        // The default uses the machine's zone: the result is one of the two forms.
-        let label = bucket_label(t(17, 30));
-        assert!(label.is_empty() || label.len() == 2, "{label:?}");
-        assert_eq!(bucket_label(t(17, 30)), bucket_label_in(t(17, 30), &Local));
-    }
 
     #[test]
     fn bucket_hour_labels_mark_the_bucket_containing_each_hour() {
