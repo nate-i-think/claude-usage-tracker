@@ -104,13 +104,13 @@ Why the short cycles: most MCP clients inherit a ~60 s request timeout (Claude D
 
 ### Registering it
 
-**Claude Code, project scope.** The repo ships a `.mcp.json` that runs `target/release/claude-usage-cli mcp`. The path is relative, so it works only after `cargo build --release` and only when Claude Code runs from the repo root. Approve the `claude-usage` server when asked and check it with `/mcp`.
-
-**Claude Code, any scope.** Register the binary by absolute path so it works from any directory:
+**Claude Code (recommended).** Register the binary by absolute path so it works from any directory:
 
 ```bash
 claude mcp add --scope user claude-usage -- "C:\absolute\path\to\claude-usage-monitor\target\release\claude-usage-cli.exe" mcp
 ```
+
+**Claude Code, project scope.** The repo ships a `.mcp.json` that runs `target/release/claude-usage-cli mcp`. The path is relative, so it works only after `cargo build --release` and only when Claude Code runs from the repo root; started from a subdirectory, the server fails to launch. Approve the `claude-usage` server when asked and check it with `/mcp`.
 
 **Claude Desktop.** Add to `claude_desktop_config.json`:
 
