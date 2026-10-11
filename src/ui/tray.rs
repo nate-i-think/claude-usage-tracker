@@ -9,6 +9,8 @@
 //! window is hidden.
 
 use std::fmt::Display;
+#[cfg(not(windows))]
+use std::sync::mpsc::Receiver;
 
 use chrono::{DateTime, TimeZone, Utc};
 use eframe::egui::Color32;
@@ -270,7 +272,13 @@ fn cap_utf16(text: String, max: usize) -> String {
 }
 
 #[cfg(windows)]
-pub use native::Tray;
+pub use native::{install_event_handlers, Tray};
+
+/// No tray outside Windows: nothing is ever sent.
+#[cfg(not(windows))]
+pub fn install_event_handlers(_ctx: &eframe::egui::Context) -> Receiver<TrayAction> {
+    std::sync::mpsc::channel().1
+}
 
 /// No tray outside Windows: [`Tray::create`] always fails.
 #[cfg(not(windows))]
@@ -278,11 +286,8 @@ pub struct Tray;
 
 #[cfg(not(windows))]
 impl Tray {
-    pub fn create(_ctx: &eframe::egui::Context, _pill: bool) -> Result<Self, String> {
+    pub fn create(_pill: bool) -> Result<Self, String> {
         Err("no tray icon on this platform".to_owned())
-    }
-    pub fn try_recv(&self) -> Option<TrayAction> {
-        None
     }
     pub fn pill_checked(&self) -> bool {
         false
@@ -317,12 +322,36 @@ mod native {
         }
     }
 
+    /// Route clicks on the icon and menu picks into the returned channel,
+    /// waking `ctx` for each. Call once per process: tray-icon and muda keep
+    /// only the first handler ever set, so the handlers outlive any one
+    /// [`Tray`] (the icon is dropped and re-created with the setting).
+    pub fn install_event_handlers(ctx: &egui::Context) -> Receiver<TrayAction> {
+        let (tx, rx) = channel();
+        {
+            let (tx, ctx) = (tx.clone(), ctx.clone());
+            MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+                if let Some(action) = menu_action(e.id.0.as_str()) {
+                    let _ = tx.send(action);
+                    ctx.request_repaint();
+                }
+            }));
+        }
+        let ctx = ctx.clone();
+        TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+            if let Some(action) = click_action(&e) {
+                let _ = tx.send(action);
+                ctx.request_repaint();
+            }
+        }));
+        rx
+    }
+
     /// The live tray icon and its menu. Created and dropped on the main
     /// thread (the menu items are not `Send`); dropping it removes the icon.
     pub struct Tray {
         icon: TrayIcon,
         pill_item: CheckMenuItem,
-        rx: Receiver<TrayAction>,
         /// Icon edge in pixels (the system small-icon size).
         size: u32,
         face: IconFace,
@@ -330,9 +359,10 @@ mod native {
     }
 
     impl Tray {
-        /// Show the icon; its events wake `ctx`. Never opens the menu
-        /// itself: without a user gesture the popup gets stuck.
-        pub fn create(ctx: &egui::Context, pill: bool) -> Result<Self, String> {
+        /// Show the icon; its events go to [`install_event_handlers`]'
+        /// channel. Never opens the menu itself: without a user gesture the
+        /// popup gets stuck.
+        pub fn create(pill: bool) -> Result<Self, String> {
             let show_hide = MenuItem::with_id(super::MENU_SHOW_HIDE, "Show / Hide", true, None);
             let pill_item = CheckMenuItem::with_id(super::MENU_PILL, "Pill mode", true, pill, None);
             let refresh = MenuItem::with_id(super::MENU_REFRESH, "Refresh now", true, None);
@@ -361,39 +391,13 @@ mod native {
                 .with_menu_on_left_click(false)
                 .build()
                 .map_err(|e| e.to_string())?;
-
-            let (tx, rx) = channel();
-            {
-                let (tx, ctx) = (tx.clone(), ctx.clone());
-                MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-                    if let Some(action) = menu_action(e.id.0.as_str()) {
-                        let _ = tx.send(action);
-                        ctx.request_repaint();
-                    }
-                }));
-            }
-            {
-                let ctx = ctx.clone();
-                TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-                    if let Some(action) = click_action(&e) {
-                        let _ = tx.send(action);
-                        ctx.request_repaint();
-                    }
-                }));
-            }
             Ok(Self {
                 icon,
                 pill_item,
-                rx,
                 size,
                 face,
                 tooltip,
             })
-        }
-
-        /// The next queued action, if any.
-        pub fn try_recv(&self) -> Option<TrayAction> {
-            self.rx.try_recv().ok()
         }
 
         /// The "Pill mode" check (the menu flips it before reporting).
@@ -420,14 +424,6 @@ mod native {
             if tooltip != self.tooltip && self.icon.set_tooltip(Some(&tooltip)).is_ok() {
                 self.tooltip = tooltip;
             }
-        }
-    }
-
-    impl Drop for Tray {
-        fn drop(&mut self) {
-            // Release the handlers' context and sender with the icon.
-            MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
-            TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
         }
     }
 

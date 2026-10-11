@@ -6,6 +6,7 @@
 //! tick, tracking the window rect, the tray icon) runs in [`eframe::App::logic`], which
 //! eframe calls every pass, even when it skips the UI. `ui()` only draws.
 
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use chrono::{Local, Utc};
@@ -121,6 +122,8 @@ pub struct App {
     /// The tray icon, while [`Settings::tray_enabled`] and it could be
     /// created.
     tray: Option<Tray>,
+    /// Clicks and menu picks from the tray icon (whichever one exists).
+    tray_events: Receiver<TrayAction>,
     /// Creating the tray icon failed; not retried until the setting is
     /// turned off and on again.
     tray_failed: bool,
@@ -176,11 +179,12 @@ impl App {
             pulse_tracker: motion::PulseTracker::default(),
             pulse: motion::Pulse::NONE,
             tray: None,
+            tray_events: tray::install_event_handlers(&ctx),
             tray_failed: false,
             hidden: false,
             quitting: false,
         };
-        app.sync_tray_presence(&ctx);
+        app.sync_tray_presence();
         app
     }
 
@@ -323,15 +327,17 @@ impl App {
     /// Create or drop the tray icon to match the setting, act on its clicks
     /// and menu, and keep its icon, tooltip and "Pill mode" check current.
     fn sync_tray(&mut self, ctx: &egui::Context) {
-        self.sync_tray_presence(ctx);
+        self.sync_tray_presence();
         if self.tray.is_none() {
+            // Left over from a dropped icon.
+            while self.tray_events.try_recv().is_ok() {}
             // Nothing could bring the window back.
             if self.hidden {
                 self.show(ctx);
             }
             return;
         }
-        while let Some(action) = self.tray.as_ref().and_then(Tray::try_recv) {
+        while let Ok(action) = self.tray_events.try_recv() {
             self.tray_action(ctx, action);
         }
         let snap = self.state.data.as_ref().map(|d| &d.snapshot);
@@ -350,12 +356,12 @@ impl App {
 
     /// Create the tray icon (on the main thread) when the setting is on and
     /// it does not exist yet; drop it when the setting is off.
-    fn sync_tray_presence(&mut self, ctx: &egui::Context) {
+    fn sync_tray_presence(&mut self) {
         if !self.settings.tray_enabled {
             self.tray_failed = false;
             self.tray = None;
         } else if self.tray.is_none() && !self.tray_failed {
-            match Tray::create(ctx, self.settings.ui_mode == UiMode::Pill) {
+            match Tray::create(self.settings.ui_mode == UiMode::Pill) {
                 Ok(t) => self.tray = Some(t),
                 Err(e) => {
                     self.tray_failed = true;
