@@ -73,6 +73,22 @@ pub fn check_status(status: u16, body: &str) -> Result<(), FetchError> {
     }
 }
 
+/// An error and its `source()` chain joined with ": " (like anyhow's
+/// `{:#}`), so timeouts, DNS, TLS, and refused connections are
+/// distinguishable. Consecutive repeated messages are dropped.
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut parts: Vec<String> = vec![e.to_string()];
+    let mut cur = e.source();
+    while let Some(inner) = cur {
+        let msg = inner.to_string();
+        if parts.last() != Some(&msg) {
+            parts.push(msg);
+        }
+        cur = inner.source();
+    }
+    parts.join(": ")
+}
+
 fn prefix_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -124,6 +140,7 @@ impl Client {
         let mut defaults = HeaderMap::new();
         defaults.insert(ACCEPT, HeaderValue::from_static("*/*"));
         defaults.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.5"));
+        // The spike's successful request shape also sent these.
         for (name, value) in [
             ("sec-fetch-dest", "empty"),
             ("sec-fetch-mode", "cors"),
@@ -139,7 +156,9 @@ impl Client {
             .brotli(true)
             .timeout(TIMEOUT)
             .build()
-            .map_err(|e| FetchError::Transport(format!("building HTTP client: {e}")))?;
+            .map_err(|e| {
+                FetchError::Transport(format!("building HTTP client: {}", error_chain(&e)))
+            })?;
         Ok(Self { http })
     }
 
@@ -171,7 +190,7 @@ impl Client {
             .get(usage_url(org_id))
             .headers(map)
             .send()
-            .map_err(|e| FetchError::Transport(e.without_url().to_string()))?;
+            .map_err(|e| FetchError::Transport(error_chain(&e.without_url())))?;
         let status = resp.status().as_u16();
         let content_type = resp
             .headers()
@@ -180,7 +199,7 @@ impl Client {
             .map(str::to_owned);
         let body = resp
             .text()
-            .map_err(|e| FetchError::Transport(e.without_url().to_string()))?;
+            .map_err(|e| FetchError::Transport(error_chain(&e.without_url())))?;
         Ok(RawResponse {
             status,
             content_type,
@@ -359,6 +378,40 @@ mod tests {
             parse_response(401, "{}").unwrap_err(),
             FetchError::Unauthorized
         ));
+    }
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_joins_sources() {
+        let e = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer(
+                    "client error (Connect)",
+                    Some(Box::new(Layer("operation timed out", None))),
+                ))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&e),
+            "error sending request: client error (Connect): operation timed out"
+        );
+        assert_eq!(error_chain(&Layer("alone", None)), "alone");
     }
 
     #[test]
