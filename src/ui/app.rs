@@ -20,6 +20,9 @@ use super::{install_fonts, level_color, show_runs, tone_color, Tone};
 
 /// eframe storage key for [`Settings`].
 const SETTINGS_KEY: &str = "settings";
+/// Key eframe stores egui's memory (including the theme preference) under
+/// (private `STORAGE_EGUI_MEMORY_KEY` in eframe's native/epi_integration.rs).
+const EGUI_MEMORY_KEY: &str = "egui";
 /// Manual refreshes bypass the poller's minimum interval, so the button rests
 /// this long after a click.
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
@@ -54,6 +57,12 @@ pub fn refresh_ready(last_click: Option<Instant>, now: Instant) -> bool {
     last_click.is_none_or(|t| now.saturating_duration_since(t) >= REFRESH_COOLDOWN)
 }
 
+/// True when eframe has no persisted egui memory yet (first launch), so no
+/// theme preference has been saved.
+pub fn first_run(storage: Option<&dyn eframe::Storage>) -> bool {
+    storage.is_none_or(|s| s.get_string(EGUI_MEMORY_KEY).is_none())
+}
+
 pub struct App {
     /// The one poller for the app's lifetime; settings changes go to it as
     /// [`PollMsg::UpdateSettings`].
@@ -72,7 +81,10 @@ impl App {
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
             .unwrap_or_default();
         let ctx = cc.egui_ctx.clone();
-        ctx.set_theme(egui::ThemePreference::Dark);
+        // Dark by default; afterwards egui restores the persisted preference.
+        if first_run(cc.storage) {
+            ctx.set_theme(egui::ThemePreference::Dark);
+        }
         install_fonts(&ctx);
         if settings.always_on_top {
             ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
@@ -98,9 +110,11 @@ impl App {
 
     /// "claude.ai usage · {plan}" with refresh, pin, and settings buttons.
     fn header(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            show_runs(ui, &rows::header_runs(&self.settings.plan));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        // Buttons first (right to left), so the title wraps in what's left.
+        right_then_left(
+            ui,
+            Align::Center,
+            |ui| {
                 if ui
                     .add(egui::Button::selectable(self.show_settings, "⚙"))
                     .on_hover_text("Settings")
@@ -140,8 +154,11 @@ impl App {
                     self.poller.send(PollMsg::RefreshNow);
                     self.last_refresh = Some(Instant::now());
                 }
-            });
-        });
+            },
+            |ui| {
+                show_runs(ui, &rows::header_runs(&self.settings.plan));
+            },
+        );
     }
 
     /// Placeholder for the settings panel, shown while `show_settings`.
@@ -170,7 +187,7 @@ impl App {
             });
         }
         if let Some(err) = &self.state.error {
-            let hint = rows::shows_sha_hint(err);
+            let hint = err.stale_sha_hint;
             let message = err.message.clone();
             let mut open_settings = false;
             error_frame(ui, red, |ui| {
@@ -197,6 +214,23 @@ impl App {
             ui.add(egui::Label::new(RichText::new(persist).color(color)).wrap());
         }
     }
+}
+
+/// One row: `right` laid out first from the right edge, then `left` from the
+/// left edge in the remaining width, so wrapping text on the left never runs
+/// under the right-hand widgets.
+fn right_then_left(
+    ui: &mut Ui,
+    align: Align,
+    right: impl FnOnce(&mut Ui),
+    left: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(align), |ui| {
+            right(ui);
+            ui.with_layout(Layout::left_to_right(align), left);
+        });
+    });
 }
 
 /// A red-outlined frame across the full width.
@@ -253,16 +287,21 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &Settings) {
     ui.add_space(8.0);
 
     show_runs(ui, &rows::burners_runs(&d.burners));
-    ui.horizontal(|ui| {
-        let rate = analytics::compute_rate(&d.history, now);
-        if let Some(h) = analytics::headroom(snap, rate, now) {
-            show_runs(ui, &rows::headroom_runs(&h));
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    // "last polled" first (right), so projected use wraps in what's left.
+    right_then_left(
+        ui,
+        Align::Min,
+        |ui| {
             let dim = tone_color(Tone::Dim, ui.visuals());
             ui.colored_label(dim, rows::last_polled(snap.fetched_at, now));
-        });
-    });
+        },
+        |ui| {
+            let rate = analytics::compute_rate(&d.history, now);
+            if let Some(h) = analytics::headroom(snap, rate, now) {
+                show_runs(ui, &rows::headroom_runs(&h));
+            }
+        },
+    );
 }
 
 impl eframe::App for App {
@@ -280,6 +319,8 @@ impl eframe::App for App {
                 self.banners(ui);
                 match &self.state.data {
                     Some(d) => dashboard(ui, d, &self.settings),
+                    // While the first poll is failing, the error banner says it all.
+                    None if self.state.error.is_some() => {}
                     None => {
                         ui.add_space(40.0);
                         ui.vertical_centered(|ui| ui.weak("loading…"));
@@ -299,6 +340,7 @@ mod tests {
     use super::*;
     use crate::model::Snapshot;
     use chrono::DateTime;
+    use eframe::Storage;
 
     fn dashboard(pct: f64) -> Box<Dashboard> {
         let t = DateTime::from_timestamp(1_791_000_000, 0).unwrap();
@@ -357,6 +399,32 @@ mod tests {
             Some(20.0)
         );
         assert!(state.error.is_none());
+    }
+
+    #[derive(Default)]
+    struct FakeStorage(std::collections::HashMap<String, String>);
+
+    impl eframe::Storage for FakeStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn first_run_only_without_persisted_egui_memory() {
+        assert!(first_run(None));
+        let mut storage = FakeStorage::default();
+        storage.set_string(SETTINGS_KEY, "{}".to_owned());
+        assert!(first_run(Some(&storage)));
+        storage.set_string(EGUI_MEMORY_KEY, "{}".to_owned());
+        assert!(!first_run(Some(&storage)));
     }
 
     #[test]

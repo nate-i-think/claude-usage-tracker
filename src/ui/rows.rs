@@ -7,12 +7,11 @@ use chrono::{DateTime, Utc};
 
 use crate::analytics::{self, BurnLine, Eta, Headroom, BURN_WINDOW_MINUTES};
 use crate::model::{ExtraUsage, UsageWindow};
-use crate::poller::FetchErrorInfo;
 use crate::storage::InstanceUsage;
 
 use eframe::egui::{vec2, Align, Color32, Layout, Rect, RichText, Sense, Ui};
 
-use super::{show_runs, tone_color, Run, Tone};
+use super::{bar_track_color, show_runs, tone_color, Run, Tone};
 
 /// One window's summary row, ready to lay out.
 #[derive(Debug, Clone, PartialEq)]
@@ -178,12 +177,6 @@ pub fn last_polled(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("last polled {secs}s ago")
 }
 
-/// Whether an error should carry the "client SHA may be stale" hint: the
-/// poller flagged it, or it mentions a 403 or a permission_error.
-pub fn shows_sha_hint(err: &FetchErrorInfo) -> bool {
-    err.stale_sha_hint || err.message.contains("permission_error") || err.message.contains("403")
-}
-
 // --- Layout -------------------------------------------------------------------
 
 /// Label column: fits the longest window label ("Omelette promo").
@@ -247,7 +240,7 @@ fn paint_bar(ui: &mut Ui, width: f32, fraction: f32, fill: Color32) {
     let track = Rect::from_center_size(rect.center(), vec2(rect.width(), BAR_HEIGHT));
     let radius = BAR_HEIGHT / 2.0;
     let painter = ui.painter();
-    painter.rect_filled(track, radius, ui.visuals().extreme_bg_color);
+    painter.rect_filled(track, radius, bar_track_color(ui.visuals()));
     if fraction > 0.0 {
         let mut filled = track;
         filled.set_width((track.width() * fraction).max(BAR_HEIGHT));
@@ -498,24 +491,5 @@ mod tests {
             last_polled(NOW + Duration::seconds(3), NOW),
             "last polled 0s ago"
         );
-    }
-
-    #[test]
-    fn sha_hint_detection() {
-        let info = |message: &str, stale_sha_hint| FetchErrorInfo {
-            message: message.to_owned(),
-            stale_sha_hint,
-        };
-        assert!(shows_sha_hint(&info("anything", true)));
-        assert!(shows_sha_hint(&info(
-            "403 — auth or Cloudflare: <html>",
-            false
-        )));
-        assert!(shows_sha_hint(&info("HTTP 400: permission_error", false)));
-        assert!(!shows_sha_hint(&info(
-            "401 — session expired. Sign in to claude.ai.",
-            false
-        )));
-        assert!(!shows_sha_hint(&info("request failed: timed out", false)));
     }
 }
