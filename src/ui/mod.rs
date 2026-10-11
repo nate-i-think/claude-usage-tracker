@@ -78,10 +78,21 @@ pub fn tone_color(tone: Tone, visuals: &Visuals) -> Color32 {
         Tone::Level(level) => level_color(level, visuals),
         Tone::Accent if visuals.dark_mode => Color32::from_rgb(0x4f, 0xc8, 0xdc),
         Tone::Accent => Color32::from_rgb(0x0b, 0x72, 0x85),
-        Tone::Fable => {
+        Tone::Fable if visuals.dark_mode => {
             let [r, g, b] = FABLE_ORANGE;
             Color32::from_rgb(r, g, b)
         }
+        // #d97757 darkened to stay readable on a light panel.
+        Tone::Fable => Color32::from_rgb(0xb0, 0x4f, 0x30),
+    }
+}
+
+/// Progress-bar track color: a visible groove on either theme.
+pub fn bar_track_color(visuals: &Visuals) -> Color32 {
+    if visuals.dark_mode {
+        Color32::from_gray(58)
+    } else {
+        Color32::from_gray(212)
     }
 }
 
@@ -117,4 +128,72 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// Show the runs as a wrapping label.
 pub fn show_runs(ui: &mut Ui, runs: &[Run]) -> egui::Response {
     ui.add(egui::Label::new(layout_job(runs, ui)).wrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG relative luminance.
+    fn luminance(c: Color32) -> f64 {
+        let lin = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+
+    /// WCAG contrast ratio, >= 1.
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    const COLORED: [Tone; 7] = [
+        Tone::Level(Level::Green),
+        Tone::Level(Level::Yellow),
+        Tone::Level(Level::Orange),
+        Tone::Level(Level::Red),
+        Tone::Accent,
+        Tone::Fable,
+        Tone::Strong,
+    ];
+
+    #[test]
+    fn colored_text_readable_on_both_themes() {
+        for visuals in [Visuals::dark(), Visuals::light()] {
+            for tone in COLORED {
+                let ratio = contrast(tone_color(tone, &visuals), visuals.panel_fill);
+                assert!(
+                    ratio >= 3.0,
+                    "{tone:?} contrast {ratio:.2} (dark_mode={})",
+                    visuals.dark_mode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fable_is_brand_coral_on_dark_and_darker_on_light() {
+        let [r, g, b] = FABLE_ORANGE;
+        let coral = Color32::from_rgb(r, g, b);
+        assert_eq!(tone_color(Tone::Fable, &Visuals::dark()), coral);
+        assert!(luminance(tone_color(Tone::Fable, &Visuals::light())) < luminance(coral));
+    }
+
+    #[test]
+    fn bar_track_visible_on_both_themes() {
+        for visuals in [Visuals::dark(), Visuals::light()] {
+            let ratio = contrast(bar_track_color(&visuals), visuals.panel_fill);
+            assert!(
+                ratio >= 1.25,
+                "track contrast {ratio:.2} (dark_mode={})",
+                visuals.dark_mode
+            );
+        }
+    }
 }
