@@ -38,8 +38,12 @@ tokio = { version = "1", features = ["rt", "macros", "time", "io-std"] }
 schemars = "1"
 
 [target.'cfg(windows)'.dependencies]
-# Already in the tree (via clap); only adds the MessageBoxW binding.
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+# Already in the tree (via clap): MessageBoxW, and window placement (ui::window).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging",
+] }
+# eframe's own (0.6): the HWND of the main window for its startup placement.
+raw-window-handle = "0.6"
 
 [profile.release]
 lto = "thin"

@@ -571,12 +571,12 @@ mod tests {
         let current = Settings {
             ui_mode: UiMode::Pill,
             full_rect: Some(SavedRect {
-                x: 1.0,
-                y: 2.0,
+                pos: Pos { x: 1, y: 2 },
                 w: 400.0,
                 h: 450.0,
             }),
-            pill_pos: Some(Pos { x: 5.0, y: 6.0 }),
+            full_maximized: true,
+            pill_pos: Some(Pos { x: 5, y: 6 }),
             details_open: true,
             ..Settings::default()
         };

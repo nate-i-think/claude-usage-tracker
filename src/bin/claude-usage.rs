@@ -12,7 +12,7 @@ fn main() -> eframe::Result {
     // persistence is off (see ui::window).
     let settings = window::load_settings_early();
     let options = eframe::NativeOptions {
-        viewport: window::viewport_builder(&settings, window::screen_bounds()),
+        viewport: window::viewport_builder(&settings, window::PlaceBy::for_platform()),
         persist_window: false,
         ..Default::default()
     };
