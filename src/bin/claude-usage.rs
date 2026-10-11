@@ -13,6 +13,8 @@ fn main() -> eframe::Result {
             .with_inner_size([560.0, 620.0])
             .with_min_inner_size([360.0, 400.0])
             .with_resizable(true),
+        // Remember window size and position (the default; stated so it stays on).
+        persist_window: true,
         ..Default::default()
     };
     eframe::run_native(

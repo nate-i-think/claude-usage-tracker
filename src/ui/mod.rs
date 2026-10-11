@@ -8,6 +8,7 @@
 pub mod app;
 pub mod charts;
 pub mod rows;
+pub mod settings;
 
 pub use app::App;
 
