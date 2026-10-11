@@ -20,6 +20,7 @@ pub mod settings;
 pub mod sparkline;
 pub mod theme;
 pub mod timeline;
+pub mod tray;
 pub mod window;
 
 pub use app::App;

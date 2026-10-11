@@ -46,6 +46,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 # eframe's own (0.6): the HWND of the main window for its startup placement.
 raw-window-handle = "0.6"
+# The tray icon with the live 5-hour % (windows-sys only; no aws-lc/nasm).
+tray-icon = "=0.26.1"
 
 [profile.release]
 lto = "thin"
