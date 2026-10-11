@@ -16,7 +16,7 @@ pub const CLIENT_SHA_ENV: &str = "CLAUDE_USAGE_TUI_CLIENT_SHA";
 pub const CLIENT_SHA_FILE: &str = "client_sha.txt";
 
 /// Shortest string accepted as a client SHA from settings or file.
-const MIN_CLIENT_SHA_LEN: usize = 8;
+pub const MIN_CLIENT_SHA_LEN: usize = 8;
 
 /// Persisted user settings. Missing fields take their [`Default`] values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,12 +65,30 @@ pub fn parse_interval(s: &str) -> Result<u64> {
         .with_context(|| format!("interval {s:?} is too large"))
 }
 
+/// Where the effective client SHA came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientShaSource {
+    /// The [`CLIENT_SHA_ENV`] environment variable.
+    Env,
+    /// The value saved in [`Settings::client_sha`].
+    Settings,
+    /// A `client_sha.txt` file at this path.
+    File(PathBuf),
+}
+
 /// Resolve the anthropic-client-sha header value.
 ///
 /// Order: env `CLAUDE_USAGE_TUI_CLIENT_SHA` (non-empty) > `settings_value`
 /// (trimmed, at least 8 chars) > `client_sha.txt` next to the executable >
 /// `client_sha.txt` in the current directory > error.
 pub fn resolve_client_sha(settings_value: Option<&str>) -> Result<String> {
+    resolve_client_sha_with_source(settings_value).map(|(sha, _)| sha)
+}
+
+/// [`resolve_client_sha`], also reporting which source won.
+pub fn resolve_client_sha_with_source(
+    settings_value: Option<&str>,
+) -> Result<(String, ClientShaSource)> {
     let env = std::env::var(CLIENT_SHA_ENV).ok();
     let mut candidates = Vec::new();
     if let Some(dir) = std::env::current_exe()
@@ -94,20 +112,20 @@ fn resolve_client_sha_from(
     env_value: Option<&str>,
     settings_value: Option<&str>,
     candidates: &[PathBuf],
-) -> Result<String> {
+) -> Result<(String, ClientShaSource)> {
     if let Some(v) = env_value.map(str::trim).filter(|v| !v.is_empty()) {
-        return Ok(v.to_owned());
+        return Ok((v.to_owned(), ClientShaSource::Env));
     }
     let valid = |v: &str| {
         let v = v.trim();
         (v.len() >= MIN_CLIENT_SHA_LEN).then(|| v.to_owned())
     };
     if let Some(v) = settings_value.and_then(valid) {
-        return Ok(v);
+        return Ok((v, ClientShaSource::Settings));
     }
     for path in candidates {
         if let Some(v) = fs::read_to_string(path).ok().as_deref().and_then(valid) {
-            return Ok(v);
+            return Ok((v, ClientShaSource::File(path.clone())));
         }
     }
     let tried = if candidates.is_empty() {
@@ -212,13 +230,14 @@ mod tests {
     fn client_sha_env_wins() {
         let tmp = tempfile::tempdir().unwrap();
         let file = sha_file(tmp.path(), "filesha1234");
-        let got = resolve_client_sha_from(Some("envsha"), Some("settingssha"), &[file]).unwrap();
+        let (got, _) =
+            resolve_client_sha_from(Some("envsha"), Some("settingssha"), &[file]).unwrap();
         assert_eq!(got, "envsha");
     }
 
     #[test]
     fn client_sha_empty_env_falls_through_to_settings() {
-        let got = resolve_client_sha_from(Some(""), Some("  settingssha  "), &[]).unwrap();
+        let (got, _) = resolve_client_sha_from(Some(""), Some("  settingssha  "), &[]).unwrap();
         assert_eq!(got, "settingssha");
     }
 
@@ -226,7 +245,7 @@ mod tests {
     fn client_sha_short_settings_falls_through_to_file() {
         let tmp = tempfile::tempdir().unwrap();
         let file = sha_file(tmp.path(), "  filesha1234\n");
-        let got = resolve_client_sha_from(None, Some("short"), &[file]).unwrap();
+        let (got, _) = resolve_client_sha_from(None, Some("short"), &[file]).unwrap();
         assert_eq!(got, "filesha1234");
     }
 
@@ -237,13 +256,27 @@ mod tests {
         let missing = exe_dir.path().join("nope").join(CLIENT_SHA_FILE);
         let short = sha_file(exe_dir.path(), "tiny");
         let good = sha_file(cwd.path(), "cwdsha12345");
-        let got =
+        let (got, _) =
             resolve_client_sha_from(None, None, &[missing, short.clone(), good.clone()]).unwrap();
         assert_eq!(got, "cwdsha12345");
 
         fs::write(&short, "exesha12345").unwrap();
-        let got = resolve_client_sha_from(None, None, &[short, good]).unwrap();
+        let (got, _) = resolve_client_sha_from(None, None, &[short, good]).unwrap();
         assert_eq!(got, "exesha12345");
+    }
+
+    #[test]
+    fn client_sha_source_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = sha_file(tmp.path(), "filesha1234");
+        let files = [file.clone()];
+        let src = |env, set| resolve_client_sha_from(env, set, &files).unwrap().1;
+        assert_eq!(
+            src(Some("envsha"), Some("settingssha")),
+            ClientShaSource::Env
+        );
+        assert_eq!(src(None, Some("settingssha")), ClientShaSource::Settings);
+        assert_eq!(src(None, Some("short")), ClientShaSource::File(file));
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use eframe::egui::{
-    self, Align, CentralPanel, Color32, Frame, Layout, RichText, ScrollArea, Ui, ViewportCommand,
-    WindowLevel,
+    self, style::ScrollStyle, Align, CentralPanel, Color32, Frame, Layout, RichText, ScrollArea,
+    Ui, ViewportCommand,
 };
 
 use crate::analytics::{self, Level};
@@ -17,6 +17,7 @@ use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 
 use super::charts;
 use super::rows::{self, BurnTag};
+use super::settings::{self, PanelAction, SettingsPanel};
 use super::{install_fonts, level_color, show_runs, tone_color, Tone};
 
 /// eframe storage key for [`Settings`].
@@ -70,8 +71,8 @@ pub struct App {
     poller: Poller,
     settings: Settings,
     state: PollState,
-    /// The settings panel is open.
-    show_settings: bool,
+    /// The settings panel, while open.
+    settings_panel: Option<SettingsPanel>,
     last_refresh: Option<Instant>,
 }
 
@@ -88,7 +89,7 @@ impl App {
         }
         install_fonts(&ctx);
         if settings.always_on_top {
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(settings::window_level(true)));
         }
         let notify_ctx = ctx.clone();
         let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
@@ -98,7 +99,7 @@ impl App {
             poller,
             settings,
             state: PollState::default(),
-            show_settings: false,
+            settings_panel: None,
             last_refresh: None,
         }
     }
@@ -111,17 +112,18 @@ impl App {
 
     /// "claude.ai usage · {plan}" with refresh, pin, and settings buttons.
     fn header(&mut self, ui: &mut Ui) {
+        let title = rows::header_runs(&self.settings.plan);
         // Buttons first (right to left), so the title wraps in what's left.
         right_then_left(
             ui,
             Align::Center,
             |ui| {
                 if ui
-                    .add(egui::Button::selectable(self.show_settings, "⚙"))
+                    .add(egui::Button::selectable(self.settings_panel.is_some(), "⚙"))
                     .on_hover_text("Settings")
                     .clicked()
                 {
-                    self.show_settings = !self.show_settings;
+                    self.toggle_settings();
                 }
 
                 let pinned = self.settings.always_on_top;
@@ -135,14 +137,7 @@ impl App {
                     .on_hover_text(pin_tip)
                     .clicked()
                 {
-                    self.settings.always_on_top = !pinned;
-                    let level = if self.settings.always_on_top {
-                        WindowLevel::AlwaysOnTop
-                    } else {
-                        WindowLevel::Normal
-                    };
-                    ui.ctx()
-                        .send_viewport_cmd(ViewportCommand::WindowLevel(level));
+                    settings::set_always_on_top(ui.ctx(), &mut self.settings, !pinned);
                 }
 
                 let ready = refresh_ready(self.last_refresh, Instant::now());
@@ -157,26 +152,41 @@ impl App {
                 }
             },
             |ui| {
-                show_runs(ui, &rows::header_runs(&self.settings.plan));
+                show_runs(ui, &title);
             },
         );
     }
 
-    /// Placeholder for the settings panel, shown while `show_settings`.
-    fn settings_panel(&mut self, ui: &mut Ui) {
-        Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.strong("Settings");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        self.show_settings = false;
-                    }
-                });
-            });
-            ui.weak("The settings panel is not built yet.");
-        });
-        ui.add_space(4.0);
+    /// Open the settings panel with a fresh draft, or close it (discarding
+    /// the draft).
+    fn toggle_settings(&mut self) {
+        self.settings_panel = match self.settings_panel {
+            Some(_) => None,
+            None => Some(SettingsPanel::new(&self.settings)),
+        };
+    }
+
+    /// The settings panel, if open; Apply commits, saves, and tells the
+    /// poller.
+    fn settings_panel(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        let Some(panel) = self.settings_panel.as_mut() else {
+            return;
+        };
+        match panel.show(ui, &mut self.settings) {
+            PanelAction::None => {}
+            PanelAction::Cancel => self.settings_panel = None,
+            PanelAction::Apply(new) => {
+                if let Some(msg) = settings::poller_update(&self.settings, &new) {
+                    self.poller.send(msg);
+                }
+                self.settings = new;
+                self.settings_panel = None;
+                if let Some(storage) = frame.storage_mut() {
+                    eframe::set_value(storage, SETTINGS_KEY, &self.settings);
+                    storage.flush();
+                }
+            }
+        }
     }
 
     /// Poller-stopped, fetch-error, and persist-error notices.
@@ -201,8 +211,8 @@ impl App {
                     });
                 }
             });
-            if open_settings {
-                self.show_settings = true;
+            if open_settings && self.settings_panel.is_none() {
+                self.toggle_settings();
             }
         }
         if let Some(persist) = self
@@ -307,17 +317,18 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &Settings) {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         self.drain_events();
         ui.ctx().request_repaint_after(TICK);
 
         CentralPanel::default().show(ui, |ui| {
+            // A solid scrollbar takes its own space instead of overlaying
+            // content at narrow widths.
+            ui.spacing_mut().scroll = ScrollStyle::solid();
             ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 self.header(ui);
                 ui.separator();
-                if self.show_settings {
-                    self.settings_panel(ui);
-                }
+                self.settings_panel(ui, frame);
                 self.banners(ui);
                 match &self.state.data {
                     Some(d) => dashboard(ui, d, &self.settings),
