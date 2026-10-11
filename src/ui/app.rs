@@ -65,8 +65,7 @@ pub fn refresh_ready(last_click: Option<Instant>, now: Instant) -> bool {
 /// What one logic pass must do with the settings.
 #[derive(Debug)]
 pub struct SettingsSync {
-    /// Tell the poller (it has `sent`, the settings now differ in what it
-    /// uses).
+    /// Tell the poller: what it uses differs from what it was last sent.
     pub poller: Option<PollMsg>,
     /// Write the settings to storage now (they differ from what was last
     /// persisted).
@@ -233,8 +232,8 @@ impl App {
         };
     }
 
-    /// The settings panel, if open; Apply commits, saves, and tells the
-    /// poller.
+    /// The settings panel, if open; Apply commits to the live settings, and
+    /// `logic()` saves them and tells the poller.
     fn settings_panel(&mut self, ui: &mut Ui) {
         let Some(panel) = self.settings_panel.as_mut() else {
             return;
