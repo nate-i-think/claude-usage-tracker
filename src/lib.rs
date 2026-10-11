@@ -1,5 +1,6 @@
 //! Claude usage monitor: library core shared by the GUI and CLI binaries.
 
+pub mod analytics;
 pub mod config;
 pub mod cookies;
 pub mod model;
