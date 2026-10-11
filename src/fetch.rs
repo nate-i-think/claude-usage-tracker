@@ -49,6 +49,12 @@ pub enum FetchError {
     Status { status: u16, body: String },
     #[error("invalid JSON from usage endpoint: {0}")]
     Json(String),
+    /// A 2xx response whose body is an HTML page (Cloudflare interstitial).
+    #[error(
+        "got an HTML page instead of JSON — likely a Cloudflare challenge; \
+         open claude.ai/settings/usage in your browser and retry"
+    )]
+    Html,
 }
 
 impl FetchError {
@@ -228,8 +234,14 @@ impl Client {
 /// Status check then JSON parse into a [`Snapshot`] stamped now.
 pub fn parse_response(status: u16, body: &str) -> Result<Snapshot, FetchError> {
     check_status(status, body)?;
-    let data: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| FetchError::Json(e.to_string()))?;
+    let data: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        // Sniffed like `debug`: a 200 HTML page is a Cloudflare interstitial.
+        if body.trim_start().starts_with('<') {
+            FetchError::Html
+        } else {
+            FetchError::Json(e.to_string())
+        }
+    })?;
     Ok(model::parse_usage(&data, Utc::now()))
 }
 
@@ -361,6 +373,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_html_body_is_a_cloudflare_hint() {
+        for body in ["<!DOCTYPE html><html>Just a moment...", "\n  <html>"] {
+            let e = parse_response(200, body).unwrap_err();
+            assert!(matches!(e, FetchError::Html), "{e:?}");
+            assert_eq!(
+                e.to_string(),
+                "got an HTML page instead of JSON — likely a Cloudflare challenge; \
+                 open claude.ai/settings/usage in your browser and retry"
+            );
+        }
+    }
+
+    #[test]
     fn parse_response_ok_and_bad_json() {
         let snap = parse_response(
             200,
@@ -369,7 +394,7 @@ mod tests {
         .unwrap();
         assert_eq!(snap.five_hour_pct(), Some(12.5));
 
-        let e = parse_response(200, "<html>").unwrap_err();
+        let e = parse_response(200, "not json").unwrap_err();
         assert!(matches!(e, FetchError::Json(_)));
         assert!(e
             .to_string()
