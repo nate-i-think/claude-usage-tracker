@@ -42,15 +42,25 @@ pub fn footer_items(has_daily: bool, extra_visible: bool) -> Vec<FooterItem> {
     .collect()
 }
 
-/// The 5-hour burn in brief: "+0.21%/min · cap in 5h 28m" (rate and ETA in
-/// their level colors), "steady", or "need 2 samples".
+/// The 5-hour burn in brief: "+0.21%/min · cap in 1h 48m" (rate and ETA in
+/// their level colors) when the cap comes before the reset, "+0.34%/min ·
+/// safe till reset" when the reset comes first, "steady", or "need 2
+/// samples".
 pub fn burn_summary(line: Option<&BurnLine>) -> Vec<Run> {
     let Some(line) = line else {
         return vec![Run::new("need 2 samples", Tone::Dim)];
     };
     match line.eta {
         Eta::Steady => vec![Run::new("steady", Tone::Level(Level::Green))],
-        Eta::Minutes { minutes, level } => vec![
+        Eta::Minutes {
+            lands_after_reset: true,
+            ..
+        } => vec![
+            Run::new(analytics::fmt_rate(line.rate), Tone::Level(line.rate_level)),
+            Run::new(" · ", Tone::Dim),
+            Run::new("safe till reset", Tone::Level(Level::Green)),
+        ],
+        Eta::Minutes { minutes, level, .. } => vec![
             Run::new(analytics::fmt_rate(line.rate), Tone::Level(line.rate_level)),
             Run::new(" · cap in ", Tone::Dim),
             Run::new(analytics::fmt_min(minutes), Tone::Level(level)),
@@ -94,7 +104,7 @@ pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
         snap.five_hour_resets_at(),
         now,
     );
-    let burn_job = layout_job(&burn_summary(burn.as_ref()), ui);
+    let mut burn_job = layout_job(&burn_summary(burn.as_ref()), ui);
     let small = eframe::egui::TextStyle::Small.resolve(ui.style());
     let painter = ui.painter().clone();
     let caption =
@@ -103,31 +113,34 @@ pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
 
     // Measure every item first so the strip can pack them.
     let spark_caption = caption("7d");
-    let burn_galley = painter.layout_job(burn_job);
     let extra_caption = caption("extra");
     let gauge_text = gauge.as_ref().map(|g| {
         let body = eframe::egui::TextStyle::Body.resolve(ui.style());
         digits::number_galley(&painter, &g.text, body, palette.level(g.level))
     });
-    let row_h = burn_galley.size().y.max(sparkline::HEIGHT);
-    let widths: Vec<f32> = items
-        .iter()
-        .map(|item| match item {
-            FooterItem::Sparkline => {
-                spark_caption.size().x + CAPTION_GAP + sparkline::width(bars.len())
-            }
-            FooterItem::Burn => burn_galley.size().x,
-            FooterItem::Extra => {
-                let text_w = gauge_text.as_ref().map_or(0.0, |(_, w)| *w);
-                extra_caption.size().x + CAPTION_GAP + text_w + CAPTION_GAP + GAUGE_W
-            }
-        })
-        .collect();
 
     super::theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());
+        let available = ui.available_width();
+        // The burn summary wraps rather than run past a narrow row.
+        burn_job.wrap.max_width = available;
+        let burn_galley = painter.layout_job(burn_job);
+        let row_h = burn_galley.size().y.max(sparkline::HEIGHT);
+        let widths: Vec<f32> = items
+            .iter()
+            .map(|item| match item {
+                FooterItem::Sparkline => {
+                    spark_caption.size().x + CAPTION_GAP + sparkline::width(bars.len())
+                }
+                FooterItem::Burn => burn_galley.size().x,
+                FooterItem::Extra => {
+                    let text_w = gauge_text.as_ref().map_or(0.0, |(_, w)| *w);
+                    extra_caption.size().x + CAPTION_GAP + text_w + CAPTION_GAP + GAUGE_W
+                }
+            })
+            .collect();
         let gap = 1.5 * GAP;
-        let rows = layout::pack_rows(&widths, ui.available_width(), gap);
+        let rows = layout::pack_rows(&widths, available, gap);
         let mut it = items.iter().zip(&widths);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing = vec2(gap, GAP);
@@ -241,19 +254,37 @@ mod tests {
     }
 
     #[test]
-    fn burn_summary_with_eta() {
+    fn burn_summary_cap_before_reset() {
         let l = line(
             0.214,
             Level::Orange,
             Eta::Minutes {
-                minutes: 328.9,
-                level: Level::Green,
+                minutes: 108.9,
+                level: Level::Yellow,
+                lands_after_reset: false,
             },
         );
         let runs = burn_summary(Some(&l));
-        assert_eq!(plain_text(&runs), "+0.21%/min · cap in 5h 28m");
+        assert_eq!(plain_text(&runs), "+0.21%/min · cap in 1h 48m");
         assert!(runs.contains(&Run::new("+0.21%/min", Tone::Level(Level::Orange))));
-        assert!(runs.contains(&Run::new("5h 28m", Tone::Level(Level::Green))));
+        assert!(runs.contains(&Run::new("1h 48m", Tone::Level(Level::Yellow))));
+    }
+
+    #[test]
+    fn burn_summary_safe_when_the_cap_lands_after_reset() {
+        let l = line(
+            0.34,
+            Level::Orange,
+            Eta::Minutes {
+                minutes: 328.9,
+                level: Level::Green,
+                lands_after_reset: true,
+            },
+        );
+        let runs = burn_summary(Some(&l));
+        assert_eq!(plain_text(&runs), "+0.34%/min · safe till reset");
+        assert!(runs.contains(&Run::new("safe till reset", Tone::Level(Level::Green))));
+        assert!(!plain_text(&runs).contains("cap"));
     }
 
     #[test]
