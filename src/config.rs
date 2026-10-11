@@ -36,9 +36,12 @@ pub struct Settings {
     pub client_sha: Option<String>,
     /// The window mode to open in.
     pub ui_mode: UiMode,
-    /// Last full-mode window rect (outer position, inner size), in points.
+    /// Last normal (not maximized) full-mode window rect. Units: see
+    /// `ui::window`.
     pub full_rect: Option<SavedRect>,
-    /// Last pill-mode window position (outer), in points.
+    /// The full-mode window was maximized.
+    pub full_maximized: bool,
+    /// Last pill-mode window position (outer).
     pub pill_pos: Option<Pos>,
     /// Show the tray icon.
     pub tray_enabled: bool,
@@ -71,6 +74,7 @@ impl Default for Settings {
             client_sha: None,
             ui_mode: UiMode::Full,
             full_rect: None,
+            full_maximized: false,
             pill_pos: None,
             tray_enabled: true,
             close_to_tray: true,
@@ -99,19 +103,19 @@ pub enum UiMode {
     Pill,
 }
 
-/// A window position in points.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// A window's outer top-left corner in physical desktop pixels (see
+/// `ui::window` for why pixels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pos {
-    pub x: f32,
-    pub y: f32,
+    pub x: i32,
+    pub y: i32,
 }
 
-/// A window rect in points: outer position plus inner (client) size, the
-/// two things a viewport builder takes.
+/// A saved window: outer position in physical pixels, inner (client) size
+/// in egui points (see `ui::window`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SavedRect {
-    pub x: f32,
-    pub y: f32,
+    pub pos: Pos,
     pub w: f32,
     pub h: f32,
 }
@@ -230,6 +234,7 @@ mod tests {
         assert_eq!(s.client_sha, None);
         assert_eq!(s.ui_mode, UiMode::Full);
         assert_eq!(s.full_rect, None);
+        assert!(!s.full_maximized);
         assert_eq!(s.pill_pos, None);
         assert!(s.tray_enabled && s.close_to_tray && s.closes_to_tray());
         assert!(!s.start_in_pill);
@@ -272,12 +277,12 @@ mod tests {
         let s = Settings {
             ui_mode: UiMode::Pill,
             full_rect: Some(SavedRect {
-                x: -1200.5,
-                y: 40.0,
+                pos: Pos { x: -1200, y: 40 },
                 w: 430.0,
                 h: 470.25,
             }),
-            pill_pos: Some(Pos { x: 10.0, y: 20.0 }),
+            full_maximized: true,
+            pill_pos: Some(Pos { x: 10, y: 20 }),
             tray_enabled: false,
             start_in_pill: true,
             alerts: AlertToggles {

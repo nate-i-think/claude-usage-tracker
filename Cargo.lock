@@ -775,6 +775,7 @@ dependencies = [
  "clap",
  "eframe",
  "glob",
+ "raw-window-handle",
  "reqwest",
  "rmcp",
  "ron",

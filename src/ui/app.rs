@@ -14,7 +14,7 @@ use eframe::egui::{
 };
 
 use crate::analytics::{self, Level};
-use crate::config::{SavedRect, Settings, UiMode};
+use crate::config::{Settings, UiMode};
 use crate::model::UsageWindow;
 use crate::paths::Paths;
 use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
@@ -22,7 +22,7 @@ use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 use super::charts;
 use super::rows::{self, BurnTag};
 use super::settings::{self, PanelAction, SettingsPanel};
-use super::window::{self, SETTINGS_KEY};
+use super::window::{self, TrackedWindow, SETTINGS_KEY};
 use super::{level_color, show_runs, theme, tone_color, Tone};
 
 /// Key eframe stores egui's memory (including the theme preference) under
@@ -96,9 +96,9 @@ pub struct App {
     poller_settings: Settings,
     /// The settings last written to storage.
     persisted: Settings,
-    /// The full-mode window rect as of the last pass that had one; saved
-    /// into [`Settings::full_rect`] by `save()`.
-    last_full_rect: Option<SavedRect>,
+    /// The full-mode window as of the last pass that showed it; saved into
+    /// [`Settings::full_rect`] / [`Settings::full_maximized`] by `save()`.
+    tracked: TrackedWindow,
     state: PollState,
     /// The settings panel, while open.
     settings_panel: Option<SettingsPanel>,
@@ -117,8 +117,11 @@ impl App {
             ctx.set_theme(egui::ThemePreference::Dark);
         }
         theme::install(&ctx);
-        // The window level, size and position come from the viewport
-        // builder (window::viewport_builder), built from these settings.
+        // Window level and size come from the viewport builder
+        // (window::viewport_builder); on Windows the saved position and
+        // maximized state are applied here, while the window is hidden.
+        #[cfg(windows)]
+        window::apply_placement(cc, window::startup_placement(&settings));
         let notify_ctx = ctx.clone();
         let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
             notify_ctx.request_repaint()
@@ -128,7 +131,7 @@ impl App {
             poller_settings: settings.clone(),
             persisted: settings.clone(),
             settings,
-            last_full_rect: None,
+            tracked: TrackedWindow::default(),
             state: PollState::default(),
             settings_panel: None,
             last_refresh: None,
@@ -146,9 +149,8 @@ impl App {
     fn track_window(&mut self, ctx: &egui::Context) {
         match self.settings.ui_mode {
             UiMode::Full => {
-                if let Some(rect) = ctx.input(|i| window::full_rect_of(i.viewport())) {
-                    self.last_full_rect = Some(rect);
-                }
+                let zoom = ctx.zoom_factor();
+                ctx.input(|i| self.tracked.observe(i.viewport(), zoom));
             }
             // Task 8 tracks the pill position here.
             UiMode::Pill => {}
@@ -417,9 +419,8 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if self.settings.ui_mode == UiMode::Full && self.last_full_rect.is_some() {
-            self.settings.full_rect = self.last_full_rect;
-        }
+        (self.settings.full_rect, self.settings.full_maximized) =
+            window::full_state_to_save(self.settings.ui_mode, &self.tracked, &self.settings);
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
         self.persisted = self.settings.clone();
     }
@@ -552,9 +553,8 @@ mod tests {
 
         // save() wrote a new rect: persisted matches, the poller ignores it.
         let moved = Settings {
-            full_rect: Some(SavedRect {
-                x: 5.0,
-                y: 6.0,
+            full_rect: Some(crate::config::SavedRect {
+                pos: crate::config::Pos { x: 5, y: 6 },
                 w: 420.0,
                 h: 460.0,
             }),
