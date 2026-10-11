@@ -95,11 +95,11 @@ fn user_data_root() -> PathBuf {
     home_dir().join(".local").join("share")
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::home_dir().unwrap_or_default()
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
