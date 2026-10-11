@@ -36,6 +36,8 @@ ron = "0.12"
 rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "io-std"] }
 schemars = "1"
+# eframe's own (via image): encodes the app icon the toasts show.
+png = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 # Already in the tree (via clap): MessageBoxW, window placement and the pill's
@@ -43,11 +45,16 @@ schemars = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
+    # The toasts' app id (notify): the HKCU AppUserModelId key and the
+    # process tag. Security: RegCreateKeyExW's SECURITY_ATTRIBUTES.
+    "Win32_UI_Shell", "Win32_System_Registry", "Win32_Security",
 ] }
 # eframe's own (0.6): the HWND of the main window for its startup placement.
 raw-window-handle = "0.6"
 # The tray icon with the live 5-hour % (windows-sys only; no aws-lc/nasm).
 tray-icon = "=0.26.1"
+# Threshold alert toasts (windows 0.62, already in the tree; no aws-lc).
+tauri-winrt-notification = "=0.8.1"
 
 [profile.release]
 lto = "thin"

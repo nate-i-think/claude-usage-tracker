@@ -3,10 +3,12 @@
 //!
 //! Work that must go on while the window is hidden (draining poll events,
 //! telling the poller about settings changes, persisting settings, the 1 s
-//! tick, tracking the window rect, the tray icon) runs in [`eframe::App::logic`], which
-//! eframe calls every pass, even when it skips the UI. `ui()` only draws.
+//! tick, tracking the window rect, the tray icon, threshold alerts) runs in
+//! [`eframe::App::logic`], which eframe calls every pass, even when it skips
+//! the UI. `ui()` only draws.
 
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{Local, Utc};
@@ -19,9 +21,11 @@ use crate::crash;
 use crate::paths::Paths;
 use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 
+use super::alerts::AlertHook;
 use super::banners::{banner, BannerKind};
 use super::layout::{self, right_then_left, GAP};
 use super::mode::{self, Settle, SettleStep};
+use super::notify::{self, AppId};
 use super::pill::{self, PillAction, PillState};
 use super::settings::{self, PanelAction, SettingsPanel};
 use super::tray::{self, CloseDecision, IconFace, Tray, TrayAction};
@@ -131,10 +135,16 @@ pub struct App {
     hidden: bool,
     /// Quit was chosen: the close that follows is not turned into a hide.
     quitting: bool,
+    /// Threshold alerts, checked once per poll and sent to the notifier
+    /// thread.
+    alerts: AlertHook,
+    /// A toast was clicked: bring the window forward.
+    toast_clicks: Receiver<()>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// `toast_app` is the identity [`notify::register`] got in `main`.
+    pub fn new(cc: &eframe::CreationContext<'_>, toast_app: AppId) -> Self {
         let mut settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
@@ -163,6 +173,15 @@ impl App {
         let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
             notify_ctx.request_repaint()
         });
+        let (click_tx, toast_clicks) = channel();
+        let click_ctx = ctx.clone();
+        let toasts = notify::spawn_notifier(
+            toast_app,
+            Arc::new(move || {
+                let _ = click_tx.send(());
+                click_ctx.request_repaint();
+            }),
+        );
         let mut app = Self {
             poller,
             poller_settings: settings.clone(),
@@ -183,6 +202,8 @@ impl App {
             tray_failed: false,
             hidden: false,
             quitting: false,
+            alerts: AlertHook::new(toasts),
+            toast_clicks,
         };
         app.sync_tray_presence();
         app
@@ -279,9 +300,17 @@ impl App {
         }
     }
 
-    /// Runs every pass after the poll results are in, visible or not:
-    /// threshold alerts (Task 10) hook in here.
-    fn background_hooks(&mut self, _now: Instant) {}
+    /// Runs every pass after the poll results are in, visible or not, and
+    /// before the settings sync (which persists the alerts' edge state):
+    /// threshold alerts for a new poll, and a clicked toast showing the
+    /// window.
+    fn background_hooks(&mut self, ctx: &egui::Context) {
+        self.alerts
+            .after_poll(self.state.data.as_deref(), &mut self.settings, Utc::now());
+        if self.toast_clicks.try_iter().count() > 0 {
+            self.show(ctx);
+        }
+    }
 
     /// Hide to the tray. Minimizing as well as hiding is what makes eframe
     /// skip `ui()` (it only checks the minimized state); `logic()` goes on.
@@ -484,6 +513,7 @@ impl App {
         match panel.show(ui, &mut self.settings) {
             PanelAction::None => {}
             PanelAction::Cancel => self.settings_panel = None,
+            PanelAction::TestNotification => self.alerts.send_test(),
             PanelAction::Apply(new) => {
                 // logic() tells the poller and persists on the next pass.
                 self.settings = new;
@@ -620,13 +650,12 @@ fn content_column(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let now = Instant::now();
         self.track_window(ctx, frame);
         self.handle_close_request(ctx);
         self.drain_events();
         self.sync_tray(ctx);
+        self.background_hooks(ctx);
         self.sync_settings(frame);
-        self.background_hooks(now);
         // Keeps "last polled" and the countdowns ticking; eframe throttles
         // it while the window is hidden.
         ctx.request_repaint_after(TICK);

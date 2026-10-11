@@ -159,6 +159,7 @@ const DIGITS: [[u8; 5]; 10] = [
 ];
 const BANG: [u8; 5] = [0b010, 0b010, 0b010, 0b000, 0b010];
 const DASH: [u8; 5] = [0b000, 0b000, 0b111, 0b000, 0b000];
+const PERCENT: [u8; 5] = [0b101, 0b001, 0b010, 0b100, 0b101];
 
 fn glyphs(label: IconLabel) -> Vec<[u8; 5]> {
     match label {
@@ -174,7 +175,17 @@ fn glyphs(label: IconLabel) -> Vec<[u8; 5]> {
 /// anti-aliased.
 pub fn render_icon_rgba(size: u32, face: IconFace) -> Vec<u8> {
     let bg = icon_background(face.level);
-    let fg = digit_color(bg);
+    render_badge_rgba(size, bg, digit_color(bg), &glyphs(face.label))
+}
+
+/// The app's own icon (the toast's app icon): Claude coral with a "%".
+pub fn render_app_icon_rgba(size: u32) -> Vec<u8> {
+    let bg = theme::DARK.accent;
+    render_badge_rgba(size, bg, digit_color(bg), &[PERCENT])
+}
+
+/// A rounded square in `bg` with `glyphs` centered on it in `fg`.
+fn render_badge_rgba(size: u32, bg: Color32, fg: Color32, glyphs: &[[u8; 5]]) -> Vec<u8> {
     let mut px = vec![0u8; (size * size * 4) as usize];
     // Rounded square, 4x4 supersampled coverage.
     let s = size as f32;
@@ -202,7 +213,6 @@ pub fn render_icon_rgba(size: u32, face: IconFace) -> Vec<u8> {
     }
     // Glyphs: 3k wide, k apart, centered.
     let k = (size / 8).max(1);
-    let glyphs = glyphs(face.label);
     let n = glyphs.len() as u32;
     let width = n * GLYPH_W * k + (n - 1) * k;
     let (x0, y0) = (
@@ -534,6 +544,33 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn app_icon_is_a_coral_square_with_a_percent_sign() {
+        let size = 256;
+        let px = render_app_icon_rgba(size);
+        assert_eq!(px.len(), (size * size * 4) as usize);
+        let at = |x: u32, y: u32| {
+            let i = ((y * size + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let bg = theme::DARK.accent;
+        assert_eq!(at(0, 0)[3], 0, "rounded corner is transparent");
+        assert_eq!(at(size / 2, 4), [bg.r(), bg.g(), bg.b(), 255]);
+        // The "%" glyph: k = 32 px blocks, 3x5 cells centered.
+        let fg = digit_color(bg);
+        let (x0, y0, k) = ((size - 3 * 32) / 2, (size - 5 * 32) / 2, 32);
+        let cell = |col: u32, row: u32| at(x0 + col * k + k / 2, y0 + row * k + k / 2);
+        let ink = [fg.r(), fg.g(), fg.b(), 255];
+        let rows: Vec<String> = (0..5)
+            .map(|r| {
+                (0..3)
+                    .map(|c| if cell(c, r) == ink { '#' } else { '.' })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rows, ["#.#", "..#", ".#.", "#..", "#.#"]);
     }
 
     #[test]
