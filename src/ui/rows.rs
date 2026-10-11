@@ -125,8 +125,6 @@ pub fn extra_runs(e: &ExtraUsage) -> Vec<Run> {
 
 /// How many burners the dashboard lists.
 const TOP_BURNERS: usize = 5;
-/// Burner names are cut to this many characters.
-const BURNER_NAME_CHARS: usize = 20;
 
 /// "Top burners (5h):  {name} {k}k  ·  …" for the top five (already sorted
 /// by tokens, highest first), or a dim "no local activity yet".
@@ -140,8 +138,8 @@ pub fn burners_runs(burners: &[InstanceUsage]) -> Vec<Run> {
         if i > 0 {
             runs.push(Run::new("  ·  ", Tone::Normal));
         }
-        let name: String = b.name.chars().take(BURNER_NAME_CHARS).collect();
-        runs.push(Run::new(format!("{name} "), Tone::Normal));
+        // Already short: storage bounds display names.
+        runs.push(Run::new(format!("{} ", b.display_name), Tone::Normal));
         runs.push(Run::new(
             format!("{:.0}k", b.tokens as f64 / 1000.0),
             Tone::Strong,
@@ -285,6 +283,7 @@ mod tests {
     fn burner(name: &str, tokens: u64) -> InstanceUsage {
         InstanceUsage {
             name: name.to_owned(),
+            display_name: name.to_owned(),
             source: "claude-code",
             tokens,
             last_active: NOW,
@@ -427,11 +426,11 @@ mod tests {
     #[test]
     fn burners_top_five_truncated() {
         let burners: Vec<InstanceUsage> = [
-            ("C--Users-someone-very-long-project-name", 123_456),
+            ("…ne-very-long-project", 123_456),
             ("b", 98_500),
             ("c", 1_400),
             ("d", 999),
-            ("é-unicode-name-long-enough-to-cut", 50_000),
+            ("é-unicode", 50_000),
             ("f", 10),
         ]
         .into_iter()
@@ -440,8 +439,8 @@ mod tests {
         let runs = burners_runs(&burners);
         assert_eq!(
             plain_text(&runs),
-            "Top burners (5h):  C--Users-someone-ver 123k  ·  b 98k  ·  c 1k  ·  d 1k  ·  \
-             é-unicode-name-long- 50k"
+            "Top burners (5h):  …ne-very-long-project 123k  ·  b 98k  ·  c 1k  ·  d 1k  ·  \
+             é-unicode 50k"
         );
         assert!(runs.contains(&Run::new("123k", Tone::Strong)));
     }

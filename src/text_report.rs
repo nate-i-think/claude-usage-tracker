@@ -185,6 +185,7 @@ Projected use: 0%  ·  idle, safe to spin up agents
         });
         d.burners = vec![InstanceUsage {
             name: "proj".into(),
+            display_name: "proj".into(),
             source: "claude-code",
             tokens: 12_345,
             last_active: now(),

@@ -19,7 +19,10 @@ pub mod alerts;
 mod names;
 mod timeline;
 
-pub use names::{encode_project_path, prettify_project, prettify_project_in, PROJECT_NAME_CHARS};
+pub use names::{
+    encode_project_path, last_path_component, prettify_project, prettify_project_in,
+    project_display_name, PROJECT_NAME_CHARS,
+};
 
 pub use timeline::{fable_layer, pace, projection, seven_day_pace, Projection, WindowSample};
 

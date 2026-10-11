@@ -806,15 +806,7 @@ mod tests {
                 ts(earlier)
             ),
         ];
-        fs::write(
-            paths.history_file(),
-            lines.join(
-                "
-",
-            ) + "
-",
-        )
-        .unwrap();
+        fs::write(paths.history_file(), lines.join("\n") + "\n").unwrap();
 
         let mut source = FakeSource::new(vec![Ok(42.0)]);
         let before = storage::history_reads();
