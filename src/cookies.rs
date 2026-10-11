@@ -1,8 +1,9 @@
 //! Firefox-family browser cookies: profile discovery, sqlite read, scoring.
 //!
-//! Port of the cookie half of api.py (`BROWSERS`, `find_cookie_files`,
-//! `normalize_expires`, `score_profile`, `load_cookie_jar`, `detect_org_id`),
-//! restricted to browsers that store cookies in `cookies.sqlite`.
+//! Ported from the cookie half of the Python api.py (removed; see git
+//! history): `BROWSERS`, `find_cookie_files`, `normalize_expires`,
+//! `score_profile`, `load_cookie_jar`, `detect_org_id`; restricted to
+//! browsers that store cookies in `cookies.sqlite`.
 
 use std::collections::HashSet;
 use std::fmt;

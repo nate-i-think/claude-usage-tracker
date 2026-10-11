@@ -126,9 +126,9 @@ fn section(title: &str) {
     println!("\n== {title} ==");
 }
 
-/// Port of debug.py: profiles, cookie inventory (masked), request setup, one
-/// request, and a recommendation. Exit 0 only when the request returned
-/// usage data.
+/// Ported from the Python debug.py (removed; see git history): profiles,
+/// cookie inventory (masked), request setup, one request, and a
+/// recommendation. Exit 0 only when the request returned usage data.
 fn debug(cookie_file: Option<&Path>) -> ExitCode {
     let now = unix_now();
     println!("claude-usage-cli — debug");

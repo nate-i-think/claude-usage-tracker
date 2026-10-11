@@ -1,6 +1,6 @@
 //! Platform-aware locations for app data, Claude Code, and Cowork sessions.
 //!
-//! Port of paths.py.
+//! Ported from the Python paths.py (removed; see git history).
 
 use std::fs;
 use std::path::{Path, PathBuf};

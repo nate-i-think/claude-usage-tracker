@@ -1,7 +1,8 @@
 //! Dashboard rows: testable formatters from analytics data to [`Run`]s, and
 //! the small egui functions that lay them out.
 //!
-//! Copy and ordering follow ui.py's `render_dashboard` and its helpers.
+//! Copy and ordering follow `render_dashboard` and its helpers in the Python
+//! ui.py (removed; see git history).
 
 use chrono::{DateTime, Utc};
 
@@ -27,7 +28,7 @@ pub struct WindowRow {
     pub reset: Run,
 }
 
-/// The summary row for one window (ui.py `render_window_row`).
+/// The summary row for one window (the Python ui.py `render_window_row`).
 pub fn window_row(w: &UsageWindow, now: DateTime<Utc>) -> WindowRow {
     match w.utilization {
         None => WindowRow {
@@ -66,7 +67,7 @@ pub fn burn_tag(tag: BurnTag) -> Run {
     }
 }
 
-/// The burn line after its tag (ui.py `render_burn_line`): "15m burn
+/// The burn line after its tag (the Python ui.py `render_burn_line`): "15m burn
 /// {rate}, → 100% in {eta} (over last {span}m, {n} samples)", or the
 /// "need 2 recent samples" form when `line` is `None`.
 pub fn burn_body(line: Option<&BurnLine>) -> Vec<Run> {

@@ -2,10 +2,11 @@
 //! color levels, countdown formatting, Fable chart ceilings, and the row
 //! rules of the dashboard.
 //!
-//! Port of the math in ui.py, separated from its Rich rendering. Pure: no
-//! I/O, no egui. Wherever Python read the clock, `now` is a parameter, so
-//! every result is deterministic. Outputs are structured (levels, numbers,
-//! plain strings without markup); the GUI and the CLI report render them.
+//! Ported from the math in the Python ui.py (removed; see git history),
+//! separated from its Rich rendering. Pure: no I/O, no egui. Wherever
+//! Python read the clock, `now` is a parameter, so every result is
+//! deterministic. Outputs are structured (levels, numbers, plain strings
+//! without markup); the GUI and the CLI report render them.
 
 use std::fmt::Display;
 
@@ -517,7 +518,8 @@ mod tests {
         }
     }
 
-    /// test_ui.py `_snap`: a 5-hour window at `pct` resetting in `minutes_to_reset`.
+    /// From the Python test_ui.py `_snap` (removed): a 5-hour window at
+    /// `pct` resetting in `minutes_to_reset`.
     fn snap(pct: f64, minutes_to_reset: f64) -> Snapshot {
         Snapshot {
             fetched_at: NOW,
@@ -530,7 +532,8 @@ mod tests {
         }
     }
 
-    /// test_ui.py `_snap_with_windows`: a live 5-hour window plus `extra` windows.
+    /// From the Python test_ui.py `_snap_with_windows` (removed): a live
+    /// 5-hour window plus `extra` windows.
     fn snap_with_windows(extra: Vec<UsageWindow>) -> Snapshot {
         let mut windows = vec![window("5-hour", Some(10.0), Some(NOW + minutes(120.0)))];
         windows.extend(extra);
@@ -541,7 +544,8 @@ mod tests {
         }
     }
 
-    /// test_ui.py `_history`: `[(minutes_ago, pct), ...]` -> samples, oldest first.
+    /// From the Python test_ui.py `_history` (removed):
+    /// `[(minutes_ago, pct), ...]` -> samples, oldest first.
     fn history(points: &[(f64, f64)]) -> Vec<(DateTime<Utc>, Option<f64>)> {
         points
             .iter()

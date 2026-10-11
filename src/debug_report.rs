@@ -1,7 +1,8 @@
 //! Pure formatting for `claude-usage-cli debug`: masking, profile and cookie
 //! tables, the response body sniff, and the recommendation.
 //!
-//! Port of debug.py minus the TLS-profile sweep (one HTTP stack now). No
+//! Ported from the Python debug.py (removed; see git history), minus the
+//! TLS-profile sweep (one HTTP stack now). No
 //! function here prints a cookie value except through [`mask`].
 
 use chrono::{DateTime, Local, TimeZone, Utc};
@@ -23,8 +24,9 @@ const IMPORTANT_COOKIES: &[(&str, &str)] = &[
     ("anthropic-device-id", "device ID (sent as a header too)"),
 ];
 
-/// debug.py `_mask`: "<none>" for no value; all `*` when 15 characters or
-/// fewer; else the first and last 6 characters around "…" plus the length.
+/// As the Python debug.py `_mask` (removed): "<none>" for no value; all
+/// `*` when 15 characters or fewer; else the first and last 6 characters
+/// around "…" plus the length.
 pub fn mask(value: Option<&str>) -> String {
     let Some(v) = value else {
         return "<none>".to_owned();
@@ -77,7 +79,7 @@ fn absolute(ts: f64) -> String {
     absolute_in(ts, &Local)
 }
 
-/// A cookie's expiry status (debug.py inventory): "session", "EXPIRED 5m
+/// A cookie's expiry status (as the Python debug.py inventory): "session", "EXPIRED 5m
 /// ago", minutes under 10 minutes, hours under a day, else days.
 pub fn cookie_expiry(expiry: Option<f64>, now: f64) -> String {
     let Some(e) = expiry else {
@@ -287,7 +289,7 @@ fn short(s: &str, n: usize) -> String {
         .collect()
 }
 
-/// `sk-ant-[\w-]{6,}` → `sk-ant-***`. debug.py used `\w{6,}`, which misses
+/// `sk-ant-[\w-]{6,}` → `sk-ant-***`. The Python debug.py used `\w{6,}`, which misses
 /// real keys such as `sk-ant-api03-…` (the hyphen ends the match early).
 fn redact_api_keys(s: &str) -> String {
     const PREFIX: &str = "sk-ant-";
@@ -348,7 +350,7 @@ fn expired(c: &Cookie, now: f64) -> bool {
     c.expiry.is_some_and(|e| e < now)
 }
 
-/// The recommendation (debug.py `_print_recommendation`, adapted: no TLS
+/// The recommendation (the Python debug.py `_print_recommendation`, adapted: no TLS
 /// impersonation advice; a `permission_error` points at the client SHA).
 /// The first line is the headline.
 pub fn recommendation(jar: &CookieJar, probe: &Probe, now: f64) -> Vec<String> {

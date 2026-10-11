@@ -1,5 +1,5 @@
 //! The "5-hour window" and "Last 7 days" bar charts with the orange Fable
-//! floor (Python `BarChart` in ui.py).
+//! floor (the Python ui.py `BarChart`; removed, see git history).
 //!
 //! A custom painter rather than egui_plot: the axes are fixed at 0–100%, the
 //! chart is static (no zoom/pan), and the labels are categorical, all of
