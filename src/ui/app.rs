@@ -1,0 +1,370 @@
+//! The eframe app: owns the poller, drains its events, and lays out the
+//! dashboard top to bottom.
+
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
+use eframe::egui::{
+    self, Align, CentralPanel, Color32, Frame, Layout, RichText, ScrollArea, Ui, ViewportCommand,
+    WindowLevel,
+};
+
+use crate::analytics::{self, Level};
+use crate::config::Settings;
+use crate::model::UsageWindow;
+use crate::paths::Paths;
+use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
+
+use super::rows::{self, BurnTag};
+use super::{install_fonts, level_color, show_runs, tone_color, Tone};
+
+/// eframe storage key for [`Settings`].
+const SETTINGS_KEY: &str = "settings";
+/// Manual refreshes bypass the poller's minimum interval, so the button rests
+/// this long after a click.
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+/// Repaint cadence so "last polled" and the countdowns tick while idle.
+const TICK: Duration = Duration::from_secs(1);
+
+/// The latest poll results as the dashboard sees them.
+#[derive(Debug, Default)]
+pub struct PollState {
+    /// The last successful poll; kept across failures.
+    pub data: Option<Box<Dashboard>>,
+    /// The most recent failure, cleared by the next success.
+    pub error: Option<FetchErrorInfo>,
+}
+
+impl PollState {
+    /// Fold one poller event in: success replaces the data and clears the
+    /// error; failure keeps the last good data and records the error.
+    pub fn apply(&mut self, event: PollEvent) {
+        match event {
+            PollEvent::Ok(dashboard) => {
+                self.data = Some(dashboard);
+                self.error = None;
+            }
+            PollEvent::Err(info) => self.error = Some(info),
+        }
+    }
+}
+
+/// Whether the refresh button is usable again, given its last click.
+pub fn refresh_ready(last_click: Option<Instant>, now: Instant) -> bool {
+    last_click.is_none_or(|t| now.saturating_duration_since(t) >= REFRESH_COOLDOWN)
+}
+
+pub struct App {
+    /// The one poller for the app's lifetime; settings changes go to it as
+    /// [`PollMsg::UpdateSettings`].
+    poller: Poller,
+    settings: Settings,
+    state: PollState,
+    /// The settings panel is open.
+    show_settings: bool,
+    last_refresh: Option<Instant>,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings: Settings = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
+            .unwrap_or_default();
+        let ctx = cc.egui_ctx.clone();
+        ctx.set_theme(egui::ThemePreference::Dark);
+        install_fonts(&ctx);
+        if settings.always_on_top {
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+        }
+        let notify_ctx = ctx.clone();
+        let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
+            notify_ctx.request_repaint()
+        });
+        Self {
+            poller,
+            settings,
+            state: PollState::default(),
+            show_settings: false,
+            last_refresh: None,
+        }
+    }
+
+    fn drain_events(&mut self) {
+        while let Some(event) = self.poller.try_recv() {
+            self.state.apply(event);
+        }
+    }
+
+    /// "claude.ai usage · {plan}" with refresh, pin, and settings buttons.
+    fn header(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            show_runs(ui, &rows::header_runs(&self.settings.plan));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::selectable(self.show_settings, "⚙"))
+                    .on_hover_text("Settings")
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
+                }
+
+                let pinned = self.settings.always_on_top;
+                let pin_tip = if pinned {
+                    "Stop keeping on top"
+                } else {
+                    "Keep on top"
+                };
+                if ui
+                    .add(egui::Button::selectable(pinned, "📌"))
+                    .on_hover_text(pin_tip)
+                    .clicked()
+                {
+                    self.settings.always_on_top = !pinned;
+                    let level = if self.settings.always_on_top {
+                        WindowLevel::AlwaysOnTop
+                    } else {
+                        WindowLevel::Normal
+                    };
+                    ui.ctx()
+                        .send_viewport_cmd(ViewportCommand::WindowLevel(level));
+                }
+
+                let ready = refresh_ready(self.last_refresh, Instant::now());
+                if ui
+                    .add_enabled(ready, egui::Button::selectable(false, "🔄"))
+                    .on_hover_text("Refresh now")
+                    .on_disabled_hover_text("Refreshed just now")
+                    .clicked()
+                {
+                    self.poller.send(PollMsg::RefreshNow);
+                    self.last_refresh = Some(Instant::now());
+                }
+            });
+        });
+    }
+
+    /// Placeholder for the settings panel, shown while `show_settings`.
+    fn settings_panel(&mut self, ui: &mut Ui) {
+        Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.strong("Settings");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        self.show_settings = false;
+                    }
+                });
+            });
+            ui.weak("The settings panel is not built yet.");
+        });
+        ui.add_space(4.0);
+    }
+
+    /// Poller-stopped, fetch-error, and persist-error notices.
+    fn banners(&mut self, ui: &mut Ui) {
+        let red = level_color(Level::Red, ui.visuals());
+        if !self.poller.is_alive() {
+            error_frame(ui, red, |ui| {
+                ui.colored_label(red, "poller stopped — restart the app");
+            });
+        }
+        if let Some(err) = &self.state.error {
+            let hint = rows::shows_sha_hint(err);
+            let message = err.message.clone();
+            let mut open_settings = false;
+            error_frame(ui, red, |ui| {
+                ui.colored_label(red, RichText::new("claude.ai usage — error").strong());
+                ui.add(egui::Label::new(RichText::new(message).color(red)).wrap());
+                if hint {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Your client SHA may be stale — update it in Settings");
+                        open_settings = ui.button("Open Settings").clicked();
+                    });
+                }
+            });
+            if open_settings {
+                self.show_settings = true;
+            }
+        }
+        if let Some(persist) = self
+            .state
+            .data
+            .as_ref()
+            .and_then(|d| d.persist_error.as_ref())
+        {
+            let color = level_color(Level::Orange, ui.visuals());
+            ui.add(egui::Label::new(RichText::new(persist).color(color)).wrap());
+        }
+    }
+}
+
+/// A red-outlined frame across the full width.
+fn error_frame(ui: &mut Ui, red: Color32, add: impl FnOnce(&mut Ui)) {
+    Frame::new()
+        .stroke((1.0, red))
+        .fill(red.gamma_multiply(0.08))
+        .corner_radius(4.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+    ui.add_space(4.0);
+}
+
+/// The dashboard body for one successful poll.
+fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &Settings) {
+    let now = Utc::now();
+    let snap = &d.snapshot;
+    let order = analytics::ordered_windows(snap);
+    let show_rows = |ui: &mut Ui, windows: &[&UsageWindow]| {
+        for w in windows {
+            if analytics::window_visible(w, settings.show_all) {
+                rows::show_window_row(ui, &rows::window_row(w, now));
+            }
+        }
+    };
+
+    show_rows(ui, &order.primary);
+    ui.add_space(4.0);
+    let all = analytics::burn_line(
+        &d.history,
+        snap.five_hour_pct(),
+        snap.five_hour_resets_at(),
+        now,
+    );
+    rows::show_burn_row(ui, BurnTag::All, &rows::burn_body(all.as_ref()));
+    if let Some(fable) = snap.window("Fable") {
+        let line = analytics::burn_line(&d.fable_history, fable.utilization, fable.resets_at, now);
+        rows::show_burn_row(ui, BurnTag::Fable, &rows::burn_body(line.as_ref()));
+    }
+    if !order.rest.is_empty() {
+        ui.add_space(4.0);
+        show_rows(ui, &order.rest);
+    }
+
+    if let Some(extra) = analytics::visible_extra(snap) {
+        ui.add_space(6.0);
+        show_runs(ui, &rows::extra_runs(extra));
+    }
+
+    // Charts (5-hour window, last 7 days) go here.
+    ui.add_space(8.0);
+
+    show_runs(ui, &rows::burners_runs(&d.burners));
+    ui.horizontal(|ui| {
+        let rate = analytics::compute_rate(&d.history, now);
+        if let Some(h) = analytics::headroom(snap, rate, now) {
+            show_runs(ui, &rows::headroom_runs(&h));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let dim = tone_color(Tone::Dim, ui.visuals());
+            ui.colored_label(dim, rows::last_polled(snap.fetched_at, now));
+        });
+    });
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.drain_events();
+        ui.ctx().request_repaint_after(TICK);
+
+        CentralPanel::default().show(ui, |ui| {
+            ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                self.header(ui);
+                ui.separator();
+                if self.show_settings {
+                    self.settings_panel(ui);
+                }
+                self.banners(ui);
+                match &self.state.data {
+                    Some(d) => dashboard(ui, d, &self.settings),
+                    None => {
+                        ui.add_space(40.0);
+                        ui.vertical_centered(|ui| ui.weak("loading…"));
+                    }
+                }
+            });
+        });
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, SETTINGS_KEY, &self.settings);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Snapshot;
+    use chrono::DateTime;
+
+    fn dashboard(pct: f64) -> Box<Dashboard> {
+        let t = DateTime::from_timestamp(1_791_000_000, 0).unwrap();
+        Box::new(Dashboard {
+            snapshot: Snapshot {
+                fetched_at: t,
+                windows: vec![UsageWindow {
+                    label: "5-hour".to_owned(),
+                    utilization: Some(pct),
+                    resets_at: None,
+                }],
+                extra: None,
+            },
+            history: Vec::new(),
+            fable_history: Vec::new(),
+            five_hour_buckets: Vec::new(),
+            fable_buckets: Vec::new(),
+            daily_history: Vec::new(),
+            fable_daily: Vec::new(),
+            burners: Vec::new(),
+            window_start: t,
+            persist_error: None,
+        })
+    }
+
+    fn err(message: &str) -> PollEvent {
+        PollEvent::Err(FetchErrorInfo {
+            message: message.to_owned(),
+            stale_sha_hint: false,
+        })
+    }
+
+    #[test]
+    fn error_keeps_last_good_data_and_success_clears_error() {
+        let mut state = PollState::default();
+        state.apply(err("request failed: timed out"));
+        assert!(state.data.is_none());
+        assert_eq!(
+            state.error.as_ref().unwrap().message,
+            "request failed: timed out"
+        );
+
+        state.apply(PollEvent::Ok(dashboard(10.0)));
+        assert!(state.error.is_none());
+
+        state.apply(err("HTTP 500: oops"));
+        assert_eq!(
+            state.data.as_ref().unwrap().snapshot.five_hour_pct(),
+            Some(10.0)
+        );
+        assert!(state.error.is_some());
+
+        state.apply(PollEvent::Ok(dashboard(20.0)));
+        assert_eq!(
+            state.data.as_ref().unwrap().snapshot.five_hour_pct(),
+            Some(20.0)
+        );
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn refresh_cooldown() {
+        let t = Instant::now();
+        assert!(refresh_ready(None, t));
+        assert!(!refresh_ready(Some(t), t));
+        assert!(!refresh_ready(Some(t), t + Duration::from_millis(4_900)));
+        assert!(refresh_ready(Some(t), t + REFRESH_COOLDOWN));
+    }
+}
