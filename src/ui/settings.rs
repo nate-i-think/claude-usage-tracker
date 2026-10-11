@@ -349,7 +349,7 @@ impl SettingsPanel {
 
             group_heading(ui, "Motion");
             theme::checkbox(ui, &mut d.reduce_motion, "Reduce motion");
-            theme::checkbox(ui, &mut d.keep_pulsing, "Keep pulsing at high usage");
+            theme::checkbox(ui, &mut d.keep_pulsing, "Keep pulsing near cap");
             ui.add_space(4.0);
 
             ui.horizontal(|ui| {

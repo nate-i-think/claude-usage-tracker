@@ -19,13 +19,14 @@ use std::ops::Range;
 use chrono::{DateTime, Duration, Local, TimeZone, Timelike, Utc};
 use eframe::egui::{
     epaint::{Mesh, PathStroke},
-    pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
+    pos2, vec2, Align2, Color32, FontId, Id, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
     TextStyle, Ui, Vec2,
 };
 
 use crate::analytics::{self, alerts::fmt_clock_in, Projection, WindowSample};
 use crate::poller::Dashboard;
 
+use super::motion;
 use super::theme::Palette;
 
 /// Height of the timeline in full mode.
@@ -632,7 +633,15 @@ pub fn show_timeline(
         (p, analytics::projection(now, p, rate, d.window_end))
     });
     let reset_known = d.snapshot.five_hour_resets_at().is_some();
-    let ends = projection.map(|(pct, p)| (pct, p, end_label(reset_known, &p, now)));
+    // The dot eases to each poll's %; the projection draws in when it
+    // first appears and when a poll moves its end.
+    let ctx = ui.ctx().clone();
+    let ends = projection.map(|(pct, p)| Ends {
+        pct: motion::eased(&ctx, Id::new("timeline-now-pct"), pct),
+        projection: p,
+        label: end_label(reset_known, &p, now),
+        share: motion::draw_in(&ctx, Id::new("timeline-projection"), p.end_pct),
+    });
     paint_now(&painter, &axes, palette, state, now, ends, &font);
 
     if let Some(pointer) = response.hover_pos() {
@@ -779,6 +788,22 @@ fn paint_areas(
     }
 }
 
+/// What [`paint_now`] draws beyond the marker line.
+struct Ends {
+    /// The dot's % (eased).
+    pct: f64,
+    projection: Projection,
+    label: Option<EndLabel>,
+    /// Share of the projection drawn in so far, 0..=1.
+    share: f32,
+}
+
+/// Opacity of the projection's end mark and label for a draw-in `share`:
+/// they fade in over the last 30% of the line.
+pub fn end_fade(share: f32) -> f32 {
+    ((share - 0.7) / 0.3).clamp(0.0, 1.0)
+}
+
 /// The now marker, the dashed projection with its cap ✕ and label or the
 /// "safe" end label, and the dot at the current %.
 fn paint_now(
@@ -787,7 +812,7 @@ fn paint_now(
     palette: &Palette,
     state: Color32,
     now: DateTime<Utc>,
-    projection: Option<(f64, Projection, Option<EndLabel>)>,
+    ends: Option<Ends>,
     font: &FontId,
 ) {
     let x = axes.x_at(now);
@@ -796,9 +821,16 @@ fn paint_now(
         axes.plot.y_range(),
         Stroke::new(1.0, palette.text_muted.gamma_multiply(0.6)),
     );
-    let Some((pct, p, kind)) = projection else {
+    let Some(Ends {
+        pct,
+        projection: p,
+        label: kind,
+        share,
+    }) = ends
+    else {
         return;
     };
+    let fade = end_fade(share);
     let from = axes.pos(now, pct);
     let to = axes.pos(p.end_t, p.end_pct);
     // The end label ("cap 4:10p" by the ✕, or "safe"), placed off the line
@@ -829,17 +861,26 @@ fn paint_now(
     let stop = placed
         .as_ref()
         .map_or(to, |(_, rect, _)| dash_end(from, to, *rect));
-    paint_dashed(painter, from, stop, Stroke::new(1.5, state));
+    paint_dashed(
+        painter,
+        from,
+        from + (stop - from) * share,
+        Stroke::new(1.5, state),
+    );
 
-    if matches!(kind, Some(EndLabel::Cap(_))) {
-        let stroke = Stroke::new(2.0, palette.danger);
+    if matches!(kind, Some(EndLabel::Cap(_))) && fade > 0.0 {
+        let stroke = Stroke::new(2.0, palette.danger.gamma_multiply(fade));
         let (a, b) = (vec2(CAP_MARK, CAP_MARK), vec2(CAP_MARK, -CAP_MARK));
         painter.line_segment([to - a, to + a], stroke);
         painter.line_segment([to - b, to + b], stroke);
     }
-    if let Some((galley, rect, color)) = placed {
-        painter.rect_filled(rect.expand(LABEL_PAD), 3.0, palette.surface);
-        painter.galley(rect.min, galley, color);
+    if let Some((galley, rect, color)) = placed.filter(|_| fade > 0.0) {
+        painter.rect_filled(
+            rect.expand(LABEL_PAD),
+            3.0,
+            palette.surface.gamma_multiply(fade),
+        );
+        painter.galley_with_override_text_color(rect.min, galley, color.gamma_multiply(fade));
     }
 
     painter.circle(from, DOT_RADIUS, state, Stroke::new(1.5, palette.surface));
@@ -1246,6 +1287,14 @@ mod tests {
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
         Rect::from_min_max(pos2(x0, y0), pos2(x1, y1))
+    }
+
+    #[test]
+    fn end_mark_fades_in_over_the_last_of_the_draw_in() {
+        assert_eq!(end_fade(0.0), 0.0);
+        assert_eq!(end_fade(0.7), 0.0);
+        assert!((end_fade(0.85) - 0.5).abs() < 1e-5);
+        assert_eq!(end_fade(1.0), 1.0);
     }
 
     #[test]

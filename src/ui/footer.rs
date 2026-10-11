@@ -3,7 +3,7 @@
 //! that wraps when narrow.
 
 use chrono::{DateTime, Local, Utc};
-use eframe::egui::{vec2, Align, Layout, Rect, Sense, Ui};
+use eframe::egui::{vec2, Align, Id, Layout, Rect, Sense, Ui};
 
 use crate::analytics::{self, BurnLine, Eta, Level};
 use crate::model::ExtraUsage;
@@ -11,7 +11,7 @@ use crate::poller::Dashboard;
 
 use super::layout::{self, GAP};
 use super::theme::Palette;
-use super::{digits, layout_job, rows, sparkline, Run, Tone};
+use super::{digits, layout_job, motion, rows, sparkline, Run, Tone};
 
 /// Width of the extra-usage gauge's bar.
 const GAUGE_W: f32 = 48.0;
@@ -228,12 +228,15 @@ fn centered_galley(
 fn gauge_bar(ui: &mut Ui, g: &ExtraGauge, palette: &Palette) -> eframe::egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(GAUGE_W, GAUGE_H * 3.0), Sense::hover());
     let track = Rect::from_center_size(rect.center(), vec2(GAUGE_W, GAUGE_H));
+    let ctx = ui.ctx();
+    let fraction = motion::eased(ctx, Id::new("extra-gauge-fraction"), g.fraction);
+    let color = motion::eased(ctx, Id::new("extra-gauge-color"), palette.level(g.level));
     let painter = ui.painter();
     painter.rect_filled(track, GAUGE_H / 2.0, palette.track);
-    if g.fraction > 0.0 {
+    if fraction > 0.0 {
         let mut fill = track;
-        fill.set_width((GAUGE_W * g.fraction).max(GAUGE_H));
-        painter.rect_filled(fill, GAUGE_H / 2.0, palette.level(g.level));
+        fill.set_width((GAUGE_W * fraction).max(GAUGE_H));
+        painter.rect_filled(fill, GAUGE_H / 2.0, color);
     }
     response
 }

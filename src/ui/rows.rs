@@ -10,9 +10,9 @@ use crate::analytics::{self, BurnLine, Eta, Headroom, BURN_WINDOW_MINUTES};
 use crate::model::{ExtraUsage, UsageWindow};
 use crate::storage::InstanceUsage;
 
-use eframe::egui::{vec2, Align, Color32, Layout, Rect, RichText, Sense, TextStyle, Ui};
+use eframe::egui::{vec2, Align, Color32, Id, Layout, Rect, RichText, Sense, TextStyle, Ui};
 
-use super::{bar_track_color, digits, show_runs, theme, tone_color, Run, Tone};
+use super::{bar_track_color, digits, motion, show_runs, theme, tone_color, Run, Tone};
 
 /// One window's summary row, ready to lay out.
 #[derive(Debug, Clone, PartialEq)]
@@ -222,12 +222,12 @@ pub fn show_window_row(ui: &mut Ui, row: &WindowRow) {
         cell(ui, PCT_WIDTH, right(), |ui| number(ui, &row.pct));
         let gap = ui.spacing().item_spacing.x;
         let bar_width = (ui.available_width() - RESET_WIDTH - gap).max(0.0);
-        paint_bar(
-            ui,
-            bar_width,
-            row.fraction,
-            tone_color(row.fill, ui.visuals()),
-        );
+        // The bar's fill and color ease to each poll's values.
+        let ctx = ui.ctx().clone();
+        let fraction = motion::eased(&ctx, Id::new(("window-bar", &row.label)), row.fraction);
+        let fill = tone_color(row.fill, ui.visuals());
+        let fill = motion::eased(&ctx, Id::new(("window-bar-color", &row.label)), fill);
+        paint_bar(ui, bar_width, fraction, fill);
         cell(ui, RESET_WIDTH, right(), |ui| number(ui, &row.reset));
     });
 }
