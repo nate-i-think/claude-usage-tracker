@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 
-use crate::analytics::{BURN_WINDOW_MINUTES, HISTORY_LEN};
+use crate::analytics::{WindowSample, BURN_WINDOW_MINUTES, HISTORY_LEN};
 use crate::config::{Settings, MIN_INTERVAL_SECS};
 use crate::crash::catch_recoverable;
 use crate::fetch::{self, FetchError};
@@ -43,6 +43,12 @@ pub struct Dashboard {
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     pub burners: Vec<InstanceUsage>,
     pub window_start: DateTime<Utc>,
+    /// End of the current five-hour window: its `resets_at`, else
+    /// `window_start + 5h`.
+    pub window_end: DateTime<Utc>,
+    /// Every history sample in `[window_start, window_start + 5h)`, oldest
+    /// first, including this poll's.
+    pub window_samples: Vec<WindowSample>,
     /// Saving this poll to history.jsonl failed; the data above is still
     /// fresh. Shown as a warning.
     pub persist_error: Option<String>,
@@ -216,8 +222,12 @@ fn build_dashboard(
     now: DateTime<Utc>,
 ) -> Dashboard {
     let ws = window_start(&snapshot, now);
-    // One history read feeds all four charts.
+    let window_end = snapshot
+        .five_hour_resets_at()
+        .unwrap_or(ws + ChronoDuration::hours(5));
+    // One history read feeds all four charts and the window samples.
     let rollups = storage::rollups(paths, ws, DAILY_DAYS, now);
+    let window_samples = with_current_sample(rollups.window_samples, &snapshot, ws, window_end);
     Dashboard {
         history: history.five_hour(),
         fable_history: history.fable(),
@@ -227,9 +237,35 @@ fn build_dashboard(
         fable_daily: rollups.fable_daily,
         burners: storage::attribute_recent(&dirs.claude_code, &dirs.cowork, ws),
         window_start: ws,
+        window_end,
+        window_samples,
         persist_error: None,
         snapshot,
     }
+}
+
+/// `samples` with this poll's sample at its exact fetch time, whether or not
+/// it reached history.jsonl (the persist can fail, and the file keeps only
+/// microseconds). Kept only when it falls inside the window.
+fn with_current_sample(
+    mut samples: Vec<WindowSample>,
+    snap: &Snapshot,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Vec<WindowSample> {
+    let t = snap.fetched_at;
+    if t < window_start || t > window_end {
+        return samples;
+    }
+    // The persisted copy of this poll, if any, rounded to microseconds.
+    samples.retain(|s| (s.t - t).abs() >= ChronoDuration::milliseconds(1));
+    samples.push(WindowSample {
+        t,
+        five_hour: snap.five_hour_pct(),
+        fable: snap.window("Fable").and_then(|w| w.utilization),
+    });
+    samples.sort_by_key(|s| s.t);
+    samples
 }
 
 /// State shared between the [`Poller`] handle and its thread.
@@ -745,6 +781,97 @@ mod tests {
         assert_eq!(d.persist_error, None);
         // The just-appended sample lands in the current 30-minute bucket.
         assert!(d.five_hour_buckets.iter().any(|(_, v)| *v == Some(42.0)));
+    }
+
+    #[test]
+    fn poll_once_fills_window_samples_from_one_history_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::with_data_dir(tmp.path().join("data"));
+        let dirs = SessionDirs {
+            claude_code: tmp.path().join("cc"),
+            cowork: tmp.path().join("cw"),
+        };
+        // FakeSource resets 2h after the fetch, so the window began ~3h ago.
+        let now = Utc::now();
+        let earlier = now - ChronoDuration::hours(1);
+        let ts = |t: DateTime<Utc>| t.timestamp() as f64;
+        fs::create_dir_all(paths.data_dir()).unwrap();
+        let lines = [
+            format!(
+                r#"{{"ts": {}, "five_hour": 1.0, "fable_7d": 5.0}}"#,
+                ts(now - ChronoDuration::hours(4))
+            ),
+            format!(
+                r#"{{"ts": {}, "five_hour": 30.0, "fable_7d": 6.0}}"#,
+                ts(earlier)
+            ),
+        ];
+        fs::write(
+            paths.history_file(),
+            lines.join(
+                "
+",
+            ) + "
+",
+        )
+        .unwrap();
+
+        let mut source = FakeSource::new(vec![Ok(42.0)]);
+        let before = storage::history_reads();
+        let d = poll_once(
+            &mut source,
+            &paths,
+            &dirs,
+            &Settings::default(),
+            &mut BurnHistory::default(),
+        )
+        .unwrap();
+        assert_eq!(storage::history_reads() - before, 1, "one history read");
+
+        let fetched = d.snapshot.fetched_at;
+        assert_eq!(d.window_end, d.snapshot.five_hour_resets_at().unwrap());
+        assert_eq!(d.window_end, d.window_start + ChronoDuration::hours(5));
+        assert_eq!(
+            d.window_samples,
+            [
+                WindowSample {
+                    t: DateTime::from_timestamp(earlier.timestamp(), 0).unwrap(),
+                    five_hour: Some(30.0),
+                    fable: Some(6.0),
+                },
+                // This poll, once, at its exact fetch time.
+                WindowSample {
+                    t: fetched,
+                    five_hour: Some(42.0),
+                    fable: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn current_sample_is_added_when_persist_failed_and_kept_in_order() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
+        let s = snap(now, Some(50.0), Some(7.0)); // window 9:00..14:00
+        let ws = window_start(&s, now);
+        let old = WindowSample {
+            t: now - ChronoDuration::minutes(5),
+            five_hour: Some(45.0),
+            fable: None,
+        };
+        let got = with_current_sample(vec![old], &s, ws, ws + ChronoDuration::hours(5));
+        let current = WindowSample {
+            t: now,
+            five_hour: Some(50.0),
+            fable: Some(7.0),
+        };
+        assert_eq!(got, [old, current]);
+        // A window that already ended (stale reset): not added.
+        let (start, end) = (
+            now - ChronoDuration::hours(6),
+            now - ChronoDuration::hours(1),
+        );
+        assert!(with_current_sample(vec![], &s, start, end).is_empty());
     }
 
     #[test]

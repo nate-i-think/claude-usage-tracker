@@ -15,6 +15,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc}
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::analytics::WindowSample;
 use crate::model::{ExtraUsage, Snapshot};
 use crate::paths::Paths;
 
@@ -74,6 +75,8 @@ pub fn append_snapshot(paths: &Paths, snap: &Snapshot) -> io::Result<()> {
 /// History rows with `ts >= since`. Unreadable lines are skipped; unknown
 /// keys are ignored and missing or non-numeric values become `None`.
 pub fn read_recent(paths: &Paths, since: DateTime<Utc>) -> Vec<HistoryEntry> {
+    #[cfg(test)]
+    HISTORY_READS.with(|n| n.set(n.get() + 1));
     let Ok(file) = File::open(paths.history_file()) else {
         return Vec::new();
     };
@@ -83,6 +86,19 @@ pub fn read_recent(paths: &Paths, since: DateTime<Utc>) -> Vec<HistoryEntry> {
         .filter_map(|d| history_entry_from_json(&d))
         .filter(|e| e.ts >= cutoff)
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`read_recent`] on this thread, so tests can assert how many
+    /// times a code path read history.jsonl.
+    static HISTORY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`read_recent`] calls so far on this thread (tests only).
+#[cfg(test)]
+pub(crate) fn history_reads() -> usize {
+    HISTORY_READS.with(std::cell::Cell::get)
 }
 
 fn history_entry_from_json(d: &Value) -> Option<HistoryEntry> {
@@ -190,16 +206,19 @@ pub fn fable_five_hour_buckets(
     window_buckets(&rows, window_start, now, |e| e.fable_7d)
 }
 
-/// All four chart rollups from a single read of history.jsonl. Identical to
-/// calling [`five_hour_buckets`], [`fable_five_hour_buckets`],
-/// [`daily_history`] and [`fable_daily_history`] separately, but the history
-/// is read and parsed once (from the earliest cutoff any of them needs).
+/// All four chart rollups, plus the raw samples of the five-hour window, from
+/// a single read of history.jsonl. The rollups are identical to calling
+/// [`five_hour_buckets`], [`fable_five_hour_buckets`], [`daily_history`] and
+/// [`fable_daily_history`] separately, but the history is read and parsed
+/// once (from the earliest cutoff any of them needs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rollups {
     pub five_hour: Vec<(DateTime<Utc>, Option<f64>)>,
     pub fable_five_hour: Vec<(DateTime<Utc>, Option<f64>)>,
     pub daily: Vec<(NaiveDate, Option<f64>)>,
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
+    /// Every row in `[window_start, window_start + 5h)`, oldest first.
+    pub window_samples: Vec<WindowSample>,
 }
 
 /// See [`Rollups`].
@@ -219,7 +238,29 @@ pub fn rollups(
         fable_five_hour: window_buckets(&rows, window_start, now, |e| e.fable_7d),
         daily: daily_max(&rows, days, now, |e| e.seven_day),
         fable_daily: daily_max(&rows, days, now, |e| e.fable_7d),
+        window_samples: window_samples(&rows, window_start),
     }
+}
+
+/// The rows inside the five-hour window starting at `window_start`, as
+/// samples, oldest first. `rows` may hold entries outside the window.
+fn window_samples(rows: &[HistoryEntry], window_start: DateTime<Utc>) -> Vec<WindowSample> {
+    let start_ts = unix_seconds(window_start);
+    let end_ts = unix_seconds(window_start + Duration::minutes(WINDOW_MINUTES));
+    let mut samples: Vec<WindowSample> = rows
+        .iter()
+        .filter(|e| e.ts >= start_ts && e.ts < end_ts)
+        .filter_map(|e| {
+            Some(WindowSample {
+                t: from_unix_seconds(e.ts)?,
+                five_hour: e.five_hour,
+                fable: e.fable_7d,
+            })
+        })
+        .collect();
+    // The file is append-only, but concurrent writers can interleave.
+    samples.sort_by_key(|s| s.t);
+    samples
 }
 
 /// Bucket one field over the five-hour window: max per bucket. Buckets that
@@ -1005,6 +1046,43 @@ mod tests {
         assert_eq!(got.five_hour, five_hour_buckets(&paths, old_ws, now));
         assert!(got.five_hour.iter().any(|(_, v)| v.is_some()));
         assert_eq!(got.daily, daily_history(&paths, 7, now));
+    }
+
+    #[test]
+    fn rollups_window_samples_are_the_rows_in_the_window_from_one_read() {
+        let (_tmp, paths) = temp_paths();
+        let ws = utc(2026, 10, 11, 10, 0, 0);
+        let now = ws + Duration::minutes(200);
+        let line = |t: DateTime<Utc>, five: Value, fable: Value| {
+            json!({"ts": unix_seconds(t), "five_hour": five, "fable_7d": fable}).to_string()
+        };
+        write_history(
+            &paths,
+            &[
+                line(ws - Duration::seconds(1), json!(99.0), json!(9.0)), // before
+                line(ws + Duration::minutes(30), json!(20.0), json!(3.0)),
+                line(ws, json!(10.0), Value::Null), // at the start, out of order
+                "garbage".into(),
+                line(ws + Duration::minutes(60), Value::Null, json!(4.0)),
+                line(ws + Duration::minutes(300), json!(1.0), json!(1.0)), // at the end
+            ],
+        );
+        let before = history_reads();
+        let got = rollups(&paths, ws, 7, now);
+        assert_eq!(history_reads() - before, 1, "rollups reads history once");
+        let sample = |m: i64, five, fable| WindowSample {
+            t: ws + Duration::minutes(m),
+            five_hour: five,
+            fable,
+        };
+        assert_eq!(
+            got.window_samples,
+            [
+                sample(0, Some(10.0), None),
+                sample(30, Some(20.0), Some(3.0)),
+                sample(60, None, Some(4.0)),
+            ]
+        );
     }
 
     #[test]

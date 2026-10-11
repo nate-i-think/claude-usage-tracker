@@ -375,6 +375,8 @@ mod tests {
             fable_daily: Vec::new(),
             burners: Vec::new(),
             window_start: t,
+            window_end: t,
+            window_samples: Vec::new(),
             persist_error: None,
         })
     }
