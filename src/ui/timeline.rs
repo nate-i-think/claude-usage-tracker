@@ -444,27 +444,116 @@ fn shift_inside(rect: Rect, bounds: Rect) -> Rect {
     moved.translate(vec2(x, y))
 }
 
+/// Clearance between the ✕ and its label, past the mark and the pad.
+pub const CAP_LABEL_CLEARANCE: f32 = CAP_MARK + 4.0;
+/// Half-size of the box around the ✕ no label may cover.
+pub const CAP_KEEP_OUT: f32 = CAP_MARK + 1.0;
+/// The "safe" label's clearance and keep-out around the dash's tip.
+const SAFE_LABEL_CLEARANCE: f32 = 4.0;
+const SAFE_KEEP_OUT: f32 = 2.0;
+
+/// What the projection's end says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndLabel {
+    /// "cap 4:10p" with a ✕, at this time.
+    Cap(DateTime<Utc>),
+    /// "safe": the window resets first.
+    Safe,
+}
+
+/// The end label for projection `p`, or none: without a known reset the
+/// window end is only assumed, so neither "safe" nor a cap time is
+/// claimed (the footer then shows the rate alone); a zero-length line
+/// gets none either.
+pub fn end_label(reset_known: bool, p: &Projection, now: DateTime<Utc>) -> Option<EndLabel> {
+    if !reset_known {
+        return None;
+    }
+    match p.cap_at {
+        Some(cap) => Some(EndLabel::Cap(cap)),
+        None if p.end_t > now => Some(EndLabel::Safe),
+        None => None,
+    }
+}
+
+/// Whether `a` and `b` overlap with positive area (touching edges don't).
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.min.x < b.max.x && b.min.x < a.max.x && a.min.y < b.max.y && b.min.y < a.max.y
+}
+
+/// The line's lowest point (largest y) over `x0..=x1`, for a segment that
+/// may not span that range (it is extended flat past its ends).
+fn line_low_over(from: Pos2, end: Pos2, x0: f32, x1: f32) -> f32 {
+    let y_at = |x: f32| {
+        if (end.x - from.x).abs() < f32::EPSILON {
+            from.y.max(end.y)
+        } else {
+            let t = ((x - from.x) / (end.x - from.x)).clamp(0.0, 1.0);
+            from.y + (end.y - from.y) * t
+        }
+    };
+    y_at(x0).max(y_at(x1))
+}
+
 /// The end label's rect, `size` big, for the projection `from`→`end`,
-/// kept `clearance` away from the end point (the ✕'s arm, or a small gap)
-/// and inside `bounds`. Tries above-left, above-right, below-right, left,
-/// then below-left of the end point and takes the first whose padded rect
-/// the line misses; when none does, above-left (and the dash stops short
-/// of it, see [`dash_end`]).
-pub fn place_end_label(from: Pos2, end: Pos2, size: Vec2, clearance: f32, bounds: Rect) -> Rect {
+/// inside `bounds`. `keep_out` is the half-size of the box around the end
+/// point the label's pad must never cover (the ✕, or the dash's tip), and
+/// `clearance` how far the label sits from the end point.
+///
+/// Tries, in order: above-left, above-right, left at the top of the bounds,
+/// below-right, left (centered on the end point), then below-left dropped
+/// just under the line. Takes
+/// the first whose padded rect misses both the line and the keep-out box.
+/// When the line touches every one, takes the first that still misses the
+/// keep-out box (the dash then stops short of it, see [`dash_end`]).
+pub fn place_end_label(
+    from: Pos2,
+    end: Pos2,
+    size: Vec2,
+    clearance: f32,
+    keep_out: f32,
+    bounds: Rect,
+) -> Rect {
     let c = clearance;
     let at = |min: Pos2| shift_inside(Rect::from_min_size(min, size), bounds);
-    let above_left = at(pos2(end.x - size.x, end.y - c - size.y));
+    // Left of the end point at the top of the bounds, far enough left that
+    // the line (rising toward the end point) has dropped below the label.
+    let top_left = {
+        let drop = bounds.top() + size.y + 2.0 * LABEL_PAD - end.y;
+        let run = end.x - from.x;
+        let gap = if drop <= 0.0 {
+            c
+        } else if run > 0.0 && from.y > end.y {
+            c.max(drop * run / (from.y - end.y) + LABEL_PAD)
+        } else {
+            c
+        };
+        at(pos2(end.x - gap - size.x, bounds.top()))
+    };
+    let under_line = {
+        let x = shift_inside(
+            Rect::from_min_size(pos2(end.x - size.x, end.y), size),
+            bounds,
+        );
+        let low = line_low_over(from, end, x.left() - LABEL_PAD, x.right() + LABEL_PAD);
+        at(pos2(x.left(), (end.y + c).max(low + LABEL_PAD + 1.0)))
+    };
     let candidates = [
-        above_left,
+        at(pos2(end.x - size.x, end.y - c - size.y)),
         at(pos2(end.x + c, end.y - c - size.y)),
+        top_left,
         at(pos2(end.x + c, end.y + c)),
         at(pos2(end.x - c - size.x, end.y - size.y / 2.0)),
-        at(pos2(end.x - size.x, end.y + c)),
+        under_line,
     ];
+    let keep = Rect::from_center_size(end, Vec2::splat(2.0 * keep_out));
+    let clear_of_keep = |r: &Rect| !overlaps(r.expand(LABEL_PAD), keep);
     candidates
-        .into_iter()
-        .find(|r| segment_entry(from, end, r.expand(LABEL_PAD)).is_none())
-        .unwrap_or(above_left)
+        .iter()
+        .copied()
+        .find(|r| clear_of_keep(r) && segment_entry(from, end, r.expand(LABEL_PAD)).is_none())
+        .or_else(|| candidates.iter().copied().find(clear_of_keep))
+        .unwrap_or(under_line)
 }
 
 /// Where the dashed projection stops: at `end`, or just before it would
@@ -542,7 +631,9 @@ pub fn show_timeline(
         let rate = analytics::compute_rate(&d.history, now);
         (p, analytics::projection(now, p, rate, d.window_end))
     });
-    paint_now(&painter, &axes, palette, state, now, projection, &font);
+    let reset_known = d.snapshot.five_hour_resets_at().is_some();
+    let ends = projection.map(|(pct, p)| (pct, p, end_label(reset_known, &p, now)));
+    paint_now(&painter, &axes, palette, state, now, ends, &font);
 
     if let Some(pointer) = response.hover_pos() {
         if axes.plot.x_range().contains(pointer.x) {
@@ -696,7 +787,7 @@ fn paint_now(
     palette: &Palette,
     state: Color32,
     now: DateTime<Utc>,
-    projection: Option<(f64, Projection)>,
+    projection: Option<(f64, Projection, Option<EndLabel>)>,
     font: &FontId,
 ) {
     let x = axes.x_at(now);
@@ -705,31 +796,34 @@ fn paint_now(
         axes.plot.y_range(),
         Stroke::new(1.0, palette.text_muted.gamma_multiply(0.6)),
     );
-    let Some((pct, p)) = projection else {
+    let Some((pct, p, kind)) = projection else {
         return;
     };
     let from = axes.pos(now, pct);
     let to = axes.pos(p.end_t, p.end_pct);
     // The end label ("cap 4:10p" by the ✕, or "safe"), placed off the line
     // inside the widget; the dash stops short of it if it must.
-    let label = if let Some(cap) = p.cap_at {
-        Some((
+    let label = kind.map(|k| match k {
+        EndLabel::Cap(cap) => (
             format!("cap {}", short_time_in(cap, &Local)),
             palette.danger,
-            CAP_MARK + 2.0,
-        ))
-    } else if p.end_t > now {
-        Some(("safe".to_owned(), palette.good, 4.0))
-    } else {
-        None
-    };
+            CAP_LABEL_CLEARANCE,
+            CAP_KEEP_OUT,
+        ),
+        EndLabel::Safe => (
+            "safe".to_owned(),
+            palette.good,
+            SAFE_LABEL_CLEARANCE,
+            SAFE_KEEP_OUT,
+        ),
+    });
     let bounds = Rect::from_min_max(
         pos2(axes.plot.left(), painter.clip_rect().top()),
         pos2(painter.clip_rect().right(), axes.plot.bottom()),
     );
-    let placed = label.map(|(text, color, clearance)| {
+    let placed = label.map(|(text, color, clearance, keep_out)| {
         let galley = painter.layout_no_wrap(text, font.clone(), color);
-        let rect = place_end_label(from, to, galley.size(), clearance, bounds);
+        let rect = place_end_label(from, to, galley.size(), clearance, keep_out, bounds);
         (galley, rect, color)
     });
     let stop = placed
@@ -737,7 +831,7 @@ fn paint_now(
         .map_or(to, |(_, rect, _)| dash_end(from, to, *rect));
     paint_dashed(painter, from, stop, Stroke::new(1.5, state));
 
-    if p.cap_at.is_some() {
+    if matches!(kind, Some(EndLabel::Cap(_))) {
         let stroke = Stroke::new(2.0, palette.danger);
         let (a, b) = (vec2(CAP_MARK, CAP_MARK), vec2(CAP_MARK, -CAP_MARK));
         painter.line_segment([to - a, to + a], stroke);
@@ -1175,7 +1269,7 @@ mod tests {
     #[test]
     fn end_label_above_left_of_a_rising_line() {
         let bounds = rect(0.0, 0.0, 200.0, 120.0);
-        let got = place_end_label(pos2(0.0, 100.0), pos2(100.0, 40.0), LABEL, 4.0, bounds);
+        let got = place_end_label(pos2(0.0, 100.0), pos2(100.0, 40.0), LABEL, 4.0, 2.0, bounds);
         assert_eq!(got, rect(70.0, 26.0, 100.0, 36.0));
     }
 
@@ -1183,7 +1277,7 @@ mod tests {
     fn end_label_above_right_when_the_top_is_tight() {
         let bounds = rect(0.0, 0.0, 200.0, 120.0);
         let (from, end) = (pos2(0.0, 100.0), pos2(100.0, 8.0));
-        let got = place_end_label(from, end, LABEL, 4.0, bounds);
+        let got = place_end_label(from, end, LABEL, 4.0, 2.0, bounds);
         assert_eq!(got, rect(104.0, 0.0, 134.0, 10.0));
         assert_eq!(segment_entry(from, end, got.expand(LABEL_PAD)), None);
     }
@@ -1192,23 +1286,81 @@ mod tests {
     fn end_label_flat_line_sits_above_it() {
         let bounds = rect(0.0, 0.0, 102.0, 120.0);
         let (from, end) = (pos2(50.0, 60.0), pos2(100.0, 60.0));
-        let got = place_end_label(from, end, LABEL, 4.0, bounds);
+        let got = place_end_label(from, end, LABEL, 4.0, 2.0, bounds);
         assert_eq!(got, rect(70.0, 46.0, 100.0, 56.0));
     }
 
+    /// Real proportions: the cap point sits on the 100% line, 11.5 pt
+    /// under the widget top; "cap 6:08p" is about 60 x 14.
+    fn assert_cap_label_clear(bounds: Rect, end: Pos2, slope: f32) {
+        let size = vec2(60.0, 14.0);
+        let dx = (200.0_f32).min((bounds.bottom() - 2.0 - end.y) / slope);
+        let from = pos2(end.x - dx, end.y + slope * dx);
+        let got = place_end_label(from, end, size, CAP_LABEL_CLEARANCE, CAP_KEEP_OUT, bounds);
+        let case = format!("end {end:?} slope {slope} -> {got:?}");
+        assert!(bounds.contains_rect(got), "outside: {case}");
+        let keep = Rect::from_center_size(end, Vec2::splat(2.0 * CAP_KEEP_OUT));
+        assert!(
+            !overlaps(got.expand(LABEL_PAD), keep),
+            "covers the cap mark: {case}"
+        );
+        assert_eq!(
+            segment_entry(from, end, got.expand(LABEL_PAD)),
+            None,
+            "on the line: {case}"
+        );
+    }
+
     #[test]
-    fn end_label_cornered_stays_inside_and_the_dash_stops_short() {
-        // Narrow and near the top: every spot touches the line.
-        let bounds = rect(0.0, 0.0, 102.0, 120.0);
-        let (from, end) = (pos2(0.0, 100.0), pos2(100.0, 8.0));
-        let got = place_end_label(from, end, LABEL, 4.0, bounds);
-        assert!(bounds.contains_rect(got), "{got:?}");
-        assert_eq!(got, rect(70.0, 0.0, 100.0, 10.0));
+    fn cap_label_never_covers_the_mark_or_the_line() {
+        for right in [360.0, 300.0] {
+            let bounds = rect(40.0, 0.0, right, 150.0);
+            let plot_right = right - CAP_MARK - 2.0;
+            for back in [0.0, 10.0, 20.0, 30.0, 40.0, 150.0] {
+                for slope in [0.1, 0.25, 0.5, 1.0, 1.5, 2.0] {
+                    assert_cap_label_clear(bounds, pos2(plot_right - back, 11.5), slope);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn end_label_cornered_falls_back_clear_of_the_mark() {
+        // A widget too small for any clear spot: the label still avoids the
+        // mark, and the dash stops short of the label.
+        let bounds = rect(0.0, 0.0, 70.0, 40.0);
+        let (from, end) = (pos2(0.0, 30.0), pos2(64.0, 11.5));
+        let got = place_end_label(from, end, vec2(60.0, 14.0), 8.0, 5.0, bounds);
+        let keep = Rect::from_center_size(end, Vec2::splat(10.0));
+        assert!(!overlaps(got.expand(LABEL_PAD), keep), "{got:?}");
         let stop = dash_end(from, end, got);
-        assert!(!got.expand(LABEL_PAD).contains(stop), "{stop:?}");
-        assert!(stop.x < 96.0 && stop.x > 90.0, "{stop:?}");
-        // The line, cut there, misses the padded label.
         assert_eq!(segment_entry(from, stop, got.expand(LABEL_PAD)), None);
+    }
+
+    #[test]
+    fn end_labels_need_a_known_reset() {
+        let now = t0();
+        let cap = Projection {
+            end_t: now + Duration::minutes(30),
+            end_pct: 100.0,
+            cap_at: Some(now + Duration::minutes(30)),
+        };
+        let safe = Projection {
+            end_t: now + Duration::minutes(90),
+            end_pct: 80.0,
+            cap_at: None,
+        };
+        assert_eq!(end_label(true, &cap, now), Some(EndLabel::Cap(cap.end_t)));
+        assert_eq!(end_label(true, &safe, now), Some(EndLabel::Safe));
+        assert_eq!(end_label(false, &cap, now), None);
+        assert_eq!(end_label(false, &safe, now), None);
+        // A zero-length line (window over) gets no label.
+        let over = Projection {
+            end_t: now,
+            end_pct: 50.0,
+            cap_at: None,
+        };
+        assert_eq!(end_label(true, &over, now), None);
     }
 
     #[test]
