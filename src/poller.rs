@@ -8,9 +8,11 @@
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 
@@ -41,6 +43,9 @@ pub struct Dashboard {
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     pub burners: Vec<InstanceUsage>,
     pub window_start: DateTime<Utc>,
+    /// Saving this poll to history.jsonl failed; the data above is still
+    /// fresh. Shown as a warning.
+    pub persist_error: Option<String>,
 }
 
 /// Control messages into the poller thread.
@@ -191,9 +196,16 @@ pub fn poll_once(
 ) -> Result<Dashboard, FetchError> {
     let snap = source.fetch(paths, settings)?;
     history.record(&snap);
-    // A disk problem must not hide fresh data; the next append retries.
-    let _ = storage::append_snapshot(paths, &snap);
-    Ok(build_dashboard(snap, history, paths, dirs, Utc::now()))
+    // A disk problem must not hide fresh data: report it alongside.
+    let persist_error = storage::append_snapshot(paths, &snap).err().map(|e| {
+        format!(
+            "couldn't save history to {}: {e}",
+            paths.history_file().display()
+        )
+    });
+    let mut dashboard = build_dashboard(snap, history, paths, dirs, Utc::now());
+    dashboard.persist_error = persist_error;
+    Ok(dashboard)
 }
 
 fn build_dashboard(
@@ -213,14 +225,26 @@ fn build_dashboard(
         fable_daily: storage::fable_daily_history(paths, DAILY_DAYS, now),
         burners: storage::attribute_recent(&dirs.claude_code, &dirs.cowork, ws),
         window_start: ws,
+        persist_error: None,
         snapshot,
     }
+}
+
+/// State shared between the [`Poller`] handle and its thread.
+#[derive(Default)]
+struct Flags {
+    /// Set by `Drop` before it sends `Shutdown`.
+    shutdown: AtomicBool,
+    /// True while the thread is polling (fetch, persist, send, notify), false
+    /// while it waits for the next tick or message.
+    busy: AtomicBool,
 }
 
 /// Handle to the background poller thread. Dropping it shuts the thread down.
 pub struct Poller {
     control: Sender<PollMsg>,
     events: Receiver<PollEvent>,
+    flags: Arc<Flags>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -247,23 +271,26 @@ impl Poller {
     ) -> Self {
         let (control, control_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
+        let flags = Arc::new(Flags::default());
+        let thread_flags = Arc::clone(&flags);
         let handle = thread::Builder::new()
             .name("usage-poller".into())
             .spawn(move || {
-                run(
-                    source,
+                let ctx = LoopCtx {
                     paths,
                     dirs,
-                    settings,
                     notify,
-                    &control_rx,
-                    &events_tx,
-                )
+                    control: control_rx,
+                    events: events_tx,
+                    flags: thread_flags,
+                };
+                run(source, settings, &ctx);
             })
             .expect("spawning poller thread");
         Self {
             control,
             events,
+            flags,
             handle: Some(handle),
         }
     }
@@ -277,51 +304,121 @@ impl Poller {
     pub fn send(&self, msg: PollMsg) {
         let _ = self.control.send(msg);
     }
+
+    /// False once the poller thread has exited (after `Shutdown`, or if it
+    /// died), so the UI can show "poller stopped" instead of idling.
+    pub fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
 }
 
 impl Drop for Poller {
+    /// Never blocks for a poll. If the thread is waiting, `Shutdown` wakes it
+    /// and the join is immediate. If it is mid-poll, the thread is detached:
+    /// it finishes the in-flight request (bounded by the 15 s HTTP timeout),
+    /// sees the shutdown flag, and exits without sending its event.
     fn drop(&mut self) {
+        self.flags.shutdown.store(true, Ordering::SeqCst);
         let _ = self.control.send(PollMsg::Shutdown);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            // SeqCst pairs with `run`: if `busy` reads false here, the
+            // thread's next `busy = true` is ordered after our `shutdown =
+            // true`, so it sees the flag and exits before polling.
+            if !self.flags.busy.load(Ordering::SeqCst) {
+                let _ = handle.join();
+            }
         }
     }
 }
 
-fn run(
-    mut source: impl UsageSource,
+/// Everything the loop needs besides the source and current settings.
+struct LoopCtx<N> {
     paths: Paths,
     dirs: SessionDirs,
-    mut settings: Settings,
-    notify: impl Fn(),
-    control: &Receiver<PollMsg>,
-    events: &Sender<PollEvent>,
-) {
-    let mut history = BurnHistory::seeded(&paths, Utc::now());
+    notify: N,
+    control: Receiver<PollMsg>,
+    events: Sender<PollEvent>,
+    flags: Arc<Flags>,
+}
+
+fn run(mut source: impl UsageSource, mut settings: Settings, ctx: &LoopCtx<impl Fn()>) {
+    let flags = &ctx.flags;
+    let mut history = catch_unwind(AssertUnwindSafe(|| {
+        BurnHistory::seeded(&ctx.paths, Utc::now())
+    }))
+    .unwrap_or_default();
     loop {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            poll_once(&mut source, &paths, &dirs, &settings, &mut history)
-        }));
-        let event = match result {
-            Ok(Ok(dashboard)) => PollEvent::Ok(Box::new(dashboard)),
-            Ok(Err(e)) => PollEvent::Err(FetchErrorInfo::from(&e)),
-            Err(panic) => PollEvent::Err(FetchErrorInfo {
-                message: format!("internal error during poll: {}", panic_message(&*panic)),
-                stale_sha_hint: false,
-            }),
-        };
-        if events.send(event).is_err() {
+        flags.busy.store(true, Ordering::SeqCst);
+        if flags.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        notify();
+        let event = poll_event(&mut source, ctx, &settings, &mut history);
+        if flags.shutdown.load(Ordering::SeqCst) || ctx.events.send(event).is_err() {
+            return;
+        }
+        let _ = catch_unwind(AssertUnwindSafe(&ctx.notify));
+        flags.busy.store(false, Ordering::SeqCst);
 
-        let deadline = Instant::now() + poll_interval(&settings);
-        match control.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(PollMsg::RefreshNow) | Err(RecvTimeoutError::Timeout) => {}
-            Ok(PollMsg::UpdateSettings(s)) => settings = s,
-            Ok(PollMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+        let first = match ctx.control.recv_timeout(poll_interval(&settings)) {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        match drain(first, &ctx.control) {
+            Wake::Exit => return,
+            Wake::Poll(Some(new)) => settings = new,
+            Wake::Poll(None) => {}
         }
     }
+}
+
+/// One poll as an event; a panic becomes an error event.
+fn poll_event(
+    source: &mut impl UsageSource,
+    ctx: &LoopCtx<impl Fn()>,
+    settings: &Settings,
+    history: &mut BurnHistory,
+) -> PollEvent {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        poll_once(source, &ctx.paths, &ctx.dirs, settings, history)
+    }));
+    match result {
+        Ok(Ok(dashboard)) => PollEvent::Ok(Box::new(dashboard)),
+        Ok(Err(e)) => PollEvent::Err(FetchErrorInfo::from(&e)),
+        Err(panic) => PollEvent::Err(FetchErrorInfo {
+            message: format!("internal error during poll: {}", panic_message(&*panic)),
+            stale_sha_hint: false,
+        }),
+    }
+}
+
+/// What to do after waking on a control message.
+#[derive(Debug, PartialEq)]
+enum Wake {
+    Exit,
+    /// Poll once, with replacement settings if any arrived.
+    Poll(Option<Settings>),
+}
+
+/// Fold `first` and every message already queued into one decision: any
+/// `Shutdown` (or a disconnected channel) exits, the last `UpdateSettings`
+/// wins, and any number of refreshes become a single poll.
+fn drain(first: PollMsg, control: &Receiver<PollMsg>) -> Wake {
+    let mut settings = None;
+    let mut next = Some(first);
+    while let Some(msg) = next {
+        match msg {
+            PollMsg::Shutdown => return Wake::Exit,
+            PollMsg::UpdateSettings(s) => settings = Some(s),
+            PollMsg::RefreshNow => {}
+        }
+        next = match control.try_recv() {
+            Ok(msg) => Some(msg),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => return Wake::Exit,
+        };
+    }
+    Wake::Poll(settings)
 }
 
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
@@ -338,7 +435,8 @@ mod tests {
     use crate::model::UsageWindow;
     use chrono::TimeZone;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
+    use std::time::Instant;
 
     const WAIT: Duration = Duration::from_secs(1);
 
@@ -643,6 +741,7 @@ mod tests {
         assert_eq!(d.daily_history.len(), DAILY_DAYS);
         assert_eq!(d.fable_daily.len(), DAILY_DAYS);
         assert!(d.burners.is_empty());
+        assert_eq!(d.persist_error, None);
         // The just-appended sample lands in the current 30-minute bucket.
         assert!(d.five_hour_buckets.iter().any(|(_, v)| *v == Some(42.0)));
     }
@@ -655,5 +754,232 @@ mod tests {
         let info = FetchErrorInfo::from(&e);
         assert!(info.stale_sha_hint);
         assert!(info.message.starts_with("403 — auth or Cloudflare: "));
+    }
+
+    #[test]
+    fn drain_coalesces_and_prioritizes_shutdown() {
+        let plan = |p: &str| Settings {
+            plan: p.into(),
+            ..Settings::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..3 {
+            tx.send(PollMsg::RefreshNow).unwrap();
+        }
+        assert_eq!(drain(PollMsg::RefreshNow, &rx), Wake::Poll(None));
+        assert!(rx.try_recv().is_err(), "queue drained");
+
+        tx.send(PollMsg::UpdateSettings(plan("A"))).unwrap();
+        tx.send(PollMsg::RefreshNow).unwrap();
+        tx.send(PollMsg::UpdateSettings(plan("B"))).unwrap();
+        assert_eq!(drain(PollMsg::RefreshNow, &rx), Wake::Poll(Some(plan("B"))));
+
+        tx.send(PollMsg::Shutdown).unwrap();
+        tx.send(PollMsg::RefreshNow).unwrap();
+        assert_eq!(drain(PollMsg::UpdateSettings(plan("C")), &rx), Wake::Exit);
+
+        drop(tx);
+        assert_eq!(drain(PollMsg::RefreshNow, &rx), Wake::Exit);
+    }
+
+    /// Each fetch signals `started`, then blocks until `gate` yields a token.
+    struct GatedSource {
+        started: Sender<()>,
+        gate: Receiver<()>,
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl UsageSource for GatedSource {
+        fn fetch(&mut self, _: &Paths, _: &Settings) -> Result<Snapshot, FetchError> {
+            *self.calls.lock().unwrap() += 1;
+            let _ = self.started.send(());
+            let _ = self.gate.recv_timeout(Duration::from_secs(5));
+            Ok(snap(Utc::now(), Some(1.0), None))
+        }
+    }
+
+    struct GatedRig {
+        poller: Poller,
+        started: Receiver<()>,
+        gate: Sender<()>,
+        calls: Arc<Mutex<u32>>,
+        notified: Receiver<()>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl GatedRig {
+        fn start() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let (started_tx, started) = mpsc::channel();
+            let (gate, gate_rx) = mpsc::channel();
+            let calls = Arc::new(Mutex::new(0));
+            let (notify_tx, notified) = mpsc::channel();
+            let poller = Poller::spawn_with(
+                GatedSource {
+                    started: started_tx,
+                    gate: gate_rx,
+                    calls: Arc::clone(&calls),
+                },
+                Paths::with_data_dir(tmp.path().join("data")),
+                SessionDirs {
+                    claude_code: tmp.path().join("cc"),
+                    cowork: tmp.path().join("cw"),
+                },
+                Settings::default(),
+                move || {
+                    let _ = notify_tx.send(());
+                },
+            );
+            Self {
+                poller,
+                started,
+                gate,
+                calls,
+                notified,
+                _tmp: tmp,
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+
+        fn wait_started(&self) {
+            self.started.recv_timeout(WAIT).expect("fetch started");
+        }
+
+        fn release(&self) {
+            self.gate.send(()).unwrap();
+        }
+
+        fn wait_event(&self) {
+            self.notified.recv_timeout(WAIT).expect("event");
+        }
+
+        fn wait_dead(&self) {
+            let deadline = Instant::now() + WAIT;
+            while self.poller.is_alive() {
+                assert!(Instant::now() < deadline, "poller still alive");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn queued_refreshes_coalesce_into_one_poll() {
+        let rig = GatedRig::start();
+        rig.wait_started();
+        for _ in 0..5 {
+            rig.poller.send(PollMsg::RefreshNow);
+        }
+        rig.release();
+        rig.wait_event();
+        rig.wait_started();
+        rig.release();
+        rig.wait_event();
+        // No third poll: the five refreshes folded into one.
+        assert!(rig
+            .started
+            .recv_timeout(Duration::from_millis(200))
+            .is_err());
+        assert_eq!(rig.calls(), 2);
+    }
+
+    #[test]
+    fn queued_refreshes_then_shutdown_exit_without_polling() {
+        let rig = GatedRig::start();
+        rig.wait_started();
+        for _ in 0..5 {
+            rig.poller.send(PollMsg::RefreshNow);
+        }
+        rig.poller.send(PollMsg::Shutdown);
+        rig.release();
+        rig.wait_dead();
+        assert_eq!(rig.calls(), 1);
+        let started = Instant::now();
+        drop(rig.poller);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn drop_during_blocked_fetch_returns_promptly() {
+        let rig = GatedRig::start();
+        rig.wait_started();
+        let started = Instant::now();
+        drop(rig.poller);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // Let the detached thread finish; it must not poll again.
+        rig.gate.send(()).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(*rig.calls.lock().unwrap(), 1);
+        assert!(rig.notified.try_recv().is_err(), "no event after shutdown");
+    }
+
+    #[test]
+    fn is_alive_until_shutdown() {
+        let rig = Rig::start(vec![]);
+        rig.next();
+        assert!(rig.poller.is_alive());
+        rig.poller.send(PollMsg::Shutdown);
+        let deadline = Instant::now() + WAIT;
+        while rig.poller.is_alive() {
+            assert!(Instant::now() < deadline, "poller still alive");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn panicking_notify_does_not_kill_poller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let poller = Poller::spawn_with(
+            FakeSource::new(vec![Ok(1.0), Ok(2.0)]),
+            Paths::with_data_dir(tmp.path().join("data")),
+            SessionDirs {
+                claude_code: tmp.path().join("cc"),
+                cowork: tmp.path().join("cw"),
+            },
+            Settings::default(),
+            || panic!("notify failed"),
+        );
+        let wait_event = || {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                if let Some(e) = poller.try_recv() {
+                    return e;
+                }
+                assert!(Instant::now() < deadline, "no event");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert_eq!(ok_pct(wait_event()), 1.0);
+        poller.send(PollMsg::RefreshNow);
+        assert_eq!(ok_pct(wait_event()), 2.0);
+        assert!(poller.is_alive());
+    }
+
+    #[test]
+    fn persist_failure_is_reported_with_fresh_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A regular file where the data directory should be.
+        let blocker = tmp.path().join("data");
+        fs::write(&blocker, b"not a dir").unwrap();
+        let paths = Paths::with_data_dir(blocker);
+        let dirs = SessionDirs {
+            claude_code: tmp.path().join("cc"),
+            cowork: tmp.path().join("cw"),
+        };
+        let mut source = FakeSource::new(vec![Ok(7.0)]);
+        let d = poll_once(
+            &mut source,
+            &paths,
+            &dirs,
+            &Settings::default(),
+            &mut BurnHistory::default(),
+        )
+        .unwrap();
+        assert_eq!(d.snapshot.five_hour_pct(), Some(7.0));
+        let msg = d.persist_error.expect("persist error");
+        assert!(msg.starts_with("couldn't save history to "), "{msg}");
+        assert!(msg.contains("history.jsonl"), "{msg}");
     }
 }
