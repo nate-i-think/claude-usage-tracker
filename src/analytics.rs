@@ -1,6 +1,7 @@
 //! Dashboard analytics: burn rate, reset detection, cap ETA, projected use,
 //! color levels, countdown formatting, Fable chart ceilings, and the row
-//! rules of the dashboard.
+//! rules of the dashboard. Submodules: the hero timeline (pace, projection,
+//! Fable layer), project-name prettifying, and threshold [`alerts`].
 //!
 //! Ported from the math in the Python ui.py (removed; see git history),
 //! separated from its Rich rendering. Pure: no I/O, no egui. Wherever
@@ -199,7 +200,7 @@ impl Eta {
 /// Minutes until 100% from `pct` at `rate` %/min, or `None` when the pace
 /// counts as steady: rate <= 0.01 %/min, or already at or over 100%. The
 /// single source of the "steady" rule for [`burn_line`] and [`projection`].
-pub(crate) fn minutes_to_cap(pct: f64, rate: f64) -> Option<f64> {
+fn minutes_to_cap(pct: f64, rate: f64) -> Option<f64> {
     if rate <= 0.01 || pct >= 100.0 {
         None
     } else {
@@ -209,7 +210,7 @@ pub(crate) fn minutes_to_cap(pct: f64, rate: f64) -> Option<f64> {
 
 /// Whether a cap `minutes` from `now` lands strictly after `reset`. A cap
 /// exactly at the reset counts as hitting the cap first.
-pub(crate) fn lands_after(minutes: f64, now: DateTime<Utc>, reset: DateTime<Utc>) -> bool {
+fn lands_after(minutes: f64, now: DateTime<Utc>, reset: DateTime<Utc>) -> bool {
     minutes > minutes_between(now, reset)
 }
 
