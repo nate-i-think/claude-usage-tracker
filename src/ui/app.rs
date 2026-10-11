@@ -13,12 +13,14 @@ use eframe::egui::{
     self, style::ScrollStyle, Align, CentralPanel, Frame, Margin, RichText, ScrollArea, Ui,
 };
 
-use crate::config::{Settings, UiMode};
+use crate::config::{Pos, Settings, UiMode};
 use crate::paths::Paths;
 use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
 
 use super::banners::{banner, BannerKind};
 use super::layout::{self, right_then_left, GAP};
+use super::mode::{self, Settle, SettleStep};
+use super::pill::{self, PillAction, PillState};
 use super::settings::{self, PanelAction, SettingsPanel};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
 use super::{chips, details, footer, motion, theme, timeline};
@@ -97,6 +99,12 @@ pub struct App {
     /// The full-mode window as of the last pass that showed it; saved into
     /// [`Settings::full_rect`] / [`Settings::full_maximized`] by `save()`.
     tracked: TrackedWindow,
+    /// The pill position as of the last pass that showed it; saved into
+    /// [`Settings::pill_pos`] when leaving the pill and by `save()`.
+    pill_seen: Option<Pos>,
+    /// Passes since the last full/pill switch (see [`mode::Settle`]).
+    settle: Settle,
+    pill: PillState,
     /// eframe's stale window key has been dropped from storage (first pass).
     storage_cleaned: bool,
     state: PollState,
@@ -112,10 +120,12 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let settings: Settings = cc
+        let mut settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
             .unwrap_or_default();
+        // The window was built for this mode ("Start in pill mode" wins).
+        settings.ui_mode = window::startup_mode(&settings);
         let ctx = cc.egui_ctx.clone();
         // Dark by default; afterwards egui restores the persisted preference.
         if first_run(cc.storage) {
@@ -126,10 +136,14 @@ impl App {
         // (window::viewport_builder); on Windows the saved position and
         // maximized state are applied here, while the window is hidden.
         #[cfg(windows)]
-        window::apply_placement(
-            cc,
-            window::startup_placement(&settings, ctx.pixels_per_point()),
-        );
+        {
+            window::apply_placement(
+                cc,
+                window::startup_placement(&settings, ctx.pixels_per_point()),
+            );
+            // Rounds the borderless pill; decorated windows already are.
+            window::round_corners(cc);
+        }
         let notify_ctx = ctx.clone();
         let poller = Poller::spawn(Paths::platform_default(), settings.clone(), move || {
             notify_ctx.request_repaint()
@@ -140,6 +154,9 @@ impl App {
             persisted: settings.clone(),
             settings,
             tracked: TrackedWindow::default(),
+            pill_seen: None,
+            settle: Settle::default(),
+            pill: PillState::default(),
             storage_cleaned: false,
             state: PollState::default(),
             settings_panel: None,
@@ -156,16 +173,59 @@ impl App {
     }
 
     /// Remember the window rect for the current mode while egui reports one
-    /// (not while minimized or hidden).
-    fn track_window(&mut self, ctx: &egui::Context) {
-        match self.settings.ui_mode {
-            UiMode::Full => {
-                let zoom = ctx.zoom_factor();
-                ctx.input(|i| self.tracked.observe(i.viewport(), zoom));
+    /// (not while minimized or hidden). Right after a switch the old mode's
+    /// geometry is skipped, then the window is kept on a monitor once.
+    fn track_window(&mut self, ctx: &egui::Context, _frame: &eframe::Frame) {
+        let zoom = ctx.zoom_factor();
+        match self.settle.step() {
+            SettleStep::Skip => {}
+            SettleStep::Fixup => {
+                #[cfg(windows)]
+                window::keep_on_screen(_frame);
+                ctx.request_repaint();
             }
-            // Task 8 tracks the pill position here.
-            UiMode::Pill => {}
+            SettleStep::Track => match self.settings.ui_mode {
+                UiMode::Full => ctx.input(|i| self.tracked.observe(i.viewport(), zoom)),
+                UiMode::Pill => {
+                    if let Some(p) = ctx.input(|i| window::pill_pos_of(i.viewport(), zoom)) {
+                        self.pill_seen = Some(p);
+                    }
+                }
+            },
         }
+    }
+
+    /// Switch the window to `to` (full dashboard or pill), recording the
+    /// geometry of the mode being left. The header button, the pill and the
+    /// tray menu all come through here.
+    pub fn set_mode(&mut self, ctx: &egui::Context, to: UiMode) {
+        let cmds = mode::switch(
+            &mut self.settings,
+            to,
+            &self.tracked,
+            self.pill_seen,
+            ctx.pixels_per_point(),
+        );
+        if cmds.is_empty() {
+            return;
+        }
+        for cmd in cmds {
+            ctx.send_viewport_cmd(cmd);
+        }
+        self.settle.start();
+        self.pill.menu_open = false;
+        ctx.request_repaint();
+    }
+
+    /// Full ↔ pill.
+    pub fn toggle_mode(&mut self, ctx: &egui::Context) {
+        self.set_mode(ctx, mode::other(self.settings.ui_mode));
+    }
+
+    /// Ask for a poll now (the refresh button and the pill's menu).
+    fn refresh_now(&mut self) {
+        self.poller.send(PollMsg::RefreshNow);
+        self.last_refresh = Some(Instant::now());
     }
 
     /// Hand settings changes (from the panel, the pin, later the tray) to
@@ -239,17 +299,19 @@ impl App {
                 {
                     self.toggle_settings();
                 }
-                // Task 8 wires pill mode; until then the button is a stub.
-                icon_button(ui, false, false, "◱")
-                    .on_disabled_hover_text("Compact pill mode — coming soon");
+                if icon_button(ui, false, true, "◱")
+                    .on_hover_text("Compact pill (click it to come back)")
+                    .clicked()
+                {
+                    self.set_mode(ui.ctx(), UiMode::Pill);
+                }
                 let ready = refresh_ready(self.last_refresh, Instant::now());
                 if icon_button(ui, false, ready, "⟳")
                     .on_hover_text("Refresh now")
                     .on_disabled_hover_text("Refreshed just now")
                     .clicked()
                 {
-                    self.poller.send(PollMsg::RefreshNow);
-                    self.last_refresh = Some(Instant::now());
+                    self.refresh_now();
                 }
             },
             |ui| {
@@ -284,6 +346,40 @@ impl App {
                 self.settings_panel = None;
                 ui.ctx().request_repaint();
             }
+        }
+    }
+
+    /// The pill view, filling the window; acts on what it asks for.
+    fn pill_ui(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let palette = theme::Palette::for_visuals(ui.visuals());
+        let now = Utc::now();
+        let chips = self
+            .state
+            .data
+            .as_ref()
+            .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now))
+            .unwrap_or_default();
+        let failed = self.state.error.is_some() || !self.poller.is_alive();
+        let ready = refresh_ready(self.last_refresh, Instant::now());
+        let frame = Frame::NONE.fill(palette.surface);
+        let action = CentralPanel::default()
+            .frame(frame)
+            .show(ui, |ui| {
+                pill::show_pill(ui, &mut self.pill, &chips, failed, self.pulse.level, ready)
+            })
+            .inner;
+        match action {
+            PillAction::None => {}
+            PillAction::Expand => self.set_mode(&ctx, UiMode::Full),
+            PillAction::Refresh => self.refresh_now(),
+            PillAction::Settings => {
+                self.set_mode(&ctx, UiMode::Full);
+                if self.settings_panel.is_none() {
+                    self.toggle_settings();
+                }
+            }
+            PillAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 
@@ -381,7 +477,7 @@ fn content_column(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = Instant::now();
-        self.track_window(ctx);
+        self.track_window(ctx, frame);
         self.drain_events();
         self.sync_settings(frame);
         self.background_hooks(now);
@@ -392,6 +488,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.update_motion(ui.ctx());
+        if self.settings.ui_mode == UiMode::Pill {
+            self.pill_ui(ui);
+            return;
+        }
         let frame = Frame::central_panel(ui.style()).inner_margin(Margin::same(layout::OUTER_PAD));
         CentralPanel::default().frame(frame).show(ui, |ui| {
             // A solid scrollbar takes its own space instead of overlaying
@@ -413,6 +513,8 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         (self.settings.full_rect, self.settings.full_maximized) =
             window::full_state_to_save(self.settings.ui_mode, &self.tracked, &self.settings);
+        self.settings.pill_pos =
+            window::pill_pos_to_save(self.settings.ui_mode, self.pill_seen, &self.settings);
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
         self.persisted = self.settings.clone();
     }
