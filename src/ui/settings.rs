@@ -73,7 +73,7 @@ pub fn check_interval(text: &str) -> IntervalCheck {
             used: MIN_INTERVAL_SECS,
         },
         Ok(secs) => IntervalCheck::Ok(secs),
-        Err(e) => IntervalCheck::Invalid(format!("{e:#}; use e.g. 30, 30s, 2m, 1h")),
+        Err(e) => IntervalCheck::Invalid(format!("{e}; use e.g. 30, 30s, 2m, 1h")),
     }
 }
 
