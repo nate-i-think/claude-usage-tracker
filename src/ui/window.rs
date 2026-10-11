@@ -409,9 +409,34 @@ pub fn apply_placement(cc: &eframe::CreationContext<'_>, placement: Placement) {
     }
 }
 
+/// Ask Windows 11 to round the window's corners (the borderless pill has
+/// none otherwise). The preference survives later style changes, so once
+/// at startup is enough. Harmless where unsupported.
+#[cfg(windows)]
+pub fn round_corners(h: &impl raw_window_handle::HasWindowHandle) {
+    if let Some(hwnd) = hwnd_of(h) {
+        win32::round_corners(hwnd);
+    }
+}
+
+/// Pull the window back onto a monitor's work area if it is off screen
+/// (after a full/pill switch to a position saved on a monitor that is gone).
+#[cfg(windows)]
+pub fn keep_on_screen(frame: &eframe::Frame) {
+    let Some(hwnd) = hwnd_of(frame) else { return };
+    if let Some(at) = win32::current_pos(hwnd) {
+        if let Some(target) = win32::visible_target(hwnd, at).filter(|t| *t != at) {
+            win32::move_to(hwnd, target);
+        }
+    }
+}
+
 #[cfg(windows)]
 mod win32 {
     use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
     use windows_sys::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
@@ -483,6 +508,35 @@ mod win32 {
                 pos
             })
         }
+    }
+
+    pub(super) fn round_corners(hwnd: HWND) {
+        let pref = DWMWCP_ROUND;
+        // SAFETY: hwnd is our live top-level window; the attribute is a
+        // DWM_WINDOW_CORNER_PREFERENCE (i32) passed by pointer with its size.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                &pref as *const _ as *const core::ffi::c_void,
+                std::mem::size_of_val(&pref) as u32,
+            )
+        };
+    }
+
+    /// The window's outer top-left now.
+    pub(super) fn current_pos(hwnd: HWND) -> Option<Pos> {
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: hwnd is our live top-level window; r is a local RECT.
+        (unsafe { GetWindowRect(hwnd, &mut r) } != 0).then_some(Pos {
+            x: r.left,
+            y: r.top,
+        })
     }
 
     pub(super) fn move_to(hwnd: HWND, pos: Pos) {
