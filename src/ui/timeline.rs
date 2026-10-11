@@ -20,7 +20,7 @@ use chrono::{DateTime, Duration, Local, TimeZone, Timelike, Utc};
 use eframe::egui::{
     epaint::{Mesh, PathStroke},
     pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
-    TextStyle, Ui,
+    TextStyle, Ui, Vec2,
 };
 
 use crate::analytics::{self, alerts::fmt_clock_in, Projection, WindowSample};
@@ -394,10 +394,91 @@ pub fn hover_target(
     }
 }
 
-/// Left edge for a label `width` wide centered on `center`, kept inside
-/// `left..right` (pinned left when it doesn't fit).
-pub fn label_left(center: f32, width: f32, left: f32, right: f32) -> f32 {
-    (center - width / 2.0).min(right - width).max(left)
+/// Padding of the end label's backing pad around its text.
+pub const LABEL_PAD: f32 = 2.0;
+
+/// Where the segment `a`→`b` first touches `rect`, as a fraction of the
+/// way from `a` (0 when `a` is inside), or `None` when it misses.
+pub fn segment_entry(a: Pos2, b: Pos2, rect: Rect) -> Option<f32> {
+    // Liang–Barsky: clip the parameter range 0..=1 against each slab.
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0_f32, 1.0_f32);
+    for (p, q) in [
+        (-d.x, a.x - rect.left()),
+        (d.x, rect.right() - a.x),
+        (-d.y, a.y - rect.top()),
+        (d.y, rect.bottom() - a.y),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None; // parallel to and outside this slab
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+        }
+    }
+    (t0 <= t1 && d != Vec2::ZERO).then_some(t0)
+}
+
+/// `rect` moved (not resized) to lie inside `bounds` where it fits.
+fn shift_inside(rect: Rect, bounds: Rect) -> Rect {
+    let dx = (bounds.left() - rect.left()).max(0.0) + (bounds.right() - rect.right()).min(0.0);
+    let dy = (bounds.top() - rect.top()).max(0.0) + (bounds.bottom() - rect.bottom()).min(0.0);
+    let moved = rect.translate(vec2(dx, dy));
+    // Wider or taller than the bounds: pin to the left/top edge.
+    let x = if moved.width() > bounds.width() {
+        bounds.left() - moved.left()
+    } else {
+        0.0
+    };
+    let y = if moved.height() > bounds.height() {
+        bounds.top() - moved.top()
+    } else {
+        0.0
+    };
+    moved.translate(vec2(x, y))
+}
+
+/// The end label's rect, `size` big, for the projection `from`→`end`,
+/// kept `clearance` away from the end point (the ✕'s arm, or a small gap)
+/// and inside `bounds`. Tries above-left, above-right, below-right, left,
+/// then below-left of the end point and takes the first whose padded rect
+/// the line misses; when none does, above-left (and the dash stops short
+/// of it, see [`dash_end`]).
+pub fn place_end_label(from: Pos2, end: Pos2, size: Vec2, clearance: f32, bounds: Rect) -> Rect {
+    let c = clearance;
+    let at = |min: Pos2| shift_inside(Rect::from_min_size(min, size), bounds);
+    let above_left = at(pos2(end.x - size.x, end.y - c - size.y));
+    let candidates = [
+        above_left,
+        at(pos2(end.x + c, end.y - c - size.y)),
+        at(pos2(end.x + c, end.y + c)),
+        at(pos2(end.x - c - size.x, end.y - size.y / 2.0)),
+        at(pos2(end.x - size.x, end.y + c)),
+    ];
+    candidates
+        .into_iter()
+        .find(|r| segment_entry(from, end, r.expand(LABEL_PAD)).is_none())
+        .unwrap_or(above_left)
+}
+
+/// Where the dashed projection stops: at `end`, or just before it would
+/// run into the padded `label`.
+pub fn dash_end(from: Pos2, end: Pos2, label: Rect) -> Pos2 {
+    match segment_entry(from, end, label.expand(LABEL_PAD)) {
+        None => end,
+        Some(t) => {
+            let d = end - from;
+            // A small gap before the pad, never behind the start.
+            let back = (LABEL_PAD / d.length()).min(t);
+            from + d * (t - back)
+        }
+    }
 }
 
 /// Paint the timeline for `d` at `now`, `height` tall across the available
@@ -629,35 +710,42 @@ fn paint_now(
     };
     let from = axes.pos(now, pct);
     let to = axes.pos(p.end_t, p.end_pct);
-    paint_dashed(painter, from, to, Stroke::new(1.5, state));
+    // The end label ("cap 4:10p" by the ✕, or "safe"), placed off the line
+    // inside the widget; the dash stops short of it if it must.
+    let label = if let Some(cap) = p.cap_at {
+        Some((
+            format!("cap {}", short_time_in(cap, &Local)),
+            palette.danger,
+            CAP_MARK + 2.0,
+        ))
+    } else if p.end_t > now {
+        Some(("safe".to_owned(), palette.good, 4.0))
+    } else {
+        None
+    };
+    let bounds = Rect::from_min_max(
+        pos2(axes.plot.left(), painter.clip_rect().top()),
+        pos2(painter.clip_rect().right(), axes.plot.bottom()),
+    );
+    let placed = label.map(|(text, color, clearance)| {
+        let galley = painter.layout_no_wrap(text, font.clone(), color);
+        let rect = place_end_label(from, to, galley.size(), clearance, bounds);
+        (galley, rect, color)
+    });
+    let stop = placed
+        .as_ref()
+        .map_or(to, |(_, rect, _)| dash_end(from, to, *rect));
+    paint_dashed(painter, from, stop, Stroke::new(1.5, state));
 
-    if let Some(cap) = p.cap_at {
-        let c = axes.pos(cap, 100.0);
+    if p.cap_at.is_some() {
         let stroke = Stroke::new(2.0, palette.danger);
         let (a, b) = (vec2(CAP_MARK, CAP_MARK), vec2(CAP_MARK, -CAP_MARK));
-        painter.line_segment([c - a, c + a], stroke);
-        painter.line_segment([c - b, c + b], stroke);
-        let galley = painter.layout_no_wrap(
-            format!("cap {}", short_time_in(cap, &Local)),
-            font.clone(),
-            palette.danger,
-        );
-        let lx = label_left(
-            c.x,
-            galley.size().x,
-            axes.plot.left(),
-            painter.clip_rect().right(),
-        );
-        painter.galley(pos2(lx, c.y + CAP_MARK + 2.0), galley, palette.danger);
-    } else if p.end_t > now {
-        let y = (to.y - 4.0).max(axes.plot.top() + font.size);
-        painter.text(
-            pos2(painter.clip_rect().right(), y),
-            Align2::RIGHT_BOTTOM,
-            "safe",
-            font.clone(),
-            palette.good,
-        );
+        painter.line_segment([to - a, to + a], stroke);
+        painter.line_segment([to - b, to + b], stroke);
+    }
+    if let Some((galley, rect, color)) = placed {
+        painter.rect_filled(rect.expand(LABEL_PAD), 3.0, palette.surface);
+        painter.galley(rect.min, galley, color);
     }
 
     painter.circle(from, DOT_RADIUS, state, Stroke::new(1.5, palette.surface));
@@ -1060,13 +1148,76 @@ mod tests {
         );
     }
 
+    // --- end label --------------------------------------------------------
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
+        Rect::from_min_max(pos2(x0, y0), pos2(x1, y1))
+    }
+
     #[test]
-    fn label_left_keeps_labels_inside() {
-        assert_eq!(label_left(50.0, 20.0, 0.0, 100.0), 40.0);
-        assert_eq!(label_left(5.0, 20.0, 0.0, 100.0), 0.0);
-        assert_eq!(label_left(98.0, 20.0, 0.0, 100.0), 80.0);
-        // Wider than the room: pinned left.
-        assert_eq!(label_left(50.0, 200.0, 0.0, 100.0), 0.0);
+    fn segment_entry_fraction() {
+        let r = rect(40.0, 40.0, 60.0, 60.0);
+        let t = segment_entry(pos2(0.0, 50.0), pos2(100.0, 50.0), r).unwrap();
+        assert!((t - 0.4).abs() < 1e-6, "{t}");
+        assert_eq!(
+            segment_entry(pos2(50.0, 50.0), pos2(100.0, 50.0), r),
+            Some(0.0)
+        );
+        assert_eq!(segment_entry(pos2(0.0, 0.0), pos2(100.0, 0.0), r), None);
+        // Stops short of the rect.
+        assert_eq!(segment_entry(pos2(0.0, 50.0), pos2(30.0, 50.0), r), None);
+        // A point segment.
+        assert_eq!(segment_entry(pos2(1.0, 1.0), pos2(1.0, 1.0), r), None);
+    }
+
+    const LABEL: Vec2 = vec2(30.0, 10.0);
+
+    #[test]
+    fn end_label_above_left_of_a_rising_line() {
+        let bounds = rect(0.0, 0.0, 200.0, 120.0);
+        let got = place_end_label(pos2(0.0, 100.0), pos2(100.0, 40.0), LABEL, 4.0, bounds);
+        assert_eq!(got, rect(70.0, 26.0, 100.0, 36.0));
+    }
+
+    #[test]
+    fn end_label_above_right_when_the_top_is_tight() {
+        let bounds = rect(0.0, 0.0, 200.0, 120.0);
+        let (from, end) = (pos2(0.0, 100.0), pos2(100.0, 8.0));
+        let got = place_end_label(from, end, LABEL, 4.0, bounds);
+        assert_eq!(got, rect(104.0, 0.0, 134.0, 10.0));
+        assert_eq!(segment_entry(from, end, got.expand(LABEL_PAD)), None);
+    }
+
+    #[test]
+    fn end_label_flat_line_sits_above_it() {
+        let bounds = rect(0.0, 0.0, 102.0, 120.0);
+        let (from, end) = (pos2(50.0, 60.0), pos2(100.0, 60.0));
+        let got = place_end_label(from, end, LABEL, 4.0, bounds);
+        assert_eq!(got, rect(70.0, 46.0, 100.0, 56.0));
+    }
+
+    #[test]
+    fn end_label_cornered_stays_inside_and_the_dash_stops_short() {
+        // Narrow and near the top: every spot touches the line.
+        let bounds = rect(0.0, 0.0, 102.0, 120.0);
+        let (from, end) = (pos2(0.0, 100.0), pos2(100.0, 8.0));
+        let got = place_end_label(from, end, LABEL, 4.0, bounds);
+        assert!(bounds.contains_rect(got), "{got:?}");
+        assert_eq!(got, rect(70.0, 0.0, 100.0, 10.0));
+        let stop = dash_end(from, end, got);
+        assert!(!got.expand(LABEL_PAD).contains(stop), "{stop:?}");
+        assert!(stop.x < 96.0 && stop.x > 90.0, "{stop:?}");
+        // The line, cut there, misses the padded label.
+        assert_eq!(segment_entry(from, stop, got.expand(LABEL_PAD)), None);
+    }
+
+    #[test]
+    fn dash_runs_to_the_end_when_clear() {
+        let label = rect(70.0, 26.0, 100.0, 36.0);
+        assert_eq!(
+            dash_end(pos2(0.0, 100.0), pos2(100.0, 40.0), label),
+            pos2(100.0, 40.0)
+        );
     }
 
     // --- hover --------------------------------------------------------------
