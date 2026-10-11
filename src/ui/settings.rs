@@ -608,6 +608,31 @@ mod tests {
     }
 
     #[test]
+    fn apply_keeps_ui_state_changed_while_the_panel_was_open() {
+        use crate::config::{Pos, SavedRect, UiMode};
+        // The panel opened on these settings...
+        let opened = Settings::default();
+        let d = SettingsDraft::from_settings(&opened);
+        // ...then Details was toggled, the window moved and the pin flipped
+        // before Apply. Apply builds over the live settings, not the
+        // snapshot the draft came from.
+        let live = Settings {
+            details_open: true,
+            always_on_top: true,
+            ui_mode: UiMode::Pill,
+            full_rect: Some(SavedRect {
+                pos: Pos { x: 3, y: 4 },
+                w: 420.0,
+                h: 460.0,
+            }),
+            full_maximized: true,
+            pill_pos: Some(Pos { x: 7, y: 8 }),
+            ..opened.clone()
+        };
+        assert_eq!(build_settings(&d, &live).unwrap(), live);
+    }
+
+    #[test]
     fn build_blank_optionals_become_none() {
         let current = Settings {
             cookie_file: Some(PathBuf::from("c.sqlite")),
