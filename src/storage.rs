@@ -160,7 +160,8 @@ pub fn five_hour_buckets(
     window_start: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Vec<(DateTime<Utc>, Option<f64>)> {
-    window_buckets(paths, window_start, now, |e| e.five_hour)
+    let rows = read_recent(paths, window_start);
+    window_buckets(&rows, window_start, now, |e| e.five_hour)
 }
 
 /// Fable weekly-% at the same buckets as [`five_hour_buckets`] (aligned
@@ -170,15 +171,50 @@ pub fn fable_five_hour_buckets(
     window_start: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Vec<(DateTime<Utc>, Option<f64>)> {
-    window_buckets(paths, window_start, now, |e| e.fable_7d)
+    let rows = read_recent(paths, window_start);
+    window_buckets(&rows, window_start, now, |e| e.fable_7d)
+}
+
+/// All four chart rollups from a single read of history.jsonl. Identical to
+/// calling [`five_hour_buckets`], [`fable_five_hour_buckets`],
+/// [`daily_history`] and [`fable_daily_history`] separately, but the history
+/// is read and parsed once (from the earliest cutoff any of them needs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rollups {
+    pub five_hour: Vec<(DateTime<Utc>, Option<f64>)>,
+    pub fable_five_hour: Vec<(DateTime<Utc>, Option<f64>)>,
+    pub daily: Vec<(NaiveDate, Option<f64>)>,
+    pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
+}
+
+/// See [`Rollups`].
+pub fn rollups(
+    paths: &Paths,
+    window_start: DateTime<Utc>,
+    days: usize,
+    now: DateTime<Utc>,
+) -> Rollups {
+    let since = match daily_since(days, now) {
+        Some(d) => d.min(window_start),
+        None => window_start,
+    };
+    let rows = read_recent(paths, since);
+    Rollups {
+        five_hour: window_buckets(&rows, window_start, now, |e| e.five_hour),
+        fable_five_hour: window_buckets(&rows, window_start, now, |e| e.fable_7d),
+        daily: daily_max(&rows, days, now, |e| e.seven_day),
+        fable_daily: daily_max(&rows, days, now, |e| e.fable_7d),
+    }
 }
 
 /// Bucket one field over the five-hour window: max per bucket. Buckets that
 /// have started (start <= now) with no sample carry the previous value
 /// forward (utilization is monotonic within a window); later buckets are
 /// left as they are (None unless they hold a sample).
+///
+/// `rows` may hold entries outside the window; they are ignored.
 fn window_buckets(
-    paths: &Paths,
+    rows: &[HistoryEntry],
     window_start: DateTime<Utc>,
     now: DateTime<Utc>,
     field: impl Fn(&HistoryEntry) -> Option<f64>,
@@ -191,8 +227,8 @@ fn window_buckets(
     let end_ts = unix_seconds(window_start + Duration::minutes(WINDOW_MINUTES));
     let mut buckets: Vec<Option<f64>> = vec![None; n];
 
-    for e in read_recent(paths, window_start) {
-        let Some(val) = field(&e) else { continue };
+    for e in rows {
+        let Some(val) = field(e) else { continue };
         if e.ts < start_ts || e.ts >= end_ts {
             continue;
         }
@@ -223,7 +259,8 @@ pub fn daily_history(
     days: usize,
     now: DateTime<Utc>,
 ) -> Vec<(NaiveDate, Option<f64>)> {
-    daily_max(paths, days, now, |e| e.seven_day)
+    let rows = daily_since(days, now).map_or_else(Vec::new, |since| read_recent(paths, since));
+    daily_max(&rows, days, now, |e| e.seven_day)
 }
 
 /// Like [`daily_history`] but for Fable 7-day utilization, with the same day
@@ -233,11 +270,29 @@ pub fn fable_daily_history(
     days: usize,
     now: DateTime<Utc>,
 ) -> Vec<(NaiveDate, Option<f64>)> {
-    daily_max(paths, days, now, |e| e.fable_7d)
+    let rows = daily_since(days, now).map_or_else(Vec::new, |since| read_recent(paths, since));
+    daily_max(&rows, days, now, |e| e.fable_7d)
 }
 
+/// The last `days` local calendar days ending today, oldest first.
+fn day_list(days: usize, now: DateTime<Utc>) -> Vec<NaiveDate> {
+    let today = now.with_timezone(&Local).date_naive();
+    (0..days as i64)
+        .rev()
+        .map(|i| today - Duration::days(i))
+        .collect()
+}
+
+/// Earliest instant the daily rollup needs (local midnight of the oldest
+/// day), or `None` when `days == 0`.
+fn daily_since(days: usize, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    day_list(days, now).first().map(|d| local_midnight(*d))
+}
+
+/// Max of one field per local day. `rows` may hold entries older than the
+/// range; they are ignored.
 fn daily_max(
-    paths: &Paths,
+    rows: &[HistoryEntry],
     days: usize,
     now: DateTime<Utc>,
     field: impl Fn(&HistoryEntry) -> Option<f64>,
@@ -245,16 +300,12 @@ fn daily_max(
     if days == 0 {
         return Vec::new();
     }
-    let today = now.with_timezone(&Local).date_naive();
-    let day_list: Vec<NaiveDate> = (0..days as i64)
-        .rev()
-        .map(|i| today - Duration::days(i))
-        .collect();
-    let since = local_midnight(day_list[0]);
+    let day_list = day_list(days, now);
+    let since = unix_seconds(local_midnight(day_list[0]));
     let mut by_day: Vec<Option<f64>> = vec![None; days];
 
-    for e in read_recent(paths, since) {
-        let Some(val) = field(&e) else { continue };
+    for e in rows.iter().filter(|e| e.ts >= since) {
+        let Some(val) = field(e) else { continue };
         let Some(day) = from_unix_seconds(e.ts).map(|t| t.with_timezone(&Local).date_naive())
         else {
             continue;
@@ -859,6 +910,46 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(fable, vec![None, None, None, None, None, None, Some(2.0)]);
+    }
+
+    #[test]
+    fn rollups_match_the_separate_functions() {
+        let (_tmp, paths) = temp_paths();
+        let now = local(2026, 10, 11, 12, 0);
+        let ws = now - Duration::minutes(100);
+        let mut lines = Vec::new();
+        // Every 20 minutes for 9 days, all fields, so each rollup's cutoff
+        // and every window/day edge has neighbours on both sides.
+        let mut t = now - Duration::days(9);
+        let mut i = 0.0;
+        while t <= now {
+            lines.push(
+                json!({"ts": unix_seconds(t), "five_hour": i % 97.0,
+                       "seven_day": i % 89.0, "fable_7d": i % 13.0})
+                .to_string(),
+            );
+            t += Duration::minutes(20);
+            i += 1.0;
+        }
+        lines.push("not json".into());
+        write_history(&paths, &lines);
+
+        for days in [0, 1, 7] {
+            let got = rollups(&paths, ws, days, now);
+            assert_eq!(got.five_hour, five_hour_buckets(&paths, ws, now));
+            assert_eq!(
+                got.fable_five_hour,
+                fable_five_hour_buckets(&paths, ws, now)
+            );
+            assert_eq!(got.daily, daily_history(&paths, days, now));
+            assert_eq!(got.fable_daily, fable_daily_history(&paths, days, now));
+        }
+        // Window older than the daily range: the window cutoff wins.
+        let old_ws = now - Duration::days(8);
+        let got = rollups(&paths, old_ws, 7, now);
+        assert_eq!(got.five_hour, five_hour_buckets(&paths, old_ws, now));
+        assert!(got.five_hour.iter().any(|(_, v)| v.is_some()));
+        assert_eq!(got.daily, daily_history(&paths, 7, now));
     }
 
     #[test]
