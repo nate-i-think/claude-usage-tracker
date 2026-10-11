@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit, Ui};
 
+use crate::analytics::alerts::AlertToggles;
 use crate::analytics::Level;
 use crate::config::{
     parse_interval, resolve_client_sha_with_source, ClientShaSource, Settings, CLIENT_SHA_ENV,
@@ -26,6 +27,12 @@ pub struct SettingsDraft {
     pub show_all: bool,
     pub cookie_file: String,
     pub client_sha: String,
+    pub tray_enabled: bool,
+    pub close_to_tray: bool,
+    pub start_in_pill: bool,
+    pub alerts: AlertToggles,
+    pub reduce_motion: bool,
+    pub keep_pulsing: bool,
 }
 
 impl SettingsDraft {
@@ -40,6 +47,12 @@ impl SettingsDraft {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             client_sha: s.client_sha.clone().unwrap_or_default(),
+            tray_enabled: s.tray_enabled,
+            close_to_tray: s.close_to_tray,
+            start_in_pill: s.start_in_pill,
+            alerts: s.alerts,
+            reduce_motion: s.reduce_motion,
+            keep_pulsing: s.keep_pulsing,
         }
     }
 }
@@ -88,7 +101,8 @@ impl IntervalCheck {
 }
 
 /// The settings Apply would commit: the draft over `current`, whose
-/// `always_on_top` (edited live, not buffered) is kept. `Err` carries the
+/// fields the panel does not buffer (`always_on_top`, edited live, and the
+/// window/alert state the app maintains) are kept. `Err` carries the
 /// interval error; nothing is applied then.
 pub fn build_settings(draft: &SettingsDraft, current: &Settings) -> Result<Settings, String> {
     let interval_secs = match check_interval(&draft.interval) {
@@ -100,9 +114,15 @@ pub fn build_settings(draft: &SettingsDraft, current: &Settings) -> Result<Setti
         plan: non_blank(&draft.plan).unwrap_or_else(|| Settings::default().plan),
         interval_secs,
         show_all: draft.show_all,
-        always_on_top: current.always_on_top,
         cookie_file: non_blank(&draft.cookie_file).map(PathBuf::from),
         client_sha: non_blank(&draft.client_sha),
+        tray_enabled: draft.tray_enabled,
+        close_to_tray: draft.close_to_tray,
+        start_in_pill: draft.start_in_pill,
+        alerts: draft.alerts,
+        reduce_motion: draft.reduce_motion,
+        keep_pulsing: draft.keep_pulsing,
+        ..current.clone()
     })
 }
 
@@ -309,6 +329,29 @@ impl SettingsPanel {
                     });
             });
 
+            group_heading(ui, "Window");
+            let d = &mut self.draft;
+            theme::checkbox(ui, &mut d.tray_enabled, "Show tray icon");
+            ui.add_enabled_ui(d.tray_enabled, |ui| {
+                theme::checkbox(ui, &mut d.close_to_tray, "Close button hides to tray")
+                    .on_disabled_hover_text("Needs the tray icon");
+            });
+            theme::checkbox(ui, &mut d.start_in_pill, "Start in pill mode");
+
+            group_heading(ui, "Alerts");
+            theme::checkbox(ui, &mut d.alerts.crossed_75, "5-hour window reaches 75%");
+            theme::checkbox(ui, &mut d.alerts.crossed_90, "5-hour window reaches 90%");
+            theme::checkbox(
+                ui,
+                &mut d.alerts.projected_cap,
+                "Projected to hit the cap before reset",
+            );
+
+            group_heading(ui, "Motion");
+            theme::checkbox(ui, &mut d.reduce_motion, "Reduce motion");
+            theme::checkbox(ui, &mut d.keep_pulsing, "Keep pulsing at high usage");
+            ui.add_space(4.0);
+
             ui.horizontal(|ui| {
                 let built = build_settings(&self.draft, live);
                 if ui
@@ -335,6 +378,13 @@ fn field(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
     ui.label(label);
     add(ui);
     ui.add_space(4.0);
+}
+
+/// A small semibold heading over a group of toggles.
+fn group_heading(ui: &mut Ui, text: &str) {
+    ui.add_space(4.0);
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    ui.label(RichText::new(text).font(theme::semibold(body.size)));
 }
 
 /// A wrapping colored note under a field.
@@ -405,6 +455,10 @@ mod tests {
             always_on_top: true,
             cookie_file: Some(PathBuf::from("C:/x/cookies.sqlite")),
             client_sha: Some("abcdef123".into()),
+            tray_enabled: false,
+            start_in_pill: true,
+            reduce_motion: true,
+            ..Settings::default()
         };
         assert_eq!(
             SettingsDraft::from_settings(&s),
@@ -414,6 +468,12 @@ mod tests {
                 show_all: true,
                 cookie_file: "C:/x/cookies.sqlite".into(),
                 client_sha: "abcdef123".into(),
+                tray_enabled: false,
+                close_to_tray: true,
+                start_in_pill: true,
+                alerts: AlertToggles::default(),
+                reduce_motion: true,
+                keep_pulsing: false,
             }
         );
         let d = draft();
@@ -489,6 +549,7 @@ mod tests {
             show_all: true,
             cookie_file: " C:/p/cookies.sqlite ".into(),
             client_sha: " abcdef123\n".into(),
+            ..draft()
         };
         assert_eq!(
             build_settings(&d, &current).unwrap(),
@@ -499,6 +560,49 @@ mod tests {
                 always_on_top: true,
                 cookie_file: Some(PathBuf::from("C:/p/cookies.sqlite")),
                 client_sha: Some("abcdef123".into()),
+                ..Settings::default()
+            }
+        );
+    }
+
+    #[test]
+    fn build_applies_toggles_and_keeps_app_maintained_state() {
+        use crate::config::{Pos, SavedRect, UiMode};
+        let current = Settings {
+            ui_mode: UiMode::Pill,
+            full_rect: Some(SavedRect {
+                x: 1.0,
+                y: 2.0,
+                w: 400.0,
+                h: 450.0,
+            }),
+            pill_pos: Some(Pos { x: 5.0, y: 6.0 }),
+            details_open: true,
+            ..Settings::default()
+        };
+        let d = SettingsDraft {
+            tray_enabled: false,
+            close_to_tray: false,
+            start_in_pill: true,
+            alerts: AlertToggles {
+                crossed_75: false,
+                crossed_90: true,
+                projected_cap: false,
+            },
+            reduce_motion: true,
+            keep_pulsing: true,
+            ..SettingsDraft::from_settings(&current)
+        };
+        assert_eq!(
+            build_settings(&d, &current).unwrap(),
+            Settings {
+                tray_enabled: false,
+                close_to_tray: false,
+                start_in_pill: true,
+                alerts: d.alerts,
+                reduce_motion: true,
+                keep_pulsing: true,
+                ..current.clone()
             }
         );
     }

@@ -777,6 +777,7 @@ dependencies = [
  "glob",
  "reqwest",
  "rmcp",
+ "ron",
  "rusqlite",
  "rustls",
  "schemars",
