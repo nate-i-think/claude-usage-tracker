@@ -6,7 +6,7 @@ A real-time terminal dashboard for your `claude.ai` Max-plan usage. Polls the sa
 ╭───────────────────────────────── claude.ai usage  ·  Max 5x ──────────────────────────────────╮
 │ 5-hour           46.0% ━━━━━━━━━━━━━━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━     1h 59m │
 │ 7-day all        13.0% ━━━━━━━╸━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━     5d 12h │
-│ Sonnet 7d         0.0% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━          — │
+│ Fable             0.0% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━          — │
 │                                                                                               │
 │ 15m burn:   +0.00%/min   (over last 7m, 11 samples)                                           │
 │ → 100% in   steady      (no projection)                                                       │
@@ -27,13 +27,13 @@ A real-time terminal dashboard for your `claude.ai` Max-plan usage. Polls the sa
 │ ╰────────────────────────────────────────────╯ ╰────────────────────────────────────────────╯ │
 │                                                                                               │
 │ Top burners (5h):  no local activity yet                                                      │
-│ Headroom: 54%  ·  idle, safe to spin up agents                            last polled 24s ago │
+│ Projected use: 0%  ·  idle, safe to spin up agents                        last polled 24s ago │
 ╰───────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 ## What it shows
 
-- **5-hour, 7-day, Sonnet 7-day windows**: utilization, color-coded thresholds (green < 50%, yellow ≥ 50%, orange ≥ 75%, red ≥ 90%), and time-to-reset.
+- **5-hour, 7-day, and per-model (Fable) windows**: utilization, color-coded thresholds (green < 50%, yellow ≥ 50%, orange ≥ 75%, red ≥ 90%), and time-to-reset. Per-model caps now arrive in the API's `limits` array rather than as top-level keys.
 - **15-minute rolling burn rate**: how fast your 5h window is filling, computed from the last 15 minutes of samples.
 - **"100% in X" projection**: when you'll hit the cap at the current rate
 - **Side-by-side bar charts**: the current 5h window curve and the last 7 days.
@@ -43,10 +43,10 @@ A real-time terminal dashboard for your `claude.ai` Max-plan usage. Polls the sa
 
 ## Install
 
-Requires Python 3.9+ and three packages:
+Requires Python 3.9+ and these packages (`mcp` only needed for the optional MCP server below):
 
 ```bash
-pip install --user curl_cffi rich browser-cookie3
+pip install --user curl_cffi rich browser-cookie3 mcp
 ```
 
 Clone or download this repo, then run:
@@ -99,6 +99,39 @@ python claude_usage_tui.py --cookie-file ...  # explicit cookie file path
 ```
 
 `--interval` accepts plain seconds or suffix syntax (`30`, `30s`, `2m`, `1h`).
+
+## MCP server (let Claude check its own usage)
+
+`mcp_server.py` is an optional [MCP](https://modelcontextprotocol.io) server that lets a Claude instance (Claude Code, Claude Desktop, …) read your current usage and throttle itself when you're near a cap. It does **no** network or auth of its own — it just reports *what the stats were at the most recent ping*, so **the monitor must be running** to keep the data fresh. The monitor writes each snapshot to `latest.json` (next to `history.jsonl`); the MCP server reads it on demand. Nothing about the TUI changes.
+
+Tools:
+
+- **`get_usage()`** — non-blocking. Returns each window's utilization, reset time, and time-to-reset, plus the data's age, a `stale` flag (true if the monitor isn't updating), the extra-usage block, and a `recommendation`/`summary`.
+- **`wait(seconds, confirm)`** — throttle by sleeping. It blocks for only ~50s per call (`MAX_BLOCK_SEC`), then returns how much time remains until the 5-hour reset and whether to call again — so a long wait is done as several short cycles. Call with `confirm=false` first to preview (nothing sleeps); `confirm=true` to actually wait one cycle. Loop until `done` is true.
+- **`wait_test(seconds)`** — diagnostic only. Blocks for the full requested duration (uncapped up to a 600s ceiling) and reports how long it actually slept, so you can discover your client's real single-tool-call timeout. If it returns normally the limit is at least that long; if the client kills it first you've found the ceiling — then set `CLAUDE_USAGE_MCP_MAX_BLOCK` just under it.
+
+Why the short cycles: most MCP clients inherit a ~60s request timeout (Claude Desktop hard-codes it and silently drops later results, and progress notifications don't reliably extend it), so a single multi-minute block would be killed. Bounded cycling is timeout-proof and never traps the agent.
+
+Register it with Claude Code — this repo ships a project-scoped `.mcp.json`, so just run Claude Code from this directory and approve the `claude-usage` server (check with `/mcp`). Or add it explicitly, at any scope:
+
+```bash
+claude mcp add --scope user claude-usage -- python /absolute/path/to/mcp_server.py
+```
+
+For Claude Desktop, add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "claude-usage": {
+      "command": "python",
+      "args": ["C:\\absolute\\path\\to\\mcp_server.py"]
+    }
+  }
+}
+```
+
+Tuning via env vars: `CLAUDE_USAGE_MCP_MAX_BLOCK` (max seconds per `wait` cycle, default 50 — keep it under your client's tool timeout), `CLAUDE_USAGE_MCP_STALE_AFTER` (seconds before a snapshot is flagged stale, default 180), `CLAUDE_USAGE_MCP_TEST_MAX_BLOCK` (hard ceiling for `wait_test`, default 600). Set them in the `env` block of your MCP server config.
 
 
 ## Recommended layout

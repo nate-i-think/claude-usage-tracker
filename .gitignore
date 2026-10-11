@@ -22,6 +22,7 @@ env/
 # Local state — should never be committed; lives in user data dir at runtime
 # but if anyone accidentally creates these in the repo, ignore them.
 history.jsonl
+latest.json
 anonymous_id
 
 # OS clutter
