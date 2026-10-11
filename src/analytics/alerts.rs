@@ -15,8 +15,8 @@ use super::{humanize_until, Projection};
 pub const CAP_WARNING_MIN_LEAD_MINUTES: i64 = 10;
 
 /// Window keys this close together name the same window. The API's
-/// `resets_at` jitters from poll to poll (sub-second and occasionally by
-/// seconds) while windows are 5 hours apart.
+/// `resets_at` jitters from poll to poll, sub-second usually but by up to
+/// about 5 minutes at times, while windows are 5 hours apart.
 pub const WINDOW_KEY_TOLERANCE_MINUTES: i64 = 5;
 
 /// An alert to deliver.
@@ -93,9 +93,7 @@ pub fn evaluate(
     let Some(key) = window_key.map(normalize_key) else {
         return Vec::new();
     };
-    let tolerance = Duration::minutes(WINDOW_KEY_TOLERANCE_MINUTES);
-    let same_window = state.window.is_some_and(|w| (w - key).abs() <= tolerance);
-    if !same_window {
+    if !state.window.is_some_and(|w| same_window(w, key)) {
         *state = AlertState {
             window: Some(key),
             ..AlertState::default()
@@ -128,8 +126,15 @@ pub fn evaluate(
 }
 
 /// `resets_at` rounded to the nearest minute.
-fn normalize_key(t: DateTime<Utc>) -> DateTime<Utc> {
+pub fn normalize_key(t: DateTime<Utc>) -> DateTime<Utc> {
     t.duration_round(Duration::minutes(1)).unwrap_or(t)
+}
+
+/// Whether two `resets_at` values name the same 5-hour window: within
+/// [`WINDOW_KEY_TOLERANCE_MINUTES`] of each other once rounded to the
+/// minute, absorbing the API's poll-to-poll jitter.
+pub fn same_window(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
+    (normalize_key(a) - normalize_key(b)).abs() <= Duration::minutes(WINDOW_KEY_TOLERANCE_MINUTES)
 }
 
 /// Toast copy for one alert.
@@ -278,6 +283,16 @@ mod tests {
             eval(&mut s, key(0), 99.5),
             [AlertKind::Crossed90 { pct: 100 }]
         );
+    }
+
+    #[test]
+    fn same_window_absorbs_jitter_not_the_next_window() {
+        let base = key(0).unwrap();
+        for jitter_ms in [107, -400, 3_000, 61_000, -290_000, 300_000] {
+            assert!(same_window(base, base + Duration::milliseconds(jitter_ms)));
+        }
+        assert!(!same_window(base, base + Duration::minutes(6)));
+        assert!(!same_window(base, base + Duration::hours(5)));
     }
 
     #[test]
