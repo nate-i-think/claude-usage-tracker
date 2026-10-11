@@ -171,6 +171,34 @@ request header. Leave this field blank to use client_sha.txt.";
 pub struct SettingsPanel {
     draft: SettingsDraft,
     sha_source: (String, bool),
+    cookie_check: CookieFileCheck,
+}
+
+/// Whether the cookie path is an existing file, cached per path text so the
+/// open panel does not stat the disk every frame.
+#[derive(Debug, Default)]
+struct CookieFileCheck {
+    /// The path text last checked, and its result.
+    last: Option<(String, bool)>,
+}
+
+impl CookieFileCheck {
+    fn is_file(&mut self, path: &str) -> bool {
+        self.is_file_with(path, |p| Path::new(p).is_file())
+    }
+
+    /// Like [`Self::is_file`] with an injectable check (for tests); `check`
+    /// runs only when `path` differs from the last one.
+    fn is_file_with(&mut self, path: &str, check: impl FnOnce(&str) -> bool) -> bool {
+        match &self.last {
+            Some((p, found)) if p == path => *found,
+            _ => {
+                let found = check(path);
+                self.last = Some((path.to_owned(), found));
+                found
+            }
+        }
+    }
 }
 
 impl SettingsPanel {
@@ -180,6 +208,7 @@ impl SettingsPanel {
             sha_source: describe_sha_source(&resolve_client_sha_with_source(
                 current.client_sha.as_deref(),
             )),
+            cookie_check: CookieFileCheck::default(),
         }
     }
 
@@ -243,7 +272,7 @@ impl SettingsPanel {
                 let path = self.draft.cookie_file.trim();
                 if path.is_empty() {
                     ui.weak("Blank: the browser profile is detected automatically");
-                } else if Path::new(path).is_file() {
+                } else if self.cookie_check.is_file(path) {
                     note(ui, green, "File exists");
                 } else {
                     note(ui, red, "File not found");
@@ -333,6 +362,28 @@ mod tests {
         let (text, found) = describe_sha_source(&Err(anyhow::anyhow!("missing")));
         assert!(!found && text.contains(CLIENT_SHA_FILE), "{text}");
         assert!(!text.contains("abcdef123"));
+    }
+
+    #[test]
+    fn cookie_file_check_stats_only_when_the_text_changes() {
+        let mut c = CookieFileCheck::default();
+        let mut calls = 0;
+        let mut check = |path: &str, result: bool| {
+            c.is_file_with(path, |_| {
+                calls += 1;
+                result
+            })
+        };
+        assert!(check("a.json", true));
+        assert!(check("a.json", false)); // cached: the check is not rerun
+        assert!(!check("b.json", false));
+        assert!(check("a.json", true));
+        assert_eq!(calls, 3);
+
+        let real = tempfile::NamedTempFile::new().unwrap();
+        let mut c = CookieFileCheck::default();
+        assert!(c.is_file(real.path().to_str().unwrap()));
+        assert!(!c.is_file("definitely/not/here.json"));
     }
 
     #[test]
