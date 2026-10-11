@@ -31,6 +31,8 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.36.2", features = ["persistence"] }
 tempfile = "3"
+# eframe's own (0.12); reads app.ron before run_native.
+ron = "0.12"
 rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "io-std"] }
 schemars = "1"
