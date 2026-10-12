@@ -941,15 +941,7 @@ mod tests {
 
     fn write_lines(path: &Path, lines: &[Value]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let body: String = lines
-            .iter()
-            .map(|l| {
-                format!(
-                    "{l}
-"
-                )
-            })
-            .collect();
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
         fs::write(path, body).unwrap();
     }
 

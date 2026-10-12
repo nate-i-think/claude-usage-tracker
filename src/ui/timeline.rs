@@ -187,8 +187,10 @@ pub fn plot_rect(rect: Rect, label_w: f32, text_h: f32) -> Rect {
 
 /// Index ranges of `samples` drawn as one solid line each: only samples
 /// with a main value, broken where a value is missing, the time between
-/// neighbors exceeds `gap_break` (see [`bridges`]), or the value drops by
-/// more than [`RESET_DROP`] points. Single-sample ranges are kept.
+/// neighbors exceeds `gap_break` while the value changed across it (see
+/// [`bridges`]; a gap with the same value at both ends is known to be flat
+/// and stays solid), or the value drops by more than [`RESET_DROP`] points.
+/// Single-sample ranges are kept.
 pub fn segments(samples: &[Point], gap_break: Duration) -> Vec<Range<usize>> {
     segments_of(samples, gap_break, Series::Main)
 }
@@ -207,7 +209,8 @@ pub fn segments_of(samples: &[Point], gap_break: Duration, series: Series) -> Ve
             Some(r) => {
                 let prev = &samples[r.end - 1];
                 let prev_v = prev.get(series).unwrap_or(v);
-                if s.t - prev.t > max_gap || prev_v - v > RESET_DROP {
+                let changed_gap = s.t - prev.t > max_gap && prev_v != v;
+                if changed_gap || prev_v - v > RESET_DROP {
                     out.push(r);
                     Some(i..i + 1)
                 } else {
@@ -264,6 +267,11 @@ fn series(samples: &[Point], range: Range<usize>, which: Series) -> Vec<(DateTim
 /// of each new value) instead of holding each value flat, and stays flat
 /// from the last change point on (it hasn't reached the next value yet).
 /// One value per sample, so hover can still snap to the real readings.
+///
+/// Each drawn value stays within its own reading's whole percent (at most
+/// one point above a rising reading, below a falling one), so a jump of
+/// several points after a long flat stretch isn't spread over the stretch
+/// as an invented ramp: the line holds near the old value and then rises.
 pub fn through_change_points(samples: &[(DateTime<Utc>, f64)]) -> Vec<f64> {
     let changes: Vec<usize> = (0..samples.len())
         .filter(|&i| i == 0 || samples[i].1 != samples[i - 1].1)
@@ -286,7 +294,25 @@ pub fn through_change_points(samples: &[(DateTime<Utc>, f64)]) -> Vec<f64> {
         } else {
             0.0
         };
-        out.push(v0 + (v1 - v0) * frac);
+        let lerp = v0 + (v1 - v0) * frac;
+        out.push(if v1 >= v0 {
+            lerp.clamp(v, v + 1.0)
+        } else {
+            lerp.clamp(v - 1.0, v)
+        });
+    }
+    out
+}
+
+/// The drawn value of every point of `series` (see
+/// [`through_change_points`], per segment), `None` outside the segments.
+pub fn drawn_values(samples: &[Point], segs: &[Range<usize>], which: Series) -> Vec<Option<f64>> {
+    let mut out = vec![None; samples.len()];
+    for seg in segs {
+        let drawn = through_change_points(&series(samples, seg.clone(), which));
+        for (i, v) in seg.clone().zip(drawn) {
+            out[i] = Some(v);
+        }
     }
     out
 }
@@ -579,12 +605,13 @@ pub fn week_sample_tip(time: &str, pct: f64, fable: Option<f64>) -> String {
 }
 
 /// Weekly tooltip on the projections: "Mon 3p · projected 7d all 71% ·
-/// Fable 90%".
-pub fn week_projected_tip(time: &str, pct: f64, fable: Option<f64>) -> String {
-    match fable {
-        Some(f) => format!("{time} · projected 7d all {pct:.0}% · Fable {f:.0}%"),
-        None => format!("{time} · projected 7d all {pct:.0}%"),
-    }
+/// Fable 90%", each part only for a meter that is drawn.
+pub fn week_projected_tip(time: &str, all: Option<f64>, fable: Option<f64>) -> String {
+    let parts: Vec<String> = [("7d all", all), ("Fable", fable)]
+        .iter()
+        .filter_map(|(name, v)| v.map(|v| format!("{name} {v:.0}%")))
+        .collect();
+    format!("{time} · projected {}", parts.join(" · "))
 }
 
 /// What the pointer at `x` points at.
@@ -871,9 +898,19 @@ impl TimeStyle {
     }
 }
 
+/// Which meter a [`Line`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// The chart's main meter (5-hour, or 7-day all).
+    Main,
+    /// The overlay's meter (Fable 7-day).
+    Overlay,
+}
+
 /// One meter's now dot and dashed projection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Line {
+    pub kind: LineKind,
     /// The meter's % now (the dot eases to it).
     pub pct: f64,
     pub projection: Option<Projection>,
@@ -902,8 +939,10 @@ pub struct Chart {
     pub ticks: Vec<(DateTime<Utc>, String)>,
     /// At the right end of the time axis: "reset 11:10p".
     pub end_label: Option<String>,
-    /// The main meter first, then the overlay's.
+    /// The meters' lines, each tagged with its [`LineKind`].
     pub lines: Vec<Line>,
+    /// Opacity of a bridged gap's fill relative to the normal fill.
+    pub bridge_fill: f32,
     pub style: TimeStyle,
     /// The snapshot's fetch time in ms, so projections draw in per poll.
     pub poll_key: i64,
@@ -920,6 +959,7 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
             let rate = analytics::compute_rate(&d.history, now);
             let projection = analytics::projection(now, p, rate, d.window_end);
             Line {
+                kind: LineKind::Main,
                 pct: p,
                 projection: Some(projection),
                 label: end_label(reset_known, &projection, now),
@@ -938,6 +978,7 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
         gap_break: Duration::minutes(GAP_BREAK_MINUTES),
         state,
         overlay: Overlay::Share(analytics::fable_layer(&d.window_samples)),
+        bridge_fill: BRIDGE_FILL_SCALE,
         ticks: hour_ticks_in(d.window_start, d.window_end, &Local),
         end_label: Some(format!("reset {}", short_time_in(d.window_end, &Local))),
         lines,
@@ -1041,12 +1082,15 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
 
     if let Some(pointer) = response.hover_pos() {
         if axes.plot.x_range().contains(pointer.x) {
-            let main = chart
-                .lines
-                .first()
-                .and_then(|l| l.projection.map(|p| (l.pct, p)));
-            let target = hover_target(&axes, samples, &gaps, chart.now, main, pointer.x);
-            let tip = paint_hover(&painter, &axes, palette, chart, target, pointer.x);
+            // The main meter's projection, else the overlay's, drives the
+            // hover beyond now.
+            let projecting = [LineKind::Main, LineKind::Overlay]
+                .iter()
+                .filter_map(|k| chart.lines.iter().find(|l| l.kind == *k))
+                .find_map(|l| l.projection.map(|p| (l.pct, p)));
+            let target = hover_target(&axes, samples, &gaps, chart.now, projecting, pointer.x);
+            let drawn = drawn_values(samples, &segs, Series::Main);
+            let tip = paint_hover(&painter, &axes, palette, chart, &drawn, target, pointer.x);
             return response.on_hover_text_at_pointer(tip);
         }
     }
@@ -1144,7 +1188,7 @@ fn paint_areas(
     let main = |i: usize| axes.pos(samples[i].t, samples[i].value.unwrap_or(0.0));
     for b in gaps {
         let ends = [main(b.from), main(b.to)];
-        let scale = BRIDGE_FILL_SCALE;
+        let scale = chart.bridge_fill;
         painter.add(area_mesh(
             &ends,
             baseline,
@@ -1262,7 +1306,7 @@ pub fn end_fade(share: f32) -> f32 {
 }
 
 /// The text of an end label: "cap 4:10p" (or "cap Mon 10:45a"), "safe",
-/// "at cap".
+/// "at cap" (the plot shows only the mark for it; see [`label_shown`]).
 pub fn end_label_text<Tz: TimeZone>(label: EndLabel, style: TimeStyle, tz: &Tz) -> String
 where
     Tz::Offset: Display,
@@ -1271,6 +1315,20 @@ where
         EndLabel::Cap(t) => format!("cap {}", style.short(t, tz)),
         EndLabel::Safe => "safe".to_owned(),
         EndLabel::AtCap => "at cap".to_owned(),
+    }
+}
+
+/// Whether an end label's text goes in the plot. "At cap" never does (a ✕
+/// on the 100% line marks it; the row under the chart has the words), and
+/// a "cap …" label only when the projection runs far enough right to hold
+/// it (`run` from now to the cap, `room` the label's width plus its
+/// clearance); otherwise only the ✕ shows, so a cap minutes away doesn't
+/// crowd the plot's corner.
+pub fn label_shown(label: EndLabel, run: f32, room: f32) -> bool {
+    match label {
+        EndLabel::AtCap => false,
+        EndLabel::Cap(_) => run >= room,
+        EndLabel::Safe => true,
     }
 }
 
@@ -1300,11 +1358,18 @@ fn paint_now(
         e.projection
             .map_or(from(e), |p| axes.pos(p.end_t, p.end_pct))
     };
+    // Where a meter's ✕ goes: the cap, or on the 100% line at now when it
+    // is already there.
+    let mark_at = |e: &Ends| match e.label {
+        Some(EndLabel::Cap(_)) => Some(to(e)),
+        Some(EndLabel::AtCap) => Some(axes.pos(chart.now, 100.0)),
+        _ => None,
+    };
     // Every ✕ and every now dot is a keep-out for every label.
     let mut avoid: Vec<Rect> = ends
         .iter()
-        .filter(|e| matches!(e.label, Some(EndLabel::Cap(_))))
-        .map(|e| Rect::from_center_size(to(e), Vec2::splat(2.0 * CAP_KEEP_OUT)))
+        .filter_map(mark_at)
+        .map(|p| Rect::from_center_size(p, Vec2::splat(2.0 * CAP_KEEP_OUT)))
         .chain(
             ends.iter()
                 .map(|e| Rect::from_center_size(from(e), Vec2::splat(2.0 * (DOT_RADIUS + 1.5)))),
@@ -1317,7 +1382,7 @@ fn paint_now(
         } else {
             1.0
         };
-        let placed = e.label.map(|kind| {
+        let placed = e.label.and_then(|kind| {
             let (color, clearance, keep_out) = match kind {
                 EndLabel::Cap(_) => (e.cap_color, CAP_LABEL_CLEARANCE, CAP_KEEP_OUT),
                 EndLabel::Safe => (palette.good, SAFE_LABEL_CLEARANCE, SAFE_KEEP_OUT),
@@ -1325,10 +1390,13 @@ fn paint_now(
             };
             let text = end_label_text(kind, chart.style, &Local);
             let galley = painter.layout_no_wrap(text, font.clone(), color);
+            if !label_shown(kind, to.x - from.x, galley.size().x + clearance) {
+                return None;
+            }
             let own: Vec<Rect> = avoid.iter().copied().filter(|r| !r.contains(to)).collect();
             let rect = place_end_label(from, to, galley.size(), clearance, keep_out, bounds, &own);
             avoid.push(rect.expand(LABEL_PAD));
-            (galley, rect, color)
+            Some((galley, rect, color))
         });
         if e.projection.is_some() {
             let stop = placed
@@ -1341,11 +1409,11 @@ fn paint_now(
                 Stroke::new(1.5, e.color),
             );
         }
-        if matches!(e.label, Some(EndLabel::Cap(_))) && fade > 0.0 {
+        if let Some(m) = mark_at(e).filter(|_| fade > 0.0) {
             let stroke = Stroke::new(2.0, e.cap_color.gamma_multiply(fade));
             let (a, b) = (vec2(CAP_MARK, CAP_MARK), vec2(CAP_MARK, -CAP_MARK));
-            painter.line_segment([to - a, to + a], stroke);
-            painter.line_segment([to - b, to + b], stroke);
+            painter.line_segment([m - a, m + a], stroke);
+            painter.line_segment([m - b, m + b], stroke);
         }
         if let Some((galley, rect, color)) = placed.filter(|_| fade > 0.0) {
             painter.rect_filled(
@@ -1374,6 +1442,7 @@ fn paint_hover(
     axes: &Axes,
     palette: &Palette,
     chart: &Chart,
+    drawn: &[Option<f64>],
     target: HoverTarget,
     pointer_x: f32,
 ) -> String {
@@ -1383,27 +1452,34 @@ fn paint_hover(
     let point = |t: DateTime<Utc>, pct: f64| Some(axes.pos(t, pct));
     let (x, point, tip) = match target {
         HoverTarget::Projected { t, pct } => {
-            let overlay = chart.lines.get(1).and_then(|l| {
-                l.projection
-                    .and_then(|p| projected_pct(chart.now, l.pct, &p, t))
-                    .or(Some(l.pct))
-            });
+            // Each meter at `t`: on its projection, else held at its %.
+            let at = |kind: LineKind| {
+                chart.lines.iter().find(|l| l.kind == kind).map(|l| {
+                    l.projection
+                        .and_then(|p| projected_pct(chart.now, l.pct, &p, t))
+                        .unwrap_or(l.pct)
+                })
+            };
             let tip = match style {
                 TimeStyle::Clock => projected_tip(&time(t), pct),
-                TimeStyle::Weekday => week_projected_tip(&time(t), pct, overlay),
+                TimeStyle::Weekday => {
+                    week_projected_tip(&time(t), at(LineKind::Main), at(LineKind::Overlay))
+                }
             };
             (axes.x_at(t), point(t, pct), tip)
         }
         HoverTarget::Sample(i) => {
             let s = &samples[i];
             let pct = s.value.unwrap_or(0.0);
+            // The tip reads the real sample; the dot sits on the drawn line.
+            let on_line = drawn.get(i).copied().flatten().unwrap_or(pct);
             let tip = match (&chart.overlay, style) {
                 (Overlay::Share(share), _) => sample_tip(&time(s.t), pct, share[i]),
                 (Overlay::Line, TimeStyle::Weekday) => week_sample_tip(&time(s.t), pct, s.overlay),
                 (_, TimeStyle::Weekday) => week_sample_tip(&time(s.t), pct, None),
                 (_, TimeStyle::Clock) => sample_tip(&time(s.t), pct, None),
             };
-            (axes.x_at(s.t), point(s.t, pct), tip)
+            (axes.x_at(s.t), point(s.t, on_line), tip)
         }
         HoverTarget::Gap(b) => {
             let (from, to) = (samples[b.from].t, samples[b.to].t);
@@ -2134,12 +2210,16 @@ mod tests {
             "Sat 3:12p · 7d all 41%"
         );
         assert_eq!(
-            week_projected_tip("Mon 3p", 71.4, Some(90.0)),
+            week_projected_tip("Mon 3p", Some(71.4), Some(90.0)),
             "Mon 3p · projected 7d all 71% · Fable 90%"
         );
         assert_eq!(
-            week_projected_tip("Mon 3p", 71.4, None),
+            week_projected_tip("Mon 3p", Some(71.4), None),
             "Mon 3p · projected 7d all 71%"
+        );
+        assert_eq!(
+            week_projected_tip("Mon 3p", None, Some(100.0)),
+            "Mon 3p · projected Fable 100%"
         );
     }
 
@@ -2247,6 +2327,54 @@ mod tests {
         // A small dip (not a reset) interpolates down and back.
         let dip = through_change_points(&v(&[(0, 10.0), (10, 9.0), (20, 9.0), (30, 10.0)]));
         assert_eq!(dip, [10.0, 9.0, 9.5, 10.0]);
+    }
+
+    #[test]
+    fn a_multi_point_jump_holds_then_rises() {
+        let v = |pairs: &[(i64, f64)]| -> Vec<(DateTime<Utc>, f64)> {
+            pairs.iter().map(|&(m, x)| (at(m), x)).collect()
+        };
+        // 40% over a 2 h lunch, then 55%: no 2 h ramp to 55.
+        let got = through_change_points(&v(&[(0, 40.0), (60, 40.0), (120, 40.0), (121, 55.0)]));
+        assert_eq!(got[0], 40.0);
+        assert!(got[1] <= 41.0 && got[2] <= 41.0, "{got:?}");
+        assert_eq!(got[3], 55.0);
+        // A fall is held the other way.
+        let got = through_change_points(&v(&[(0, 50.0), (60, 50.0), (61, 30.0)]));
+        assert!(got[1] >= 49.0 && got[1] <= 50.0, "{got:?}");
+        // Within a segment, drawn values follow; outside, none.
+        let pts: Vec<Point> = [(0, Some(1.0)), (5, None), (6, Some(2.0)), (16, Some(3.0))]
+            .iter()
+            .map(|&(m, x)| Point {
+                t: at(m),
+                value: x,
+                overlay: None,
+            })
+            .collect();
+        let segs = segments(&pts, gap());
+        let drawn = drawn_values(&pts, &segs, Series::Main);
+        assert_eq!(drawn, vec![Some(1.0), None, Some(2.0), Some(3.0)]);
+    }
+
+    #[test]
+    fn a_flat_gap_stays_solid_a_changed_one_bridges() {
+        let samples = [
+            s(0, Some(40.0)),
+            s(120, Some(40.0)), // 2 h, same value: known flat, solid
+            s(240, Some(42.0)), // 2 h, changed: break and bridge
+        ];
+        let segs = segments(&samples, gap());
+        assert_eq!(segs, vec![0..2, 2..3]);
+        assert_eq!(bridges(&samples, &segs), vec![Bridge { from: 1, to: 2 }]);
+    }
+
+    #[test]
+    fn cap_text_only_with_room() {
+        let cap = EndLabel::Cap(at(0));
+        assert!(label_shown(cap, 80.0, 70.0));
+        assert!(!label_shown(cap, 60.0, 70.0));
+        assert!(!label_shown(EndLabel::AtCap, 500.0, 10.0));
+        assert!(label_shown(EndLabel::Safe, 0.0, 70.0));
     }
 
     #[test]
