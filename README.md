@@ -19,7 +19,7 @@ The window opens at 420x460 (minimum 360x320) in a warm dark theme. From top to 
   - Hover for a crosshair with the time, the utilization and the Fable share; past "now" it shows the projected value.
 - **Footer strip**:
   - **7d**: a sparkline of the last 7 days: one bar per day for that day's highest 7-day utilization, on a fixed 0–100% scale, with the Fable share at the bottom of each bar and today outlined. Hover a bar for the day and its value.
-  - **Burn**: the 15-minute rate for all usage ("+0.21%/min") and either "cap in 1h 48m" or "safe till reset". Hover for the full burn line. The rate is available right after a restart, because it is seeded from the saved history.
+  - **Burn**: the 15-minute rate for all usage ("+0.21%/min") and either "cap in 1h 48m" or "safe until reset". Hover for the full burn line. The rate is available right after a restart, because it is seeded from the saved history.
   - **Extra**: credits used against your monthly limit as a small gauge ("$23 / $35"), when extra usage is set up. Hover for the details, including why extra usage is disabled if it is.
 - **Details** (click to expand; it stays open or closed across restarts):
   - The other usage windows (per-model caps beyond Fable). Windows at 0% are hidden unless "Show all buckets" is on.

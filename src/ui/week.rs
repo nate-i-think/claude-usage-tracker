@@ -10,17 +10,19 @@
 //! git history for `ui/charts.rs`). Geometry and text are pure functions
 //! tested without a GPU; [`show_week`] only paints.
 
-use chrono::{Local, NaiveDate};
+use std::fmt::Display;
+
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike, Utc};
 use eframe::egui::{
     pos2, vec2, Align2, CornerRadius, Painter, Pos2, Rect, Response, Sense, Stroke, StrokeKind,
     TextStyle, Ui,
 };
 
-use crate::analytics::{self, CHART_HEIGHT, FABLE_TO_WEEKLY_ALL_RATIO};
+use crate::analytics::{self, Level, WeeklyOutlook, CHART_HEIGHT, FABLE_TO_WEEKLY_ALL_RATIO};
 use crate::poller::Dashboard;
 
 use super::theme::Palette;
-use super::timeline;
+use super::{timeline, Run, Tone};
 
 /// The card's title.
 pub const TITLE: &str = "Last 7 days";
@@ -172,6 +174,71 @@ pub fn subtitle(bars: &[DayBar]) -> String {
         )
 }
 
+/// The outlook row's label, so the weekly figure never reads as a 5-hour
+/// one.
+pub const OUTLOOK_LABEL: &str = "7d pace  ";
+/// The outlook row's tooltip: how the figure is made.
+pub const OUTLOOK_HOVER: &str = "7-day all: the rate over the last 24 h (since the \
+weekly reset, if later), projected to the weekly reset";
+
+/// A weekday and compact time: "Tue 3p" on the hour, else "Thu 9:30a".
+pub fn weekday_time_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    let local = t.with_timezone(tz);
+    let suffix = if local.hour() < 12 { 'a' } else { 'p' };
+    let clock = if local.minute() == 0 {
+        local.format("%-I").to_string()
+    } else {
+        local.format("%-I:%M").to_string()
+    };
+    format!("{} {clock}{suffix}", local.format("%a"))
+}
+
+/// The weekly projection in brief, in its level colors: "+21%/day · cap
+/// in 2d 5h (Tue 3p)", "+6%/day · ≈78% at reset · safe until Thu 9a",
+/// "+0.2%/day · steady", the rate alone without a reset, or "need more
+/// history".
+pub fn outlook_runs<Tz: TimeZone>(o: &WeeklyOutlook, tz: &Tz) -> Vec<Run>
+where
+    Tz::Offset: Display,
+{
+    let tone = Tone::Level(o.level());
+    let rate = |r: f64| Run::new(analytics::fmt_rate_per_day(r), tone);
+    match *o {
+        WeeklyOutlook::NeedHistory => vec![Run::new("need more history", Tone::Dim)],
+        WeeklyOutlook::Steady { rate: r } => vec![
+            rate(r),
+            Run::new(" · ", Tone::Dim),
+            Run::new("steady", Tone::Level(Level::Green)),
+        ],
+        WeeklyOutlook::RateOnly { rate: r } => vec![rate(r)],
+        WeeklyOutlook::Cap {
+            rate: r,
+            at,
+            minutes,
+            ..
+        } => vec![
+            rate(r),
+            Run::new(" · cap in ", Tone::Dim),
+            Run::new(analytics::fmt_days(minutes), tone),
+            Run::new(format!(" ({})", weekday_time_in(at, tz)), Tone::Dim),
+        ],
+        WeeklyOutlook::Safe {
+            rate: r,
+            at_reset,
+            reset,
+        } => vec![
+            rate(r),
+            Run::new(" · ", Tone::Dim),
+            Run::new(format!("≈{at_reset:.0}% at reset"), tone),
+            Run::new(" · ", Tone::Dim),
+            Run::new(format!("safe until {}", weekday_time_in(reset, tz)), tone),
+        ],
+    }
+}
+
 /// Slot `i` of `n` across `plot`: its x range over the plot's full height.
 pub fn slot_rect(plot: Rect, i: usize, n: usize) -> Rect {
     let w = plot.width() / n.max(1) as f32;
@@ -307,14 +374,30 @@ pub fn show_week(ui: &mut Ui, bars: &[DayBar], palette: &Palette, height: f32) -
     }
 }
 
-/// The chart's card: the title with the peak as its subtitle, then the
-/// chart, `height` tall.
-pub fn show_week_card(ui: &mut Ui, d: &Dashboard, palette: &Palette, height: f32) {
+/// The chart's card: the title with the peak as its subtitle, the chart,
+/// `height` tall, and the "7d pace" row (the weekly projection) under it.
+pub fn show_week_card(
+    ui: &mut Ui,
+    d: &Dashboard,
+    now: DateTime<Utc>,
+    palette: &Palette,
+    height: f32,
+) {
     let bars = day_bars(&d.daily_history, &d.fable_daily);
+    let snap = &d.snapshot;
+    let outlook = analytics::weekly_outlook(
+        &d.seven_day_recent,
+        snap.seven_day_pct(),
+        snap.seven_day_resets_at(),
+        now,
+    );
+    let mut runs = vec![Run::new(OUTLOOK_LABEL, Tone::Dim)];
+    runs.extend(outlook_runs(&outlook, &Local));
     super::theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());
         super::theme::chart_title(ui, palette, TITLE, Some(&subtitle(&bars)));
         show_week(ui, &bars, palette, height);
+        super::show_runs(ui, &runs).on_hover_text(OUTLOOK_HOVER);
     });
 }
 
@@ -570,6 +653,53 @@ mod tests {
         // A 0.5% bar is still a stub tall.
         let tiny = BarShape::Bar(split(0.0, 0.5, 0.0).unwrap());
         assert_eq!(shape_top(plot, tiny), 100.0 - ZERO_STUB);
+    }
+
+    #[test]
+    fn weekday_times() {
+        let t = |d, h, m| Utc.with_ymd_and_hms(2026, 10, d, h, m, 0).unwrap();
+        assert_eq!(weekday_time_in(t(13, 15, 0), &Utc), "Tue 3p");
+        assert_eq!(weekday_time_in(t(15, 9, 30), &Utc), "Thu 9:30a");
+        assert_eq!(weekday_time_in(t(11, 0, 5), &Utc), "Sun 12:05a");
+    }
+
+    #[test]
+    fn outlook_copy() {
+        use crate::ui::plain_text;
+        let t = |d, h| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        let cap = WeeklyOutlook::Cap {
+            rate: 21.3,
+            at: t(13, 15),
+            minutes: 2.0 * 1440.0 + 5.0 * 60.0,
+            level: Level::Orange,
+        };
+        let runs = outlook_runs(&cap, &Utc);
+        assert_eq!(plain_text(&runs), "+21%/day · cap in 2d 5h (Tue 3p)");
+        assert!(runs.contains(&Run::new("2d 5h", Tone::Level(Level::Orange))));
+        assert!(runs.contains(&Run::new("+21%/day", Tone::Level(Level::Orange))));
+
+        let safe = WeeklyOutlook::Safe {
+            rate: 6.0,
+            at_reset: 77.6,
+            reset: t(15, 9),
+        };
+        let runs = outlook_runs(&safe, &Utc);
+        assert_eq!(
+            plain_text(&runs),
+            "+6%/day · ≈78% at reset · safe until Thu 9a"
+        );
+        assert!(runs.contains(&Run::new("safe until Thu 9a", Tone::Level(Level::Green))));
+
+        let steady = outlook_runs(&WeeklyOutlook::Steady { rate: 0.2 }, &Utc);
+        assert_eq!(plain_text(&steady), "+0.2%/day · steady");
+        let only = outlook_runs(&WeeklyOutlook::RateOnly { rate: 20.0 }, &Utc);
+        assert_eq!(only, vec![Run::new("+20%/day", Tone::Level(Level::Orange))]);
+        let need = outlook_runs(&WeeklyOutlook::NeedHistory, &Utc);
+        assert_eq!(need, vec![Run::new("need more history", Tone::Dim)]);
+        // Neither ever says "till".
+        for o in [cap, safe] {
+            assert!(!plain_text(&outlook_runs(&o, &Utc)).contains("till"));
+        }
     }
 
     #[test]
