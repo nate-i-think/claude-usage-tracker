@@ -139,30 +139,11 @@ pub fn icon_background(level: Level) -> Color32 {
 pub fn digit_color(bg: Color32) -> Color32 {
     let white = Color32::WHITE;
     let dark = theme::LIGHT.text;
-    if contrast(white, bg) >= contrast(dark, bg) {
+    if theme::contrast(white, bg) >= theme::contrast(dark, bg) {
         white
     } else {
         dark
     }
-}
-
-/// WCAG relative luminance.
-fn luminance(c: Color32) -> f64 {
-    let lin = |v: u8| {
-        let s = v as f64 / 255.0;
-        if s <= 0.040_45 {
-            s / 12.92
-        } else {
-            ((s + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-}
-
-/// WCAG contrast ratio.
-pub fn contrast(a: Color32, b: Color32) -> f64 {
-    let (la, lb) = (luminance(a), luminance(b));
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 /// 3x5 pixel glyphs, one row per byte, high bit on the left.
@@ -700,7 +681,7 @@ mod tests {
             Level::Dim,
         ] {
             let bg = icon_background(level);
-            assert!(contrast(digit_color(bg), bg) >= 4.5, "{level:?}");
+            assert!(theme::contrast(digit_color(bg), bg) >= 4.5, "{level:?}");
         }
     }
 

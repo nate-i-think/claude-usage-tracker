@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use eframe::egui::{
     text::{ByteIndex, LayoutJob, LayoutSection},
-    vec2, Align2, Color32, FontId, Galley, Painter, Pos2, Rect, Response, Sense, TextFormat, Ui,
+    vec2, Color32, FontId, Galley, Painter, Response, Sense, TextFormat, Ui,
 };
 
 /// One piece of a laid-out number: a single digit, or a run of non-digits.
@@ -113,21 +113,6 @@ pub fn number_galley(
     });
     let galley = painter.layout_job(number_job(&plan, font, color));
     (galley, plan.width)
-}
-
-/// Paint `text` with fixed-width digits, anchored at `pos`; returns its rect.
-pub fn paint_number(
-    painter: &Painter,
-    pos: Pos2,
-    anchor: Align2,
-    text: &str,
-    font: FontId,
-    color: Color32,
-) -> Rect {
-    let (galley, width) = number_galley(painter, text, font, color);
-    let rect = anchor.anchor_size(pos, vec2(width, galley.size().y));
-    painter.galley(rect.min, galley, color);
-    rect
 }
 
 /// A non-interactive label with fixed-width digits.
