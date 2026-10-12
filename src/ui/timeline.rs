@@ -46,7 +46,7 @@ pub const GAP_BREAK_MINUTES: i64 = 10;
 pub const WEEK_GAP_BREAK_MINUTES: i64 = 60;
 /// A drop of more than this many points between samples is a reset and
 /// breaks the line (the rule of [`analytics::recent_window`]).
-pub const RESET_DROP: f64 = 5.0;
+pub const RESET_DROP: f64 = analytics::RESET_DROP;
 /// Gridlines with a label, in %.
 const GRID_MARKS: [f64; 3] = [25.0, 50.0, 75.0];
 /// Usage-area opacity at the line and at the baseline.
