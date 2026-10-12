@@ -42,9 +42,11 @@ pub fn week_window(
     (end - Duration::days(7), end)
 }
 
-/// A week of samples (oldest first) thinned to a bounded size: the last
-/// sample of each [`WEEK_THIN_BUCKET_MINUTES`] bucket, and every sample of
-/// the last [`WEEK_KEEP_ALL_MINUTES`] before `now`. A week at 30 s polls
+/// A week of samples (oldest first) thinned to a bounded size: one sample
+/// per [`WEEK_THIN_BUCKET_MINUTES`] bucket, at the bucket's last time with
+/// each meter's last value in the bucket (a later row missing a meter
+/// doesn't wipe it), and every sample of the last [`WEEK_KEEP_ALL_MINUTES`]
+/// before `now`. A week at 30 s polls
 /// (about 20 000 rows) becomes about 2 100. The weekly meters only rise
 /// within a week, so the last sample of a bucket is its highest.
 pub fn thin_week(samples: &[WeekSample], now: DateTime<Utc>) -> Vec<WeekSample> {
@@ -56,7 +58,11 @@ pub fn thin_week(samples: &[WeekSample], now: DateTime<Utc>) -> Vec<WeekSample> 
         if s.t < keep_all {
             if let Some(last) = out.last_mut() {
                 if last.t < keep_all && bucket(last.t) == bucket(s.t) {
-                    *last = *s;
+                    *last = WeekSample {
+                        t: s.t,
+                        seven_day: s.seven_day.or(last.seven_day),
+                        fable: s.fable.or(last.fable),
+                    };
                     continue;
                 }
             }
@@ -217,6 +223,22 @@ mod tests {
         assert_eq!(thin.last(), samples.last());
         assert!(thin.windows(2).all(|w| w[0].t < w[1].t));
         assert!(thin_week(&[], now).is_empty());
+    }
+
+    #[test]
+    fn thin_week_keeps_each_meters_last_value_in_a_bucket() {
+        let row = |m: i64, seven: Option<f64>, fable: Option<f64>| WeekSample {
+            t: t0() + Duration::minutes(m),
+            seven_day: seven,
+            fable,
+        };
+        let samples = [
+            row(0, Some(10.0), Some(20.0)),
+            row(1, Some(11.0), None),
+            row(2, None, None),
+        ];
+        let thin = thin_week(&samples, t0() + Duration::hours(3));
+        assert_eq!(thin, [row(2, Some(11.0), Some(20.0))]);
     }
 
     #[test]

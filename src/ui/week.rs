@@ -16,11 +16,17 @@ use crate::poller::Dashboard;
 
 use super::layout::CardSize;
 use super::theme::Palette;
-use super::timeline::{self, weekday_time_in, Chart, EndLabel, Line, Overlay, Point, TimeStyle};
+use super::timeline::{
+    self, weekday_time_in, Chart, EndLabel, Line, LineKind, Overlay, Point, TimeStyle,
+};
 use super::{Run, Tone};
 
 /// The card's title.
 pub const TITLE: &str = "7-day window";
+/// A bridged gap's fill on the weekly chart: lighter than the 5-hour
+/// chart's, so the gaps that remain (the value changed across them) don't
+/// read as dark bands.
+pub const WEEK_BRIDGE_FILL: f32 = 0.7;
 
 /// A weekly limit with a projection row under the chart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +210,8 @@ pub fn meters(has_fable: bool) -> Vec<Meter> {
 /// - safe: a line to the % at the reset, "safe";
 /// - steady: a flat line to the window end, "safe" when the reset is known;
 /// - the rate alone: a line to the window end (at most 100%), no label;
-/// - at the cap: no line, "at cap"; no history or no %: nothing.
+/// - at the cap, or a cap time already passed (an aged outlook): no line,
+///   "at cap"; no history or no %: nothing.
 pub fn weekly_line(
     o: &WeeklyOutlook,
     pct: Option<f64>,
@@ -235,17 +242,15 @@ pub fn weekly_line(
             let days = (window_end - now).as_seconds_f64() / 86_400.0;
             line(to_end((pct + rate.per_day * days).min(100.0)), None)
         }
-        WeeklyOutlook::Cap { at, .. } => {
-            let at = at.max(now);
-            line(
-                Projection {
-                    end_t: at,
-                    end_pct: 100.0,
-                    cap_at: Some(at),
-                },
-                Some(EndLabel::Cap(at)),
-            )
-        }
+        WeeklyOutlook::Cap { at, .. } if at <= now => (None, Some(EndLabel::AtCap)),
+        WeeklyOutlook::Cap { at, .. } => line(
+            Projection {
+                end_t: at,
+                end_pct: 100.0,
+                cap_at: Some(at),
+            },
+            Some(EndLabel::Cap(at)),
+        ),
         WeeklyOutlook::Safe {
             at_reset, reset, ..
         } => line(
@@ -257,6 +262,34 @@ pub fn weekly_line(
             Some(EndLabel::Safe),
         ),
     }
+}
+
+/// `projection` (from `pct` now) and `label` cut at the chart's end `chart_end` (Fable's own
+/// reset can fall after the 7-day-all window shown): the line ends at the
+/// edge at its interpolated %, and a cap or "safe" beyond the edge loses
+/// its label and ✕ (the row under the chart still says it).
+pub fn clamp_to_chart(
+    pct: f64,
+    projection: Option<Projection>,
+    label: Option<EndLabel>,
+    now: DateTime<Utc>,
+    chart_end: DateTime<Utc>,
+) -> (Option<Projection>, Option<EndLabel>) {
+    let Some(p) = projection.filter(|p| p.end_t > chart_end) else {
+        return (projection, label);
+    };
+    if chart_end <= now {
+        return (None, None);
+    }
+    let frac = (chart_end - now).as_seconds_f64() / (p.end_t - now).as_seconds_f64();
+    (
+        Some(Projection {
+            end_t: chart_end,
+            end_pct: pct + (p.end_pct - pct) * frac,
+            cap_at: None,
+        }),
+        None,
+    )
 }
 
 /// The weekly outlooks of the rows and the chart: 7-day all, and Fable
@@ -318,8 +351,14 @@ pub fn week_chart(
             };
             let end = resets.unwrap_or(d.week_end);
             let (projection, label) = weekly_line(o, pct, now, end, resets.is_some());
+            let pct = pct?;
+            let (projection, label) = clamp_to_chart(pct, projection, label, now, d.week_end);
             Some(Line {
-                pct: pct?,
+                kind: match m {
+                    Meter::All => LineKind::Main,
+                    Meter::Fable => LineKind::Overlay,
+                },
+                pct,
                 projection,
                 label,
                 color,
@@ -351,6 +390,7 @@ pub fn week_chart(
             "now".to_owned()
         }),
         lines,
+        bridge_fill: WEEK_BRIDGE_FILL,
         style: TimeStyle::Weekday,
         poll_key: snap.fetched_at.timestamp_millis(),
     }
@@ -502,7 +542,57 @@ mod tests {
             minutes: 0.0,
             level: Level::Red,
         };
-        assert_eq!(weekly_line(&late, Some(99.0), now, end, true).0, None);
+        assert_eq!(
+            weekly_line(&late, Some(99.0), now, end, true),
+            (None, Some(EndLabel::AtCap)),
+            "a cap time already passed shows as at the cap"
+        );
+    }
+
+    #[test]
+    fn projections_stop_at_the_chart_end() {
+        let now = t(12, 12);
+        let chart_end = t(13, 12);
+        // Fable caps two days out, after the window shown: the line ends at
+        // the edge, halfway from 60 to 100, without its label.
+        let p = Projection {
+            end_t: t(14, 12),
+            end_pct: 100.0,
+            cap_at: Some(t(14, 12)),
+        };
+        let (q, l) = clamp_to_chart(
+            60.0,
+            Some(p),
+            Some(EndLabel::Cap(t(14, 12))),
+            now,
+            chart_end,
+        );
+        assert_eq!(
+            q,
+            Some(Projection {
+                end_t: chart_end,
+                end_pct: 80.0,
+                cap_at: None
+            })
+        );
+        assert_eq!(l, None);
+        // Inside the chart: untouched.
+        let inside = Projection {
+            end_t: t(13, 0),
+            end_pct: 100.0,
+            cap_at: Some(t(13, 0)),
+        };
+        let label = Some(EndLabel::Cap(t(13, 0)));
+        assert_eq!(
+            clamp_to_chart(60.0, Some(inside), label, now, chart_end),
+            (Some(inside), label)
+        );
+        assert_eq!(
+            clamp_to_chart(60.0, None, Some(EndLabel::AtCap), now, chart_end),
+            (None, Some(EndLabel::AtCap))
+        );
+        // A chart already over: nothing.
+        assert_eq!(clamp_to_chart(60.0, Some(p), label, now, now), (None, None));
     }
 
     #[test]
