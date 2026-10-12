@@ -1068,8 +1068,9 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
     let samples = &chart.points;
     let segs = segments(samples, chart.gap_break);
     if segs.is_empty() {
+        // Between the 50% and 75% gridlines, so neither strikes it through.
         painter.text(
-            axes.plot.center(),
+            pos2(axes.plot.center().x, y_in(axes.plot, 62.5)),
             Align2::CENTER_CENTER,
             chart.note.unwrap_or(COLLECTING_NOTE),
             font,
