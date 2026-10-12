@@ -43,6 +43,9 @@ const FLOOR_GAP: f32 = 1.5;
 const BAR_RADIUS: u8 = 3;
 /// How far today's outline sits outside its bar.
 const TODAY_PAD: f32 = 3.0;
+/// Height of the chart when it stacks under the timeline: shorter than the
+/// timeline's [`timeline::FULL_HEIGHT`], so both fit the default window.
+pub const STACKED_HEIGHT: f32 = 140.0;
 
 /// How one bar is drawn: `orange` (the Fable floor) from 0, then `rest` in
 /// the bar color on top. Both in y-axis %, summing to the bar height.
@@ -192,6 +195,27 @@ pub fn notch_fits(rest_px: f32) -> bool {
     rest_px > FLOOR_GAP + 0.5
 }
 
+/// The y of the top of `shape` drawn on `plot`: the bar's top (at least a
+/// zero stub tall), the zero stub's, or the no-data stub's.
+pub fn shape_top(plot: Rect, shape: BarShape) -> f32 {
+    let base = plot.bottom();
+    match shape {
+        BarShape::NoData => base - NO_DATA_STUB.min(plot.height()),
+        BarShape::Zero => base - ZERO_STUB,
+        BarShape::Bar(s) => timeline::y_in(plot, s.orange + s.rest).min(base - ZERO_STUB),
+    }
+}
+
+/// Today's outline: [`TODAY_PAD`] around the bar (or stub) in `column`,
+/// down to the baseline, so it hugs the bar instead of boxing the slot.
+pub fn today_outline(plot: Rect, column: Rect, shape: BarShape) -> Rect {
+    let top = (shape_top(plot, shape) - TODAY_PAD).max(plot.top());
+    Rect::from_x_y_ranges(
+        (column.left() - TODAY_PAD)..=(column.right() + TODAY_PAD),
+        top..=plot.bottom(),
+    )
+}
+
 /// The no-data stub's outline: up the left side, across the top, down the
 /// right side of a `column`-wide stub standing on the baseline (open at the
 /// bottom, which the baseline closes).
@@ -235,17 +259,22 @@ pub fn show_week(ui: &mut Ui, bars: &[DayBar], palette: &Palette, height: f32) -
         let slot = slot_rect(plot, i, n);
         let column = bar_column(slot);
         let is_today = bar.date == today;
+        let shape = bar_shape(bar);
         if is_today {
             // A neutral outline, so today never competes with the clay
             // Fable floor.
             painter.rect_stroke(
-                column.expand2(vec2(TODAY_PAD, 0.0)),
-                CornerRadius::same(4),
+                today_outline(plot, column, shape),
+                CornerRadius {
+                    nw: 5,
+                    ne: 5,
+                    ..CornerRadius::ZERO
+                },
                 Stroke::new(1.0, palette.control_border),
                 StrokeKind::Outside,
             );
         }
-        paint_bar(&painter, palette, plot, column, bar_shape(bar));
+        paint_bar(&painter, palette, plot, column, shape);
 
         let color = if is_today {
             palette.text
@@ -308,7 +337,7 @@ fn paint_bar(painter: &Painter, palette: &Palette, plot: Rect, column: Rect, sha
             painter.rect_filled(stub, 1.0, palette.bar);
         }
         BarShape::Bar(s) => {
-            let top_y = timeline::y_in(plot, s.orange + s.rest).min(base - ZERO_STUB);
+            let top_y = shape_top(plot, shape);
             let floor_y = timeline::y_in(plot, s.orange);
             let top = CornerRadius {
                 nw: BAR_RADIUS,
@@ -519,6 +548,28 @@ mod tests {
         // Never taller than the plot.
         let short = Rect::from_min_max(pos2(0.0, 95.0), pos2(10.0, 100.0));
         assert_eq!(no_data_outline(short)[1].y, 95.0);
+    }
+
+    #[test]
+    fn today_outline_hugs_the_bar() {
+        let plot = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0));
+        let col = Rect::from_min_max(pos2(10.0, 0.0), pos2(30.0, 100.0));
+        let bar = BarShape::Bar(split(0.0, 40.0, 0.0).unwrap());
+        assert_eq!(shape_top(plot, bar), 60.0);
+        let r = today_outline(plot, col, bar);
+        assert_eq!(r.left(), 10.0 - TODAY_PAD);
+        assert_eq!(r.right(), 30.0 + TODAY_PAD);
+        assert_eq!(r.top(), 60.0 - TODAY_PAD);
+        assert_eq!(r.bottom(), 100.0);
+        // A full bar's outline stays inside the plot.
+        let full = BarShape::Bar(split(0.0, 100.0, 0.0).unwrap());
+        assert_eq!(today_outline(plot, col, full).top(), 0.0);
+        // Stubs: zero and no data.
+        assert_eq!(shape_top(plot, BarShape::Zero), 100.0 - ZERO_STUB);
+        assert_eq!(shape_top(plot, BarShape::NoData), 100.0 - NO_DATA_STUB);
+        // A 0.5% bar is still a stub tall.
+        let tiny = BarShape::Bar(split(0.0, 0.5, 0.0).unwrap());
+        assert_eq!(shape_top(plot, tiny), 100.0 - ZERO_STUB);
     }
 
     #[test]
