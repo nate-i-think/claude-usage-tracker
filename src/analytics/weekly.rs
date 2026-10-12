@@ -1,11 +1,17 @@
-//! The weekly projection: where the 7-day-all meter lands at its reset.
+//! The weekly projections: where a weekly meter (7-day all, or Fable's own
+//! 7-day limit) lands at its reset.
 //!
 //! The 5-hour burn rate (15 minutes of samples) says nothing about the
-//! week, so the weekly rate is taken over a long trailing window: the last
-//! [`WEEKLY_RATE_HOURS`] of 7-day-all samples, clipped to the current
-//! weekly window (`resets_at - 7d`), so a weekly reset never yields a
-//! negative or garbage slope. Projected at the reset, it either crosses
-//! 100% first ("cap in 2d 5h") or lands under it ("≈78% at reset").
+//! week, so the weekly rate is taken over a long trailing window: from
+//! `start = max(now - 24h, resets_at - 7d)` to now. A weekly meter only
+//! rises within its week, so the latest sample at or before `start` (the
+//! anchor) bounds the meter at `start` from below, and the rate is the rise
+//! from the anchor over the whole `now - start` (an upper bound, the safe
+//! side for a warning). Without an anchor (the app was closed, or the week
+//! just reset) the rate is the rise over the measured span. Either way a
+//! rise is never divided by less than [`WEEKLY_FLOOR_HOURS`], so a short
+//! burst can't project a cap. Projected at the reset, the meter either crosses 100% first ("cap
+//! in 2d 5h") or lands under it ("≈78% at reset").
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -13,8 +19,10 @@ use super::Level;
 
 /// The weekly rate is measured over the most recent this-many hours.
 pub const WEEKLY_RATE_HOURS: i64 = 24;
-/// Fewer hours of samples than this: no rate ("need more history").
+/// A span shorter than this gives no rate ("need more history").
 pub const WEEKLY_MIN_SPAN_HOURS: i64 = 2;
+/// A rise is never spread over less than this.
+pub const WEEKLY_FLOOR_HOURS: i64 = 6;
 /// At or below this %/day the week counts as steady.
 pub const WEEKLY_STEADY_PER_DAY: f64 = 0.5;
 /// A cap closer than this many hours is red, else orange.
@@ -23,99 +31,155 @@ const WEEKLY_RED_HOURS: f64 = 24.0;
 /// rule of [`super::recent_window`]).
 const RESET_DROP: f64 = 5.0;
 
-/// Weekly rate in %/day over the last [`WEEKLY_RATE_HOURS`] of `samples`
-/// (7-day-all, oldest first) up to `now`, using only samples since the
-/// current weekly window started (`resets_at - 7d`, when known) and after
-/// the last drop of more than 5 points (a reset the clipping missed).
-/// `None` when the kept samples span less than [`WEEKLY_MIN_SPAN_HOURS`].
+/// How a weekly rate was measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateBasis {
+    /// From a sample at or before the start, over the whole span.
+    Anchored,
+    /// No sample at or before the start: over the measured span.
+    Partial,
+}
+
+/// A weekly rate and what it was measured over.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeeklyRate {
+    /// %/day.
+    pub per_day: f64,
+    /// The span the rate covers: `now - start` when anchored, else the
+    /// measured span.
+    pub span: Duration,
+    pub basis: RateBasis,
+    /// The span was under [`WEEKLY_FLOOR_HOURS`], so the rise was spread
+    /// over the floor instead.
+    pub floored: bool,
+    /// The start was clipped to the weekly window's start (a recent reset).
+    pub since_reset: bool,
+}
+
+/// Weekly rate over the trailing window of `samples` (one weekly meter,
+/// oldest first, possibly with samples before the window) up to `now`.
+///
+/// Only samples within the current week (`resets_at - 7d`, when known) and
+/// after the last drop of more than 5 points (a reset the clipping missed)
+/// count. `None` with nothing measured inside the window, or a span under
+/// [`WEEKLY_MIN_SPAN_HOURS`].
 pub fn weekly_rate(
     samples: &[(DateTime<Utc>, Option<f64>)],
     resets_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-) -> Option<f64> {
-    let mut start = now - Duration::hours(WEEKLY_RATE_HOURS);
-    if let Some(reset) = resets_at {
-        start = start.max(reset - Duration::days(7));
-    }
-    let kept: Vec<(DateTime<Utc>, f64)> = samples
+) -> Option<WeeklyRate> {
+    let week_start = resets_at.map(|r| r - Duration::days(7));
+    let trailing = now - Duration::hours(WEEKLY_RATE_HOURS);
+    let start = week_start.filter(|w| *w > trailing).unwrap_or(trailing);
+    let since_reset = start > trailing;
+    let valid: Vec<(DateTime<Utc>, f64)> = samples
         .iter()
-        .filter(|(t, _)| *t >= start && *t <= now)
+        .filter(|(t, _)| *t <= now && week_start.is_none_or(|w| *t >= w))
         .filter_map(|(t, v)| v.filter(|v| !v.is_nan()).map(|v| (*t, v)))
         .collect();
-    let after_reset = kept
+    let after_reset = valid
         .windows(2)
         .rposition(|pair| pair[1].1 + RESET_DROP < pair[0].1)
         .map_or(0, |i| i + 1);
-    let [(t0, p0), .., (t1, p1)] = &kept[after_reset..] else {
-        return None;
+    let valid = &valid[after_reset..];
+    let &(last_t, last) = valid.last()?;
+    let (from, span, basis) = match valid.iter().rev().find(|(t, _)| *t <= start) {
+        Some(_) if last_t <= start => return None, // nothing inside the window
+        Some(&(_, anchor)) => (anchor, now - start, RateBasis::Anchored),
+        None => {
+            let &(first_t, first) = valid.first()?;
+            (first, last_t - first_t, RateBasis::Partial)
+        }
     };
-    let span = *t1 - *t0;
     if span < Duration::hours(WEEKLY_MIN_SPAN_HOURS) {
         return None;
     }
-    let days = span.as_seconds_f64() / 86_400.0;
-    Some((p1 - p0) / days)
+    let floor = Duration::hours(WEEKLY_FLOOR_HOURS);
+    Some(WeeklyRate {
+        per_day: (last - from) / (span.max(floor).as_seconds_f64() / 86_400.0),
+        span,
+        basis,
+        floored: span < floor,
+        since_reset,
+    })
 }
 
-/// What the weekly projection says.
+/// What a weekly projection says.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WeeklyOutlook {
-    /// Under [`WEEKLY_MIN_SPAN_HOURS`] of usable samples.
+    /// Not enough samples for a rate.
     NeedHistory,
-    /// The rate is at most [`WEEKLY_STEADY_PER_DAY`], or the meter is
-    /// already at 100%.
-    Steady { rate: f64 },
+    /// The meter is at or over 100%; it frees up at `reset`.
+    AtCap { reset: Option<DateTime<Utc>> },
+    /// The rate is at most [`WEEKLY_STEADY_PER_DAY`].
+    Steady { rate: WeeklyRate },
     /// The reset (or the current %) is unknown: the rate alone.
-    RateOnly { rate: f64 },
+    RateOnly { rate: WeeklyRate },
     /// 100% comes before the reset, at `at`, `minutes` from now.
     Cap {
-        rate: f64,
+        rate: WeeklyRate,
         at: DateTime<Utc>,
         minutes: f64,
         level: Level,
     },
     /// The reset comes first, with the meter at `at_reset` %.
     Safe {
-        rate: f64,
+        rate: WeeklyRate,
         at_reset: f64,
         reset: DateTime<Utc>,
     },
 }
 
 impl WeeklyOutlook {
-    /// Color of the outlook: green when steady or safe, red for a cap
-    /// within a day, orange for a later one, dim without a
-    /// rate. The rate alone is colored by the %/day (green at a pace that
-    /// would fill a week in more than a week, i.e. under 100/7 %/day).
+    /// Color of the outlook: red at the cap or for a cap within a day,
+    /// orange for a later cap, green when steady or safe, dim without a
+    /// rate. The rate alone is orange at a pace that fills a week in under
+    /// a week (over 100/7 %/day), else green.
     pub fn level(&self) -> Level {
         match *self {
             WeeklyOutlook::NeedHistory => Level::Dim,
+            WeeklyOutlook::AtCap { .. } => Level::Red,
             WeeklyOutlook::Steady { .. } | WeeklyOutlook::Safe { .. } => Level::Green,
             WeeklyOutlook::Cap { level, .. } => level,
-            WeeklyOutlook::RateOnly { rate } if rate > 100.0 / 7.0 => Level::Orange,
+            WeeklyOutlook::RateOnly { rate } if rate.per_day > 100.0 / 7.0 => Level::Orange,
             WeeklyOutlook::RateOnly { .. } => Level::Green,
+        }
+    }
+
+    /// The rate behind the outlook, if any.
+    pub fn rate(&self) -> Option<WeeklyRate> {
+        match *self {
+            WeeklyOutlook::NeedHistory | WeeklyOutlook::AtCap { .. } => None,
+            WeeklyOutlook::Steady { rate }
+            | WeeklyOutlook::RateOnly { rate }
+            | WeeklyOutlook::Cap { rate, .. }
+            | WeeklyOutlook::Safe { rate, .. } => Some(rate),
         }
     }
 }
 
-/// The weekly projection for the 7-day-all meter at `pct`, resetting at
-/// `resets_at`, from `samples` (see [`weekly_rate`]) at `now`.
+/// The projection for one weekly meter at `pct`, resetting at `resets_at`,
+/// from its `samples` (see [`weekly_rate`]) at `now`. At or over 100% it is
+/// [`WeeklyOutlook::AtCap`] whatever the history.
 pub fn weekly_outlook(
     samples: &[(DateTime<Utc>, Option<f64>)],
     pct: Option<f64>,
     resets_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> WeeklyOutlook {
+    if pct.is_some_and(|p| p >= 100.0) {
+        return WeeklyOutlook::AtCap { reset: resets_at };
+    }
     let Some(rate) = weekly_rate(samples, resets_at, now) else {
         return WeeklyOutlook::NeedHistory;
     };
-    if rate <= WEEKLY_STEADY_PER_DAY || pct.is_some_and(|p| p >= 100.0) {
+    if rate.per_day <= WEEKLY_STEADY_PER_DAY {
         return WeeklyOutlook::Steady { rate };
     }
     let (Some(pct), Some(reset)) = (pct, resets_at.filter(|r| *r > now)) else {
         return WeeklyOutlook::RateOnly { rate };
     };
-    let minutes = (100.0 - pct) / rate * 1440.0;
+    let minutes = (100.0 - pct) / rate.per_day * 1440.0;
     let to_reset = (reset - now).as_seconds_f64() / 60.0;
     if minutes <= to_reset {
         let level = if minutes < WEEKLY_RED_HOURS * 60.0 {
@@ -133,10 +197,28 @@ pub fn weekly_outlook(
     } else {
         WeeklyOutlook::Safe {
             rate,
-            at_reset: pct + rate * to_reset / 1440.0,
+            at_reset: pct + rate.per_day * to_reset / 1440.0,
             reset,
         }
     }
+}
+
+/// What the rate was measured over, for a tooltip: "over last 24h",
+/// "over last 3h (app was closed)", "over last 5h (since the weekly
+/// reset)", plus ", spread over 6h" when the floor applied.
+pub fn rate_basis_text(rate: &WeeklyRate) -> String {
+    let hours = ((rate.span.num_minutes() as f64) / 60.0).round().max(1.0);
+    let why = match (rate.basis, rate.since_reset) {
+        (_, true) => " (since the weekly reset)",
+        (RateBasis::Partial, false) => " (app was closed)",
+        (RateBasis::Anchored, false) => "",
+    };
+    let floor = if rate.floored {
+        format!(", spread over {WEEKLY_FLOOR_HOURS}h")
+    } else {
+        String::new()
+    };
+    format!("over last {hours:.0}h{why}{floor}")
 }
 
 /// A %/day rate: "+21%/day", "+0.4%/day" under 1, "-3%/day".
@@ -187,53 +269,111 @@ mod tests {
     }
 
     #[test]
-    fn rate_over_the_trailing_day() {
-        // 48 h of samples at 12%/day: only the last 24 h count.
-        let s = rising(48, 10.0, 12.0);
-        assert!(close(weekly_rate(&s, None, now()).unwrap(), 12.0));
-        // A steeper first day doesn't leak in.
-        let mut s = rising(24, 40.0, 6.0);
-        s.insert(0, (h(-30.0), Some(0.0)));
-        assert!(close(weekly_rate(&s, None, now()).unwrap(), 6.0));
-        // Missing values are skipped, future samples ignored.
+    fn anchored_rate_over_the_trailing_day() {
+        // 48 h of samples at 12%/day: anchored at 24 h ago.
+        let r = weekly_rate(&rising(48, 10.0, 12.0), None, now()).unwrap();
+        assert!(close(r.per_day, 12.0));
+        assert_eq!(r.basis, RateBasis::Anchored);
+        assert_eq!(r.span, Duration::hours(24));
+        assert!(!r.since_reset);
+        // A steeper earlier stretch doesn't leak in; missing values are
+        // skipped; future samples are ignored.
         let s = vec![
-            (h(-10.0), Some(20.0)),
+            (h(-30.0), Some(0.0)),
+            (h(-25.0), Some(40.0)),
             (h(-5.0), None),
-            (h(0.0), Some(25.0)),
+            (h(0.0), Some(46.0)),
             (h(1.0), Some(99.0)),
         ];
-        assert!(close(weekly_rate(&s, None, now()).unwrap(), 12.0));
+        let r = weekly_rate(&s, None, now()).unwrap();
+        assert!(close(r.per_day, 6.0));
+        assert_eq!(r.basis, RateBasis::Anchored);
+    }
+
+    #[test]
+    fn a_short_burst_after_a_gap_is_anchored_not_inflated() {
+        // The app was closed from 20 h ago until 1 h ago. Measured from the
+        // first sample after the start, the rise would be 1 point in 1 h
+        // (24%/day); anchored at the latest sample at or before the start
+        // (48% at -26 h), it is 8 points over the whole 24 h.
+        let s = vec![
+            (h(-26.0), Some(48.0)),
+            (h(-1.0), Some(55.0)),
+            (h(0.0), Some(56.0)),
+        ];
+        let r = weekly_rate(&s, None, now()).unwrap();
+        assert_eq!(r.basis, RateBasis::Anchored);
+        assert_eq!(r.span, Duration::hours(24));
+        assert!(close(r.per_day, 8.0));
+    }
+
+    #[test]
+    fn unanchored_rate_over_the_measured_span_with_a_floor() {
+        // History starts 10 h ago: 10 h measured, no floor.
+        let r = weekly_rate(&rising(10, 20.0, 12.0), None, now()).unwrap();
+        assert!(close(r.per_day, 12.0));
+        assert_eq!(r.basis, RateBasis::Partial);
+        assert!(!r.floored);
+        assert_eq!(r.span, Duration::hours(10));
+        // 3 h measured: +3 points spread over the 6 h floor is 12%/day,
+        // not 24%/day.
+        let s = vec![(h(-3.0), Some(20.0)), (h(0.0), Some(23.0))];
+        let r = weekly_rate(&s, None, now()).unwrap();
+        assert!(close(r.per_day, 12.0));
+        assert_eq!(r.basis, RateBasis::Partial);
+        assert!(r.floored);
+        assert_eq!(r.span, Duration::hours(3));
+        // Under 2 h: no rate.
+        let s = vec![(h(-1.9), Some(10.0)), (h(0.0), Some(12.0))];
+        assert_eq!(weekly_rate(&s, None, now()), None);
+        assert_eq!(weekly_rate(&[(h(0.0), Some(5.0))], None, now()), None);
+        assert_eq!(weekly_rate(&[], None, now()), None);
+    }
+
+    #[test]
+    fn an_anchor_with_nothing_after_the_start_gives_no_rate() {
+        let s = vec![(h(-30.0), Some(10.0)), (h(-25.0), Some(12.0))];
+        assert_eq!(weekly_rate(&s, None, now()), None);
     }
 
     #[test]
     fn rate_is_clipped_to_the_weekly_window() {
-        // The week reset 6 h ago: 90% before, 2% → 8% since.
+        // The week reset 6 h ago: 90% before, 2% → 8% since. The samples
+        // before the reset are dropped, so the 6 h since are measured.
         let reset_at = h(-6.0) + Duration::days(7);
-        let mut s = vec![(h(-20.0), Some(88.0)), (h(-7.0), Some(90.0))];
-        s.extend([(h(-6.0), Some(2.0)), (h(0.0), Some(8.0))]);
-        assert!(close(weekly_rate(&s, Some(reset_at), now()).unwrap(), 24.0));
+        let s = vec![
+            (h(-20.0), Some(88.0)),
+            (h(-7.0), Some(90.0)),
+            (h(-6.0), Some(2.0)),
+            (h(0.0), Some(8.0)),
+        ];
+        let r = weekly_rate(&s, Some(reset_at), now()).unwrap();
+        assert!(close(r.per_day, 24.0));
+        assert!(r.since_reset);
         // An unknown reset: the drop still restarts the slope.
-        assert!(close(weekly_rate(&s, None, now()).unwrap(), 24.0));
-    }
-
-    #[test]
-    fn rate_needs_two_hours_of_span() {
-        let s = vec![(h(-1.9), Some(10.0)), (h(0.0), Some(12.0))];
-        assert_eq!(weekly_rate(&s, None, now()), None);
-        let s = vec![(h(-2.0), Some(10.0)), (h(0.0), Some(12.0))];
-        assert!(close(weekly_rate(&s, None, now()).unwrap(), 24.0));
-        assert_eq!(weekly_rate(&[(h(0.0), Some(5.0))], None, now()), None);
-        assert_eq!(weekly_rate(&[], None, now()), None);
+        let r = weekly_rate(&s, None, now()).unwrap();
+        assert!(close(r.per_day, 24.0));
+        assert!(!r.since_reset);
+        // A reset 3 h ago with a sample right at it: anchored, but the
+        // 3 h rise is spread over the 6 h floor.
+        let reset_at = h(-3.0) + Duration::days(7);
+        let s = rising(24, 10.0, 12.0);
+        let r = weekly_rate(&s, Some(reset_at), now()).unwrap();
+        assert_eq!(r.basis, RateBasis::Anchored);
+        assert!(r.floored && r.since_reset);
+        assert!(close(r.per_day, 6.0));
         // A reset 1 h ago leaves too little of this week.
         let reset_at = h(-1.0) + Duration::days(7);
-        let s = rising(24, 10.0, 12.0);
-        assert_eq!(weekly_rate(&s, Some(reset_at), now()), None);
+        assert_eq!(
+            weekly_rate(&rising(24, 10.0, 12.0), Some(reset_at), now()),
+            None
+        );
     }
 
     #[test]
     fn cap_before_reset() {
         // 60% rising 20%/day, reset in 3 days: 100% in 2 days.
-        let s = rising(24, 40.0, 20.0);
+        let s = rising(48, 20.0, 20.0);
         let reset = h(72.0);
         match weekly_outlook(&s, Some(60.0), Some(reset), now()) {
             WeeklyOutlook::Cap {
@@ -242,7 +382,7 @@ mod tests {
                 minutes,
                 level,
             } => {
-                assert!(close(rate, 20.0));
+                assert!(close(rate.per_day, 20.0));
                 assert!(close(minutes, 2.0 * 1440.0));
                 assert_eq!(at, h(48.0));
                 assert_eq!(level, Level::Orange);
@@ -256,7 +396,7 @@ mod tests {
 
     #[test]
     fn safe_when_the_reset_comes_first() {
-        let s = rising(24, 40.0, 6.0);
+        let s = rising(48, 30.0, 6.0);
         let reset = h(48.0);
         let o = weekly_outlook(&s, Some(66.0), Some(reset), now());
         match o {
@@ -265,7 +405,7 @@ mod tests {
                 at_reset,
                 reset: r,
             } => {
-                assert!(close(rate, 6.0));
+                assert!(close(rate.per_day, 6.0));
                 assert!(close(at_reset, 78.0));
                 assert_eq!(r, reset);
             }
@@ -273,38 +413,30 @@ mod tests {
         }
         assert_eq!(o.level(), Level::Green);
         // Exactly at the reset counts as the cap.
-        let s = rising(24, 40.0, 17.0);
+        let s = rising(48, 30.0, 17.0);
         let o = weekly_outlook(&s, Some(66.0), Some(h(48.0)), now());
         assert!(matches!(o, WeeklyOutlook::Cap { .. }));
     }
 
     #[test]
     fn unknown_reset_or_pct_is_the_rate_alone() {
-        let s = rising(24, 40.0, 20.0);
-        assert_eq!(
-            weekly_outlook(&s, Some(60.0), None, now()),
-            WeeklyOutlook::RateOnly { rate: 20.0 }
-        );
-        assert_eq!(
-            weekly_outlook(&s, None, Some(h(30.0)), now()),
-            WeeklyOutlook::RateOnly { rate: 20.0 }
-        );
+        let s = rising(48, 20.0, 20.0);
+        let only = |o: WeeklyOutlook| matches!(o, WeeklyOutlook::RateOnly { .. });
+        assert!(only(weekly_outlook(&s, Some(60.0), None, now())));
+        assert!(only(weekly_outlook(&s, None, Some(h(30.0)), now())));
         // A reset already past is as good as unknown.
-        assert_eq!(
-            weekly_outlook(&s, Some(60.0), Some(h(-1.0)), now()),
-            WeeklyOutlook::RateOnly { rate: 20.0 }
-        );
-        assert_eq!(
-            WeeklyOutlook::RateOnly { rate: 20.0 }.level(),
-            Level::Orange
-        );
-        assert_eq!(WeeklyOutlook::RateOnly { rate: 10.0 }.level(), Level::Green);
+        assert!(only(weekly_outlook(&s, Some(60.0), Some(h(-1.0)), now())));
+        let o = weekly_outlook(&s, Some(60.0), None, now());
+        assert_eq!(o.level(), Level::Orange);
+        assert!(close(o.rate().unwrap().per_day, 20.0));
+        let slow = weekly_outlook(&rising(48, 20.0, 10.0), Some(60.0), None, now());
+        assert_eq!(slow.level(), Level::Green);
     }
 
     #[test]
     fn flat_or_falling_is_steady() {
         for per_day in [0.0, 0.5, -4.0] {
-            let s = rising(24, 40.0, per_day);
+            let s = rising(48, 40.0, per_day);
             let o = weekly_outlook(&s, Some(40.0), Some(h(30.0)), now());
             assert!(
                 matches!(o, WeeklyOutlook::Steady { .. }),
@@ -312,18 +444,59 @@ mod tests {
             );
             assert_eq!(o.level(), Level::Green);
         }
-        // Already capped.
-        let s = rising(24, 80.0, 20.0);
-        assert!(matches!(
-            weekly_outlook(&s, Some(100.0), Some(h(30.0)), now()),
-            WeeklyOutlook::Steady { .. }
-        ));
         let s = [(h(0.0), Some(1.0))];
         assert_eq!(
             weekly_outlook(&s, Some(1.0), Some(h(30.0)), now()),
             WeeklyOutlook::NeedHistory
         );
         assert_eq!(WeeklyOutlook::NeedHistory.level(), Level::Dim);
+        assert_eq!(WeeklyOutlook::NeedHistory.rate(), None);
+    }
+
+    #[test]
+    fn at_cap_is_red_never_steady() {
+        let s = rising(48, 80.0, 0.0);
+        let o = weekly_outlook(&s, Some(100.0), Some(h(30.0)), now());
+        assert_eq!(
+            o,
+            WeeklyOutlook::AtCap {
+                reset: Some(h(30.0))
+            }
+        );
+        assert_eq!(o.level(), Level::Red);
+        assert_eq!(o.rate(), None);
+        // Even with no history at all.
+        assert_eq!(
+            weekly_outlook(&[], Some(103.0), None, now()),
+            WeeklyOutlook::AtCap { reset: None }
+        );
+    }
+
+    #[test]
+    fn basis_texts() {
+        let r = |span_h: i64, basis, since_reset| WeeklyRate {
+            per_day: 1.0,
+            span: Duration::hours(span_h),
+            basis,
+            floored: span_h < WEEKLY_FLOOR_HOURS,
+            since_reset,
+        };
+        assert_eq!(
+            rate_basis_text(&r(24, RateBasis::Anchored, false)),
+            "over last 24h"
+        );
+        assert_eq!(
+            rate_basis_text(&r(10, RateBasis::Partial, false)),
+            "over last 10h (app was closed)"
+        );
+        assert_eq!(
+            rate_basis_text(&r(3, RateBasis::Partial, false)),
+            "over last 3h (app was closed), spread over 6h"
+        );
+        assert_eq!(
+            rate_basis_text(&r(5, RateBasis::Partial, true)),
+            "over last 5h (since the weekly reset), spread over 6h"
+        );
     }
 
     #[test]

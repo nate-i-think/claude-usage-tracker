@@ -28,6 +28,8 @@ pub const ALWAYS_SHOW: &[&str] = &["five_hour", "seven_day"];
 pub const FIVE_HOUR_LABEL: &str = "5-hour";
 /// Label of the seven-day (all models) window.
 pub const SEVEN_DAY_LABEL: &str = "7-day all";
+/// Label of Fable's own weekly window (a per-model limit).
+pub const FABLE_LABEL: &str = "Fable";
 
 /// One usage window (a top-level bucket or a per-model limit).
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +79,14 @@ impl Snapshot {
 
     pub fn seven_day_resets_at(&self) -> Option<DateTime<Utc>> {
         self.window(SEVEN_DAY_LABEL).and_then(|w| w.resets_at)
+    }
+
+    pub fn fable_pct(&self) -> Option<f64> {
+        self.window(FABLE_LABEL).and_then(|w| w.utilization)
+    }
+
+    pub fn fable_resets_at(&self) -> Option<DateTime<Utc>> {
+        self.window(FABLE_LABEL).and_then(|w| w.resets_at)
     }
 }
 
