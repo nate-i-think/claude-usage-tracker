@@ -12,11 +12,12 @@ pub const GAP: f32 = 8.0;
 /// Content never grows wider than this; extra width becomes side margins.
 /// Wide enough for the two charts side by side.
 pub const MAX_CONTENT_WIDTH: f32 = 1000.0;
-/// From this content width up, the timeline and the 7-day chart sit side
+/// From this content width up, the 5-hour and the 7-day timelines sit side
 /// by side; narrower, they stack (timeline first).
 pub const CHARTS_SIDE_BY_SIDE_MIN: f32 = 640.0;
-/// The timeline's share of the row when the charts sit side by side.
-const TIMELINE_SHARE: f32 = 0.62;
+/// The 5-hour timeline's share of the row when the charts sit side by
+/// side: half, now the weekly chart is a timeline too.
+const TIMELINE_SHARE: f32 = 0.5;
 
 /// Width of the content column for `available` width.
 pub fn content_width(available: f32) -> f32 {
@@ -42,7 +43,7 @@ pub fn level_height(natural: &[f32]) -> f32 {
     natural.iter().copied().fold(0.0, f32::max)
 }
 
-/// The widths of the timeline and the 7-day chart side by side in a row
+/// The widths of the 5-hour and the 7-day timelines side by side in a row
 /// `width` wide with a [`GAP`] between them, or `None` when they stack.
 pub fn chart_widths(width: f32) -> Option<(f32, f32)> {
     if width < CHARTS_SIDE_BY_SIDE_MIN {
@@ -121,9 +122,9 @@ mod tests {
         assert_eq!(chart_widths(CHARTS_SIDE_BY_SIDE_MIN - 0.5), None);
         let (a, b) = chart_widths(CHARTS_SIDE_BY_SIDE_MIN).unwrap();
         assert_eq!(a + GAP + b, CHARTS_SIDE_BY_SIDE_MIN);
-        // The timeline takes about 62%.
+        // Half each.
         let (a, b) = chart_widths(1000.0).unwrap();
-        assert_eq!((a, b), (615.0, 377.0));
+        assert_eq!((a, b), (496.0, 496.0));
         // The column cap leaves room for both.
         assert!(chart_widths(MAX_CONTENT_WIDTH).is_some());
     }
