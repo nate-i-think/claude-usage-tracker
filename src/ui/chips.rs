@@ -45,11 +45,18 @@ pub struct Chip {
     pub resets_at: Option<DateTime<Utc>>,
     /// Shows the near-cap pulse (the 5-hour chip).
     pub pulses: bool,
+    /// No 5-hour window is active ([`analytics::FiveHourState::Idle`]).
+    pub idle: bool,
 }
+
+/// The 5-hour chip's hover text while no window is active.
+pub const IDLE_TIP: &str = "no active window · starts with your next message";
 
 /// The chips for this snapshot: 5-hour and 7-day all always, Fable only
 /// when the API reports it. The 5-hour pace runs over the dashboard's
-/// window (`window_start..window_end`); the 7-day ones over the 7 days
+/// window (`window_start..window_end`), only while it is active with a
+/// known reset (see [`analytics::five_hour_now`]: a window that rolled over
+/// since the poll reads 0% with no pace); the 7-day ones over the 7 days
 /// before their reset.
 pub fn chips(
     snap: &Snapshot,
@@ -57,17 +64,17 @@ pub fn chips(
     window_end: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Vec<Chip> {
-    let five = snap.window("5-hour");
-    let five_pct = five.and_then(|w| w.utilization);
-    let five_reset = five.and_then(|w| w.resets_at);
+    let five = analytics::five_hour_now(snap.five_hour_resets_at(), snap.five_hour_pct(), now);
     let mut out = vec![Chip {
         label: "5-hour",
-        pct: five_pct,
-        pace: five_reset
-            .and(five_pct)
+        pct: five.pct,
+        pace: five
+            .resets_at
+            .and(five.pct)
             .and_then(|u| analytics::pace(u, window_start, window_end, now)),
-        resets_at: five_reset,
+        resets_at: five.resets_at,
         pulses: true,
+        idle: five.state == analytics::FiveHourState::Idle,
     }];
     let weekly = |label: &'static str| {
         let w = snap.window(label);
@@ -79,6 +86,7 @@ pub fn chips(
             pace: analytics::seven_day_pace(pct, resets_at, now),
             resets_at,
             pulses: false,
+            idle: false,
         }
     };
     out.push(weekly("7-day all"));
@@ -162,11 +170,15 @@ where
     )
 }
 
-/// The chip's hover text: reset line and pace line, each when known.
+/// The chip's hover text: reset line and pace line, each when known, or
+/// [`IDLE_TIP`] while no window is active.
 pub fn tooltip_in<Tz: TimeZone>(chip: &Chip, now: DateTime<Utc>, tz: &Tz) -> String
 where
     Tz::Offset: Display,
 {
+    if chip.idle {
+        return IDLE_TIP.to_owned();
+    }
     let lines: Vec<String> = [
         chip.resets_at.map(|r| reset_tip_in(r, now, tz)),
         chip.pace.map(pace_explained),
@@ -387,6 +399,36 @@ mod tests {
     }
 
     #[test]
+    fn chips_idle_after_a_reset_show_0_without_pace() {
+        let now = t(12, 0);
+        // After a window ends: 0% and no reset until the next message.
+        let s = snap(vec![window("5-hour", Some(0.0), None)]);
+        let c = chips(&s, now - Duration::hours(5), now, now);
+        assert_eq!(
+            (c[0].pct, c[0].pace, c[0].resets_at),
+            (Some(0.0), None, None)
+        );
+        assert!(c[0].idle);
+        assert!(!c[1].idle);
+    }
+
+    #[test]
+    fn chips_after_the_reset_passes_read_idle_until_the_next_poll() {
+        // Polled at 85% in the 9:00-14:00 window; now is 14:01.
+        let s = snap(vec![window("5-hour", Some(85.0), Some(t(14, 0)))]);
+        let c = chips(&s, t(9, 0), t(14, 0), t(14, 1));
+        assert_eq!(
+            (c[0].pct, c[0].pace, c[0].resets_at),
+            (Some(0.0), None, None)
+        );
+        assert!(c[0].idle);
+        // Before the reset: the normal chip.
+        let c = chips(&s, t(9, 0), t(14, 0), t(13, 0));
+        assert_eq!(c[0].pct, Some(85.0));
+        assert!(c[0].pace.is_some() && !c[0].idle);
+    }
+
+    #[test]
     fn pct_rounds_down() {
         assert_eq!(pct_text(Some(46.0)), "46%");
         assert_eq!(pct_text(Some(99.6)), "99%");
@@ -456,6 +498,7 @@ mod tests {
             pace: Some(6.0),
             resets_at: Some(t(13, 59)),
             pulses: true,
+            idle: false,
         };
         assert_eq!(
             tooltip_in(&chip, t(12, 0), &tz),
@@ -467,5 +510,11 @@ mod tests {
             ..chip
         };
         assert_eq!(tooltip_in(&bare, t(12, 0), &tz), "no reset time reported");
+        let idle = Chip {
+            pct: Some(0.0),
+            idle: true,
+            ..bare
+        };
+        assert_eq!(tooltip_in(&idle, t(12, 0), &tz), IDLE_TIP);
     }
 }

@@ -28,7 +28,9 @@ use eframe::egui::{
     TextStyle, Ui, Vec2,
 };
 
-use crate::analytics::{self, alerts::fmt_clock_in, Projection, WeekSample, WindowSample};
+use crate::analytics::{
+    self, alerts::fmt_clock_in, FiveHourState, Projection, WeekSample, WindowSample,
+};
 use crate::poller::Dashboard;
 
 use super::motion;
@@ -38,6 +40,10 @@ use super::theme::Palette;
 pub const FULL_HEIGHT: f32 = 180.0;
 /// The card's title.
 pub const TITLE: &str = "5-hour window";
+/// The 5-hour chart's note while no window is active.
+pub const IDLE_NOTE: &str = "No active window · starts with your next message";
+/// A chart's note before it has two samples to draw.
+const COLLECTING_NOTE: &str = "collecting samples…";
 /// On the 5-hour chart, a gap between samples longer than this ends a
 /// solid line (the app was closed or polls failed); its two ends are joined
 /// by a [`Bridge`].
@@ -946,15 +952,24 @@ pub struct Chart {
     pub style: TimeStyle,
     /// The snapshot's fetch time in ms, so projections draw in per poll.
     pub poll_key: i64,
+    /// Centered in an empty chart in place of "collecting samples…".
+    pub note: Option<&'static str>,
 }
 
-/// The 5-hour chart for `d` at `now`.
+/// The 5-hour chart for `d` at `now`. With no active window
+/// ([`analytics::FiveHourState::Idle`]: after a reset, before the next
+/// message, or once a known reset has passed since the poll) it is empty:
+/// no samples, now, projection or times, only [`IDLE_NOTE`]. With a reset
+/// unknown but usage above 0 it is the trailing 5 hours ending "now".
 pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> Chart {
     let snap = &d.snapshot;
-    let pct = snap.five_hour_pct();
-    let state = palette.level(analytics::color_for(pct));
-    let reset_known = snap.five_hour_resets_at().is_some();
-    let lines = pct
+    let live = d.five_hour_now(now);
+    let state = palette.level(analytics::color_for(live.pct));
+    let idle = live.state == FiveHourState::Idle;
+    let reset_known = live.resets_at.is_some();
+    let lines = live
+        .pct
+        .filter(|_| !idle)
         .map(|p| {
             let rate = analytics::compute_rate(&d.history, now);
             let projection = analytics::projection(now, p, rate, d.window_end);
@@ -969,21 +984,31 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
         })
         .into_iter()
         .collect();
+    let samples: &[WindowSample] = if idle { &[] } else { &d.window_samples };
     Chart {
         id: "timeline",
         start: d.window_start,
         end: d.window_end,
         now,
-        points: d.window_samples.iter().map(Point::from).collect(),
+        points: samples.iter().map(Point::from).collect(),
         gap_break: Duration::minutes(GAP_BREAK_MINUTES),
         state,
-        overlay: Overlay::Share(analytics::fable_layer(&d.window_samples)),
+        overlay: Overlay::Share(analytics::fable_layer(samples)),
         bridge_fill: BRIDGE_FILL_SCALE,
-        ticks: hour_ticks_in(d.window_start, d.window_end, &Local),
-        end_label: Some(format!("reset {}", short_time_in(d.window_end, &Local))),
+        ticks: if idle {
+            Vec::new()
+        } else {
+            hour_ticks_in(d.window_start, d.window_end, &Local)
+        },
+        end_label: match live.state {
+            FiveHourState::Active => Some(format!("reset {}", short_time_in(d.window_end, &Local))),
+            FiveHourState::Trailing => Some("now".to_owned()),
+            FiveHourState::Idle => None,
+        },
         lines,
         style: TimeStyle::Clock,
         poll_key: snap.fetched_at.timestamp_millis(),
+        note: idle.then_some(IDLE_NOTE),
     }
 }
 
@@ -999,7 +1024,7 @@ pub fn show_timeline_card(
     palette: &Palette,
     size: super::layout::CardSize,
 ) -> f32 {
-    let reset_known = d.snapshot.five_hour_resets_at().is_some();
+    let reset_known = d.five_hour_now(now).resets_at.is_some();
     let span = window_span_in(d.window_start, d.window_end, reset_known, &Local);
     let chart = five_hour_chart(d, now, palette);
     super::theme::card(palette)
@@ -1046,7 +1071,7 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
         painter.text(
             axes.plot.center(),
             Align2::CENTER_CENTER,
-            "collecting samples…",
+            chart.note.unwrap_or(COLLECTING_NOTE),
             font,
             palette.text_muted,
         );
@@ -1513,6 +1538,87 @@ mod tests {
     use super::*;
     use chrono::FixedOffset;
     use eframe::egui::{pos2, Rect};
+
+    // --- the 5-hour chart's window -------------------------------------------
+
+    /// A dashboard polled at `at` with `pct` and `resets_at`, its window as
+    /// the poller sets it, and two samples in it.
+    fn five_dash(at: DateTime<Utc>, pct: f64, resets_at: Option<DateTime<Utc>>) -> Dashboard {
+        use crate::model::{Snapshot, UsageWindow};
+        let end = resets_at.unwrap_or(at);
+        let sample = |m: i64, v: f64| WindowSample {
+            t: at - Duration::minutes(m),
+            five_hour: Some(v),
+            fable: None,
+        };
+        Dashboard {
+            snapshot: Snapshot {
+                fetched_at: at,
+                windows: vec![UsageWindow {
+                    label: "5-hour".to_owned(),
+                    utilization: Some(pct),
+                    resets_at,
+                }],
+                extra: None,
+            },
+            history: Vec::new(),
+            fable_history: Vec::new(),
+            seven_day_recent: Vec::new(),
+            fable_recent: Vec::new(),
+            burners: Vec::new(),
+            window_start: end - Duration::hours(5),
+            window_end: end,
+            window_samples: vec![sample(10, pct / 2.0), sample(0, pct)],
+            week_start: at - Duration::days(7),
+            week_end: at,
+            week_samples: Vec::new(),
+            persist_error: None,
+        }
+    }
+
+    fn t_at(h: u32, m: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 10, 12, h, m, 0).unwrap()
+    }
+
+    fn assert_idle(c: &Chart) {
+        assert!(c.points.is_empty(), "{:?}", c.points);
+        assert!(c.lines.is_empty(), "no now dot or projection");
+        assert!(c.ticks.is_empty(), "no times on an idle axis");
+        assert_eq!(c.end_label, None);
+        assert_eq!(c.note, Some(IDLE_NOTE));
+    }
+
+    #[test]
+    fn five_hour_chart_idle_after_a_reset_is_empty() {
+        let mut d = five_dash(t_at(14, 53), 0.0, None);
+        d.window_samples.clear(); // as the poller leaves it
+        assert_idle(&five_hour_chart(&d, t_at(14, 53), &crate::ui::theme::DARK));
+    }
+
+    #[test]
+    fn five_hour_chart_idle_once_the_reset_passes_between_polls() {
+        let d = five_dash(t_at(14, 10), 80.0, Some(t_at(14, 20)));
+        let live = five_hour_chart(&d, t_at(14, 15), &crate::ui::theme::DARK);
+        assert_eq!(live.points.len(), 2);
+        assert_eq!(live.lines.len(), 1);
+        assert!(live.end_label.as_deref().unwrap().starts_with("reset "));
+        assert_eq!(live.note, None);
+        // 14:21: past the chart's end, before the next poll.
+        assert_idle(&five_hour_chart(&d, t_at(14, 21), &crate::ui::theme::DARK));
+        assert_idle(&five_hour_chart(&d, t_at(14, 20), &crate::ui::theme::DARK));
+    }
+
+    #[test]
+    fn five_hour_chart_trailing_without_a_reset_ends_now() {
+        let d = five_dash(t_at(14, 53), 6.0, None);
+        let c = five_hour_chart(&d, t_at(14, 53), &crate::ui::theme::DARK);
+        assert_eq!(c.points.len(), 2);
+        assert_eq!(c.end_label.as_deref(), Some("now"));
+        assert_eq!(c.lines.len(), 1);
+        assert_eq!(c.lines[0].label, None, "no safe or cap claimed");
+        assert_eq!(c.note, None);
+    }
 
     fn t0() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 11, 10, 17, 0).unwrap()

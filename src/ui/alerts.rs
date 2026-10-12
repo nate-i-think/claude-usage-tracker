@@ -226,6 +226,34 @@ mod tests {
     }
 
     #[test]
+    fn idle_window_between_windows_keeps_the_key_and_the_next_fires_fresh() {
+        let (tx, rx) = channel();
+        let mut hook = AlertHook::new(tx);
+        let mut settings = Settings::default();
+        run(&mut hook, &mut settings, &poll(1, 91.0, 0));
+        assert_eq!(titles(&rx), ["5-hour usage at 91%"]);
+        let consumed = settings.alert_state.clone();
+        // 15:00 reset: idle polls report 0% with no reset (a null key).
+        for m in [190, 200, 230] {
+            let mut idle = poll(m, 0.0, 0);
+            idle.snapshot.windows[0].resets_at = None;
+            idle.window_start = idle.snapshot.fetched_at - Duration::hours(5);
+            idle.window_end = idle.snapshot.fetched_at;
+            run(&mut hook, &mut settings, &idle);
+        }
+        assert!(titles(&rx).is_empty(), "nothing fires while idle");
+        assert_eq!(
+            settings.alert_state, consumed,
+            "the null window keys nothing"
+        );
+        // The next window (resetting 20:00) crosses 75%: a fresh window.
+        let mut next = poll(400, 76.0, 0);
+        next.snapshot.windows[0].resets_at = Some(t0() + Duration::hours(8));
+        run(&mut hook, &mut settings, &next);
+        assert_eq!(titles(&rx), ["5-hour usage at 76%"]);
+    }
+
+    #[test]
     fn unknown_reset_fires_nothing() {
         let (tx, rx) = channel();
         let mut hook = AlertHook::new(tx);

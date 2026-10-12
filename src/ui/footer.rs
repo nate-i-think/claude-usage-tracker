@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use eframe::egui::{vec2, Id, Rect, Sense, Ui};
 
-use crate::analytics::{self, BurnLine, Eta, Level};
+use crate::analytics::{self, BurnLine, Eta, FiveHourState, Level};
 use crate::model::ExtraUsage;
 use crate::poller::Dashboard;
 
@@ -19,6 +19,10 @@ const GAUGE_H: f32 = 4.0;
 const CAPTION_GAP: f32 = 6.0;
 /// The burn row's label, so the 5-hour figure never reads as a 7-day one.
 pub const BURN_LABEL: &str = "5h burn  ";
+/// The burn row while no 5-hour window is active.
+pub const IDLE: &str = "idle";
+/// Its hover text.
+const IDLE_HOVER: &str = "5-hour: no active window; the next message starts one";
 
 /// The 5-hour burn in brief: "+0.21%/min · cap in 1h 48m" (rate and ETA in
 /// their level colors) when the cap comes before the reset, "+0.34%/min ·
@@ -77,13 +81,18 @@ pub fn extra_gauge(e: &ExtraUsage) -> ExtraGauge {
 
 /// The 5-hour burn row under the timeline: a muted "5h burn" label, then
 /// [`burn_summary`] (wrapping when narrow), with the full burn line on
-/// hover. Labelled so it never reads as a 7-day figure.
+/// hover, or "idle" while no window is active. Labelled so it never reads
+/// as a 7-day figure.
 pub fn show_burn_row(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
-    let snap = &d.snapshot;
-    let resets = snap.five_hour_resets_at();
-    let burn = analytics::burn_line(&d.history, snap.five_hour_pct(), resets, now);
+    let live = d.five_hour_now(now);
     let mut runs = vec![Run::new(BURN_LABEL, Tone::Dim)];
-    runs.extend(burn_summary(burn.as_ref(), resets.is_some()));
+    if live.state == FiveHourState::Idle {
+        runs.push(Run::new(IDLE, Tone::Dim));
+        super::show_runs(ui, &runs).on_hover_text(IDLE_HOVER);
+        return;
+    }
+    let burn = analytics::burn_line(&d.history, live.pct, live.resets_at, now);
+    runs.extend(burn_summary(burn.as_ref(), live.resets_at.is_some()));
     super::show_runs(ui, &runs).on_hover_text(burn_hover(burn.as_ref()));
 }
 
