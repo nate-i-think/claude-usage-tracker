@@ -26,6 +26,8 @@ pub const ALWAYS_SHOW: &[&str] = &["five_hour", "seven_day"];
 
 /// Label of the five-hour window.
 pub const FIVE_HOUR_LABEL: &str = "5-hour";
+/// Label of the seven-day (all models) window.
+pub const SEVEN_DAY_LABEL: &str = "7-day all";
 
 /// One usage window (a top-level bucket or a per-model limit).
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +69,14 @@ impl Snapshot {
 
     pub fn five_hour_resets_at(&self) -> Option<DateTime<Utc>> {
         self.window(FIVE_HOUR_LABEL).and_then(|w| w.resets_at)
+    }
+
+    pub fn seven_day_pct(&self) -> Option<f64> {
+        self.window(SEVEN_DAY_LABEL).and_then(|w| w.utilization)
+    }
+
+    pub fn seven_day_resets_at(&self) -> Option<DateTime<Utc>> {
+        self.window(SEVEN_DAY_LABEL).and_then(|w| w.resets_at)
     }
 }
 
