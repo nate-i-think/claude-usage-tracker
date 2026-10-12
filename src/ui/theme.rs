@@ -10,7 +10,7 @@
 //! Contrast rules, enforced by the tests below on both palettes:
 //! - text roles (`text`, `text_muted`) and state colors, which color numbers
 //!   and labels: at least 4.5:1 on `bg` and `surface`;
-//! - graphic roles (`accent`, `fable`, `text_faint`, bars, chips, chart
+//! - graphic roles (`accent`, `fable`, bars, chips, chart
 //!   fills): at least 3:1 on `bg` and `surface`. `accent`/`fable` reach
 //!   4.5:1 on `bg` (where the title and burn tag sit) but not on the dark
 //!   `surface`, so text on cards should not use them.
@@ -35,8 +35,6 @@ const INTER_SEMIBOLD_KEY: &str = "Inter SemiBold";
 /// Family name for semibold text (headings, big numbers, strong runs).
 pub const SEMIBOLD: &str = "semibold";
 
-/// Text style for the big headline percentage (~28 px).
-pub const HERO: &str = "Hero";
 /// Text style for the stat-chip percentages (~20 px).
 pub const CHIP: &str = "Chip";
 
@@ -69,14 +67,10 @@ pub struct Palette {
     pub text: Color32,
     /// Secondary text: axis labels, captions, "weak" egui text.
     pub text_muted: Color32,
-    /// Decorative only (placeholders, minor ticks); too faint for text.
-    pub text_faint: Color32,
     /// Clay: title, links, focus.
     pub accent: Color32,
     /// Accent tint behind selected items; text on it stays `text`.
     pub accent_soft: Color32,
-    /// Clay for text on cards and controls: 4.5:1 on `surface` and `raised`.
-    pub accent_text: Color32,
     /// The Fable layer/tag (Claude coral).
     pub fable: Color32,
     /// State colors, low to high.
@@ -111,10 +105,8 @@ pub const DARK: Palette = Palette {
     control_border: hex(0x858279),
     text: hex(0xF5F4EF),
     text_muted: hex(0xA6A39A),
-    text_faint: hex(0x7E7B73),
     accent: hex(0xD97757),
     accent_soft: hex(0x4E3D35),
-    accent_text: hex(0xE3906F),
     fable: Color32::from_rgb(FABLE_ORANGE[0], FABLE_ORANGE[1], FABLE_ORANGE[2]),
     good: hex(0x7FB069),
     warn: hex(0xE0B341),
@@ -138,10 +130,8 @@ pub const LIGHT: Palette = Palette {
     control_border: hex(0x807D74),
     text: hex(0x141413),
     text_muted: hex(0x6B6A65),
-    text_faint: hex(0x8A877E),
     accent: hex(0xB04F30),
     accent_soft: hex(0xE4D1C5),
-    accent_text: hex(0x9C4228),
     // #d97757 darkened to stay readable on cream.
     fable: hex(0xB04F30),
     good: hex(0x3B7A2A),
@@ -320,7 +310,6 @@ pub fn style_with(style: &mut Style, p: &Palette) {
         (TextStyle::Heading, semibold(18.0)),
         (TextStyle::Monospace, FontId::monospace(13.0)),
         (TextStyle::Name(CHIP.into()), semibold(20.0)),
-        (TextStyle::Name(HERO.into()), semibold(28.0)),
     ]
     .into();
 }
@@ -397,28 +386,28 @@ fn visuals(p: &Palette) -> Visuals {
     v
 }
 
+/// WCAG relative luminance.
+pub fn luminance(c: Color32) -> f64 {
+    let lin = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.040_45 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// WCAG contrast ratio, >= 1.
+pub fn contrast(a: Color32, b: Color32) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// WCAG relative luminance.
-    fn luminance(c: Color32) -> f64 {
-        let lin = |v: u8| {
-            let v = f64::from(v) / 255.0;
-            if v <= 0.03928 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-    }
-
-    /// WCAG contrast ratio, >= 1.
-    fn contrast(a: Color32, b: Color32) -> f64 {
-        let (la, lb) = (luminance(a), luminance(b));
-        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-    }
 
     const TEXT: f64 = 4.5;
     const GRAPHIC: f64 = 3.0;
@@ -465,14 +454,6 @@ mod tests {
     }
 
     #[test]
-    fn faint_is_graphic_grade() {
-        for p in palettes() {
-            assert_contrast(p, "text_faint", p.text_faint, "bg", p.bg, GRAPHIC);
-            assert_contrast(p, "text_faint", p.text_faint, "surface", p.surface, GRAPHIC);
-        }
-    }
-
-    #[test]
     fn controls_keep_text_readable() {
         for p in palettes() {
             for (name, bg) in [
@@ -495,8 +476,8 @@ mod tests {
                 assert_contrast(p, name, fg, "bg", p.bg, 1.25);
             }
             assert_contrast(p, "grid", p.grid, "surface", p.surface, 1.15);
-            // Quiet: well below the faintest text.
-            assert!(contrast(p.grid, p.surface) < contrast(p.text_faint, p.surface));
+            // Quiet: well below the muted text.
+            assert!(contrast(p.grid, p.surface) < contrast(p.text_muted, p.surface));
         }
     }
 
@@ -532,15 +513,6 @@ mod tests {
             // Inputs, checkboxes and buttons draw their edge with these.
             assert_eq!(w.inactive.bg_stroke, Stroke::new(1.0, edge));
             assert_eq!(w.hovered.bg_stroke, Stroke::new(1.0, edge));
-        }
-    }
-
-    #[test]
-    fn accent_text_readable_on_cards_and_controls() {
-        for p in palettes() {
-            for (name, bg) in [("bg", p.bg), ("surface", p.surface), ("raised", p.raised)] {
-                assert_contrast(p, "accent_text", p.accent_text, name, bg, TEXT);
-            }
         }
     }
 
@@ -623,15 +595,8 @@ mod tests {
                 v.widgets.inactive.corner_radius,
                 CornerRadius::same(WIDGET_RADIUS)
             );
-            for name in [HERO, CHIP] {
-                assert!(style
-                    .text_styles
-                    .contains_key(&TextStyle::Name(name.into())));
-            }
-            assert!(
-                style.text_styles[&TextStyle::Name(HERO.into())].size
-                    > style.text_styles[&TextStyle::Name(CHIP.into())].size
-            );
+            let chip = &style.text_styles[&TextStyle::Name(CHIP.into())];
+            assert!(chip.size > style.text_styles[&TextStyle::Body].size);
         }
     }
 
