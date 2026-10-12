@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use eframe::egui;
 
 use crate::config::UiMode;
@@ -73,9 +73,15 @@ impl App {
         while let Ok(action) = self.tray_events.try_recv() {
             self.tray_action(ctx, action);
         }
-        let snap = self.state.data.as_ref().map(|d| &d.snapshot);
-        let pct = snap.and_then(|s| s.five_hour_pct());
-        let resets_at = snap.and_then(|s| s.five_hour_resets_at());
+        // As of now: a window that rolled over since the poll reads 0%
+        // with no reset.
+        let five = self
+            .state
+            .data
+            .as_ref()
+            .map(|d| d.five_hour_now(Utc::now()));
+        let pct = five.and_then(|f| f.pct);
+        let resets_at = five.and_then(|f| f.resets_at);
         let failed = self.poll_failing();
         let pill = self.settings.ui_mode == UiMode::Pill;
         if let Some(t) = self.tray.as_mut() {

@@ -47,6 +47,8 @@ pub struct PillModel {
     /// The 5-hour pace delta (see [`chips::pace_text`]).
     pub pace: Option<f64>,
     pub resets_at: Option<DateTime<Utc>>,
+    /// No 5-hour window is active: "5h · idle" in place of the countdown.
+    pub idle: bool,
 }
 
 impl PillModel {
@@ -55,8 +57,12 @@ impl PillModel {
         pct: None,
         pace: None,
         resets_at: None,
+        idle: false,
     };
 }
+
+/// The countdown's place while no 5-hour window is active.
+pub const IDLE_COUNTDOWN: &str = "5h · idle";
 
 /// The pill's model: the 5-hour stat chip's data.
 pub fn model(chips: &[Chip]) -> PillModel {
@@ -66,6 +72,7 @@ pub fn model(chips: &[Chip]) -> PillModel {
             pct: c.pct,
             pace: c.pace.filter(|_| c.pct.is_some()),
             resets_at: c.resets_at,
+            idle: c.idle,
         })
         .unwrap_or(PillModel::EMPTY)
 }
@@ -110,6 +117,9 @@ where
     }
     if let Some(r) = five.resets_at {
         first.push_str(&format!(" · {}", chips::reset_tip_in(r, now, tz)));
+    }
+    if five.idle {
+        first.push_str(" · no active window");
     }
     let second = if failed {
         "Last poll failed · click to see why".to_owned()
@@ -321,7 +331,11 @@ fn paint_stats(
     let (pct_galley, pct_w) =
         digits::number_galley(painter, &chips::pct_text(pct), pct_font, color);
     let countdown = painter.layout_no_wrap(
-        countdown_text(m.resets_at, now),
+        if m.idle {
+            IDLE_COUNTDOWN.to_owned()
+        } else {
+            countdown_text(m.resets_at, now)
+        },
         FontId::proportional(COUNTDOWN_SIZE),
         palette.text_muted,
     );
@@ -415,6 +429,7 @@ mod tests {
             pace,
             resets_at: Some(t(7_140)),
             pulses: label == "5-hour",
+            idle: false,
         }
     }
 
@@ -430,11 +445,29 @@ mod tests {
                 pct: Some(46.0),
                 pace: Some(6.2),
                 resets_at: Some(t(7_140)),
+                idle: false,
             }
         );
         assert_eq!(model(&[]), PillModel::EMPTY);
         // No % → no pace either.
         assert_eq!(model(&[chip("5-hour", None, Some(3.0))]).pace, None);
+    }
+
+    #[test]
+    fn idle_pill_has_no_pace_or_reset() {
+        let idle = Chip {
+            pct: Some(0.0),
+            pace: None,
+            resets_at: None,
+            idle: true,
+            ..chip("5-hour", None, None)
+        };
+        let m = model(std::slice::from_ref(&idle));
+        assert!(m.idle);
+        assert_eq!((m.pct, m.pace, m.resets_at), (Some(0.0), None, None));
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let [a, _] = tooltip_lines_in(&[idle], false, t(0), &utc);
+        assert_eq!(a, "5-hour 0% · no active window");
     }
 
     #[test]

@@ -393,6 +393,7 @@ pub fn week_chart(
         bridge_fill: WEEK_BRIDGE_FILL,
         style: TimeStyle::Weekday,
         poll_key: snap.fetched_at.timestamp_millis(),
+        note: None,
     }
 }
 
