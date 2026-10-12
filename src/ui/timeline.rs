@@ -249,6 +249,48 @@ pub fn bridges_of(samples: &[Point], segs: &[Range<usize>], series: Series) -> V
         .collect()
 }
 
+/// `(t, value)` of `series` over `range` of `samples`, missing values as 0
+/// (segments never hold any).
+fn series(samples: &[Point], range: Range<usize>, which: Series) -> Vec<(DateTime<Utc>, f64)> {
+    samples[range]
+        .iter()
+        .map(|s| (s.t, s.get(which).unwrap_or(0.0)))
+        .collect()
+}
+
+/// The values to draw for whole-percent readings `samples` (one segment,
+/// oldest first): a meter that first reads N at `t` crossed N at about
+/// `t`, so the line runs straight between change points (the first sample
+/// of each new value) instead of holding each value flat, and stays flat
+/// from the last change point on (it hasn't reached the next value yet).
+/// One value per sample, so hover can still snap to the real readings.
+pub fn through_change_points(samples: &[(DateTime<Utc>, f64)]) -> Vec<f64> {
+    let changes: Vec<usize> = (0..samples.len())
+        .filter(|&i| i == 0 || samples[i].1 != samples[i - 1].1)
+        .collect();
+    let mut out = Vec::with_capacity(samples.len());
+    let mut k = 0;
+    for (i, &(t, v)) in samples.iter().enumerate() {
+        while k + 1 < changes.len() && changes[k + 1] <= i {
+            k += 1;
+        }
+        let Some(&next) = changes.get(k + 1) else {
+            out.push(v); // after the last change point: flat
+            continue;
+        };
+        let (t0, v0) = samples[changes[k]];
+        let (t1, v1) = samples[next];
+        let span = (t1 - t0).num_milliseconds() as f64;
+        let frac = if span > 0.0 {
+            (t - t0).num_milliseconds() as f64 / span
+        } else {
+            0.0
+        };
+        out.push(v0 + (v1 - v0) * frac);
+    }
+    out
+}
+
 /// The runs of `Some` in `values[within]`, as index ranges into `values`.
 pub fn present_runs(values: &[Option<f64>], within: Range<usize>) -> Vec<Range<usize>> {
     let mut out = Vec::new();
@@ -1118,18 +1160,30 @@ fn paint_areas(
     let mut raw = Vec::new();
     let mut lines = Vec::with_capacity(segs.len());
     for seg in segs {
+        // Drawn through the change points, not as whole-percent steps.
+        let drawn = through_change_points(&series(samples, seg.clone(), Series::Main));
         raw.clear();
         raw.extend(
-            samples[seg.clone()]
-                .iter()
-                .filter_map(|s| s.value.map(|v| axes.pos(s.t, v))),
+            seg.clone()
+                .zip(&drawn)
+                .map(|(i, v)| axes.pos(samples[i].t, *v)),
         );
         let line = thin_columns(&raw);
         painter.add(area_mesh(&line, baseline, top, bottom));
         if let Some(share) = share {
             for run in present_runs(share, seg.clone()) {
+                // Smoothed the same way, and never above the drawn line at
+                // any sample (both are straight between samples).
+                let values: Vec<_> = run
+                    .clone()
+                    .map(|i| (samples[i].t, share[i].unwrap_or(0.0)))
+                    .collect();
+                let layer_v = through_change_points(&values);
                 raw.clear();
-                raw.extend(run.map(|i| axes.pos(samples[i].t, share[i].unwrap_or(0.0))));
+                raw.extend(
+                    run.zip(layer_v)
+                        .map(|(i, v)| axes.pos(samples[i].t, v.min(drawn[i - seg.start]))),
+                );
                 let layer = thin_columns(&raw);
                 if layer.len() >= 2 {
                     painter.add(area_mesh(&layer, baseline, fable_fill, fable_fill));
@@ -1166,7 +1220,11 @@ fn paint_overlay_line(painter: &Painter, axes: &Axes, palette: &Palette, chart: 
         }
     }
     for seg in segs {
-        let raw: Vec<Pos2> = seg.map(at).collect();
+        let drawn = through_change_points(&series(samples, seg.clone(), Series::Overlay));
+        let raw: Vec<Pos2> = seg
+            .zip(drawn)
+            .map(|(i, v)| axes.pos(samples[i].t, v))
+            .collect();
         paint_polyline(painter, thin_columns(&raw), palette.fable);
     }
 }
@@ -2149,6 +2207,46 @@ mod tests {
         let second = place_end_label(from, end, LABEL, 4.0, 2.0, bounds, &taken);
         assert_ne!(second, first);
         assert!(!overlaps(second.expand(LABEL_PAD), taken[0]));
+    }
+
+    #[test]
+    fn lines_run_through_change_points() {
+        let v = |pairs: &[(i64, f64)]| -> Vec<(DateTime<Utc>, f64)> {
+            pairs.iter().map(|&(m, x)| (at(m), x)).collect()
+        };
+        // 10 held for 30 minutes, then 11, then 12: straight between the
+        // first sightings, flat after the last one.
+        let got = through_change_points(&v(&[
+            (0, 10.0),
+            (10, 10.0),
+            (20, 10.0),
+            (30, 11.0),
+            (40, 11.0),
+            (50, 12.0),
+            (60, 12.0),
+            (70, 12.0),
+        ]));
+        let want = [
+            10.0,
+            10.0 + 1.0 / 3.0,
+            10.0 + 2.0 / 3.0,
+            11.0,
+            11.5,
+            12.0,
+            12.0,
+            12.0,
+        ];
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-9, "{got:?}");
+        }
+        // Change points keep their raw value; never above the next one.
+        assert_eq!(through_change_points(&v(&[(0, 5.0)])), [5.0]);
+        assert!(through_change_points(&[]).is_empty());
+        let flat = through_change_points(&v(&[(0, 7.0), (5, 7.0)]));
+        assert_eq!(flat, [7.0, 7.0]);
+        // A small dip (not a reset) interpolates down and back.
+        let dip = through_change_points(&v(&[(0, 10.0), (10, 9.0), (20, 9.0), (30, 10.0)]));
+        assert_eq!(dip, [10.0, 9.0, 9.5, 10.0]);
     }
 
     #[test]
