@@ -522,18 +522,19 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
 
 /// The hero timeline and the "Last 7 days" chart, each on its titled card:
 /// side by side when the column is wide enough (see
-/// [`layout::chart_widths`]), else stacked with the timeline first. Both
-/// charts are [`timeline::FULL_HEIGHT`] tall, so the cards match.
+/// [`layout::chart_widths`]), both [`timeline::FULL_HEIGHT`] tall so the
+/// cards match; else stacked with the timeline first and the 7-day chart
+/// [`week::STACKED_HEIGHT`] tall.
 fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     let palette = theme::Palette::for_visuals(ui.visuals());
     let height = timeline::FULL_HEIGHT;
     let timeline_card = |ui: &mut Ui| timeline::show_timeline_card(ui, d, now, palette, height);
-    let week_card = |ui: &mut Ui| week::show_week_card(ui, d, palette, height);
     let Some((left, right)) = layout::chart_widths(ui.available_width()) else {
         timeline_card(ui);
-        week_card(ui);
+        week::show_week_card(ui, d, palette, week::STACKED_HEIGHT);
         return;
     };
+    let week_card = |ui: &mut Ui| week::show_week_card(ui, d, palette, height);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
         let column = egui::Layout::top_down(egui::Align::Min);
