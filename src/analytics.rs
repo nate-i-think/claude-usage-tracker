@@ -150,7 +150,7 @@ pub fn recent_window(
         .collect();
     let reset_idx = recent
         .windows(2)
-        .rposition(|pair| pair[1].1 + 5.0 < pair[0].1) // >5% drop = reset
+        .rposition(|pair| pair[1].1 + RESET_DROP < pair[0].1) // >5% drop = reset
         .map_or(0, |i| i + 1);
     recent[reset_idx..].to_vec()
 }
@@ -303,15 +303,22 @@ pub struct Headroom {
     pub advice_level: Option<Level>,
 }
 
-/// Projected use at reset for the 5-hour window given the ALL burn `rate`
-/// (%/min). `None` when the 5-hour percentage is unknown.
+/// Projected use at reset for the 5-hour window at `pct`, resetting at
+/// `resets_at`, given the ALL burn `rate` (%/min). `None` when the 5-hour
+/// percentage is unknown. Callers pass the figures as of now
+/// ([`five_hour_now`]), so a passed reset is never weighed.
 ///
 /// Idle (rate unknown or under 0.05): "0%", green, dim advice. Otherwise
 /// projected = pct + rate × minutes-to-reset. Green "safe" when the cap ETA
 /// lands after the reset; red with "pause" advice when the ETA is under 20
 /// minutes; orange "throttle" advice otherwise.
-pub fn headroom(snap: &Snapshot, rate: Option<f64>, now: DateTime<Utc>) -> Option<Headroom> {
-    let pct = snap.five_hour_pct()?;
+pub fn headroom(
+    pct: Option<f64>,
+    resets_at: Option<DateTime<Utc>>,
+    rate: Option<f64>,
+    now: DateTime<Utc>,
+) -> Option<Headroom> {
+    let pct = pct?;
     let headroom = 100.0 - pct;
 
     let rate = match rate {
@@ -327,9 +334,7 @@ pub fn headroom(snap: &Snapshot, rate: Option<f64>, now: DateTime<Utc>) -> Optio
     };
 
     let eta_min = headroom / rate;
-    let minutes_to_reset = snap
-        .five_hour_resets_at()
-        .map_or(f64::INFINITY, |r| minutes_between(now, r));
+    let minutes_to_reset = resets_at.map_or(f64::INFINITY, |r| minutes_between(now, r));
 
     // Total projected use at reset = already-used + additional draw if the pace
     // holds. Can exceed 100% (intentional — signals how hard you'd blow the cap);
@@ -893,7 +898,7 @@ mod tests {
         // 21% already used, 0.675%/min pace, 144 min to reset.
         // Future draw alone = 0.675 * 144 ≈ 97%, but TOTAL projected use must add
         // the 21% already spent → ≈ 118%, i.e. on pace to blow past the cap.
-        let h = headroom(&snap(21.0, 144.0), Some(0.675), NOW).unwrap();
+        let h = headroom_of(&snap(21.0, 144.0), Some(0.675), NOW).unwrap();
         let projected = projected_pct(&h);
         assert!(
             projected > 100,
@@ -905,7 +910,7 @@ mod tests {
     #[test]
     fn eta_cap_uses_hours_and_minutes() {
         // eta_min = (100-21)/0.675 ≈ 117 min → must read "1h 57m", not "117m".
-        let h = headroom(&snap(21.0, 144.0), Some(0.675), NOW).unwrap();
+        let h = headroom_of(&snap(21.0, 144.0), Some(0.675), NOW).unwrap();
         assert!(
             h.advice.contains("1h 57m"),
             "expected Xh XXm ETA, got: {:?}",
@@ -930,7 +935,7 @@ mod tests {
     #[test]
     fn safe_pace_projects_below_100() {
         // 10% used, gentle 0.1%/min, resets in 100 min → 10 + 10 = 20% total.
-        let h = headroom(&snap(10.0, 100.0), Some(0.1), NOW).unwrap();
+        let h = headroom_of(&snap(10.0, 100.0), Some(0.1), NOW).unwrap();
         assert_eq!(projected_pct(&h), 20);
         assert!(h.advice.contains("safe"), "{:?}", h.advice);
         assert_eq!(
@@ -952,15 +957,18 @@ mod tests {
             advice: "idle, safe to spin up agents".into(),
             advice_level: Some(Level::Dim),
         };
-        assert_eq!(headroom(&snap(40.0, 100.0), None, NOW), Some(idle.clone()));
         assert_eq!(
-            headroom(&snap(40.0, 100.0), Some(0.049), NOW),
+            headroom_of(&snap(40.0, 100.0), None, NOW),
             Some(idle.clone())
         );
-        assert_eq!(headroom(&snap(40.0, 100.0), Some(-1.0), NOW), Some(idle));
+        assert_eq!(
+            headroom_of(&snap(40.0, 100.0), Some(0.049), NOW),
+            Some(idle.clone())
+        );
+        assert_eq!(headroom_of(&snap(40.0, 100.0), Some(-1.0), NOW), Some(idle));
         // 0.05 itself is not idle.
         assert_ne!(
-            headroom(&snap(40.0, 100.0), Some(0.05), NOW)
+            headroom_of(&snap(40.0, 100.0), Some(0.05), NOW)
                 .unwrap()
                 .projected,
             "0%"
@@ -970,7 +978,7 @@ mod tests {
     #[test]
     fn headroom_red_when_cap_within_20_minutes() {
         // 80% used, 1.1%/min, resets in 60 min: ETA 18.18m < 20 and before reset.
-        let h = headroom(&snap(80.0, 60.0), Some(1.1), NOW).unwrap();
+        let h = headroom_of(&snap(80.0, 60.0), Some(1.1), NOW).unwrap();
         assert_eq!(
             h,
             Headroom {
@@ -981,7 +989,7 @@ mod tests {
             }
         );
         // ETA of exactly 20 minutes is orange, not red.
-        let h = headroom(&snap(80.0, 60.0), Some(1.0), NOW).unwrap();
+        let h = headroom_of(&snap(80.0, 60.0), Some(1.0), NOW).unwrap();
         assert_eq!(h.level, Level::Orange);
         assert_eq!(h.advice, "throttle if possible — ETA cap in 20m");
     }
@@ -989,38 +997,53 @@ mod tests {
     #[test]
     fn headroom_safe_boundary_is_strict() {
         // ETA equal to minutes-to-reset is not "after" the reset: orange.
-        let h = headroom(&snap(50.0, 100.0), Some(0.5), NOW).unwrap();
+        let h = headroom_of(&snap(50.0, 100.0), Some(0.5), NOW).unwrap();
         assert_eq!(h.level, Level::Orange);
         assert_eq!(h.projected, "100%");
         // One minute more and the cap lands after the reset: safe.
-        let h = headroom(&snap(50.0, 99.0), Some(0.5), NOW).unwrap();
+        let h = headroom_of(&snap(50.0, 99.0), Some(0.5), NOW).unwrap();
         assert_eq!(h.level, Level::Green);
         assert_eq!(h.projected, "100%"); // 50 + 0.5 * 99 = 99.5 rounds half-even to 100
+    }
+
+    fn headroom_of(s: &Snapshot, rate: Option<f64>, now: DateTime<Utc>) -> Option<Headroom> {
+        headroom(s.five_hour_pct(), s.five_hour_resets_at(), rate, now)
     }
 
     #[test]
     fn headroom_unknown_reset_projects_dash() {
         let mut s = snap(30.0, 100.0);
         s.windows[0].resets_at = None;
-        let h = headroom(&s, Some(0.5), NOW).unwrap();
+        let h = headroom_of(&s, Some(0.5), NOW).unwrap();
         assert_eq!(h.projected, "—");
         // ETA 140m: not under 20, and "after reset" cannot hold without a reset.
         assert_eq!(h.level, Level::Orange);
         assert_eq!(h.advice, "throttle if possible — ETA cap in 2h 20m");
-        let h = headroom(&s, Some(5.0), NOW).unwrap();
+        let h = headroom_of(&s, Some(5.0), NOW).unwrap();
         assert_eq!(h.projected, "—");
         assert_eq!(h.level, Level::Red);
         assert_eq!(h.advice, "ETA cap in 14m — pause some agents now");
     }
 
     #[test]
+    fn headroom_after_a_rollover_weighs_no_passed_reset() {
+        // Polled at 80% with 10 minutes left; now is 5 minutes past the reset.
+        let s = snap(80.0, 10.0);
+        let later = NOW + minutes(15.0);
+        let five = five_hour_now(s.five_hour_resets_at(), s.five_hour_pct(), later);
+        let h = headroom(five.pct, five.resets_at, Some(1.0), later).unwrap();
+        assert_eq!(h.projected, "—", "no reset to project to");
+        assert_eq!(h.advice, "throttle if possible — ETA cap in 1h 40m");
+    }
+
+    #[test]
     fn headroom_none_without_five_hour_pct() {
         let mut s = snap(30.0, 100.0);
         s.windows[0].utilization = None;
-        assert_eq!(headroom(&s, Some(0.5), NOW), None);
+        assert_eq!(headroom_of(&s, Some(0.5), NOW), None);
         s.windows.clear();
-        assert_eq!(headroom(&s, Some(0.5), NOW), None);
-        assert_eq!(headroom(&s, None, NOW), None);
+        assert_eq!(headroom_of(&s, Some(0.5), NOW), None);
+        assert_eq!(headroom_of(&s, None, NOW), None);
     }
 
     // --- Orange Fable floor on charts -----------------------------------------

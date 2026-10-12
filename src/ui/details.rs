@@ -106,19 +106,24 @@ fn contents(ui: &mut Ui, d: &Dashboard, settings: &Settings, now: DateTime<Utc>)
         ui.add_space(GAP);
     }
 
-    let all = analytics::burn_line(
-        &d.history,
-        snap.five_hour_pct(),
-        snap.five_hour_resets_at(),
-        now,
-    );
-    rows::show_burn_row(ui, BurnTag::All, &rows::burn_body(all.as_ref()));
+    // As of now: with no active window (after a reset, or a rollover since
+    // the poll) the ALL line says idle and there is no projected use.
+    let five = d.five_hour_now(now);
+    let idle = five.state == analytics::FiveHourState::Idle;
+    let all_body = if idle {
+        vec![super::Run::new(super::footer::IDLE, super::Tone::Dim)]
+    } else {
+        let all = analytics::burn_line(&d.history, five.pct, five.resets_at, now);
+        rows::burn_body(all.as_ref())
+    };
+    rows::show_burn_row(ui, BurnTag::All, &all_body);
     if let Some(fable) = snap.window("Fable") {
         let line = analytics::burn_line(&d.fable_history, fable.utilization, fable.resets_at, now);
         rows::show_burn_row(ui, BurnTag::Fable, &rows::burn_body(line.as_ref()));
     }
     let rate = analytics::compute_rate(&d.history, now);
-    if let Some(h) = analytics::headroom(snap, rate, now) {
+    let headroom = analytics::headroom(five.pct, five.resets_at, rate, now).filter(|_| !idle);
+    if let Some(h) = headroom {
         show_runs(ui, &rows::headroom_runs(&h));
     }
     ui.add_space(GAP);
