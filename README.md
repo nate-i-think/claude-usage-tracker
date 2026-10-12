@@ -221,7 +221,7 @@ Common failure modes:
 - **"No browser profile found"**: sign in to `claude.ai` in a supported Firefox-family browser, or set the cookie file explicitly.
 - **`__cf_bm` missing or expired**: visit `claude.ai/settings/usage` in your browser within 30 minutes before polling.
 - **"poller stopped — restart the app"** in the GUI: the background poller exited unexpectedly. Restart the app.
-- **The GUI closed or showed a "crashed" message box**: the details, with a backtrace, are in `crash.log` in the [data directory](#privacy--security). Panics the poller recovers from are logged there too, without a message box. If the tray icon or the notification registration fails, the reason is logged there as well.
+- **The GUI closed or showed a "crashed" message box**: the details are in `crash.log` in the [data directory](#privacy--security), with a backtrace for a panic. Panics the poller recovers from are logged there too, without a message box. If the tray icon or the notification registration fails, the reason is logged there as well, as a plain entry without a backtrace.
 - **The window seems gone**: with close to tray on, ✕ only hides it. Left-click the tray icon (it may be in the taskbar's "^" overflow) to bring it back.
 
 ## Privacy & security
@@ -233,7 +233,7 @@ A small amount of state is kept locally in the app's data directory:
 - `history.jsonl`: usage snapshots (percentages and timestamps; no conversation content). Used for the charts and the burn rate.
 - `latest.json`: the most recent full snapshot (every window's utilization and reset time, and the extra-usage block). Read by the MCP server.
 - `anonymous_id`: a random UUID generated per install, sent as a telemetry header to `claude.ai`, as the web client does. Nothing ties one install to another.
-- `crash.log` (GUI): panics and startup failures, with a timestamp and a backtrace.
+- `crash.log` (GUI): panics (with a backtrace), startup failures, and tray icon or notification registration failures, each with a timestamp.
 - `app-icon.png` (GUI, Windows): the coral "%" icon that notifications show, rewritten only when it changes.
 
 The data directory is:
