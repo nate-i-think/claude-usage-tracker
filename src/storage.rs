@@ -186,16 +186,13 @@ fn iso(dt: DateTime<Utc>) -> String {
 
 // --- Rollups for charts ----------------------------------------------------
 
-/// The daily rollups plus the raw samples of the five-hour window and the
+/// What the charts and the weekly projections read from history.jsonl: the
+/// five-hour window's samples, the weekly window's (thinned), and the
 /// weekly series (7-day all and Fable 7-day) of the last
-/// [`WEEKLY_RATE_HOURS`], from a single read of history.jsonl. The rollups are identical to calling
-/// [`daily_history`] and [`fable_daily_history`] separately, but the
-/// history is read and parsed once (from the earliest cutoff any of them
-/// needs).
+/// [`WEEKLY_RATE_HOURS`] with their anchors, from a single read (from the
+/// earliest cutoff any of them needs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rollups {
-    pub daily: Vec<(NaiveDate, Option<f64>)>,
-    pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     /// Every row in `[window_start, window_end)`, oldest first.
     pub window_samples: Vec<WindowSample>,
     /// The rows of the weekly window `[week_start, week_end]`, oldest
@@ -218,21 +215,15 @@ pub fn rollups(
     paths: &Paths,
     window: (DateTime<Utc>, DateTime<Utc>),
     week: (DateTime<Utc>, DateTime<Utc>),
-    days: usize,
     now: DateTime<Utc>,
 ) -> Rollups {
     let (window_start, window_end) = window;
     let recent_start = now - Duration::hours(WEEKLY_RATE_HOURS);
-    let since = match daily_since(days, now) {
-        Some(d) => d.min(window_start),
-        None => window_start,
-    }
-    .min(now - Duration::days(ANCHOR_LOOKBACK_DAYS))
-    .min(week.0);
+    let since = window_start
+        .min(now - Duration::days(ANCHOR_LOOKBACK_DAYS))
+        .min(week.0);
     let rows = read_recent(paths, since);
     Rollups {
-        daily: daily_max(&rows, days, now, |e| e.seven_day),
-        fable_daily: daily_max(&rows, days, now, |e| e.fable_7d),
         window_samples: window_samples(&rows, window_start, window_end),
         week_samples: week_samples(&rows, week, now),
         seven_day_recent: recent_series(&rows, recent_start, now, |e| e.seven_day),
@@ -309,88 +300,6 @@ fn window_samples(
     // The file is append-only, but concurrent writers can interleave.
     samples.sort_by_key(|s| s.t);
     samples
-}
-
-/// Last `days` local calendar days of 7-day utilization, max per day,
-/// oldest first. Days without samples are `None`.
-pub fn daily_history(
-    paths: &Paths,
-    days: usize,
-    now: DateTime<Utc>,
-) -> Vec<(NaiveDate, Option<f64>)> {
-    let rows = daily_since(days, now).map_or_else(Vec::new, |since| read_recent(paths, since));
-    daily_max(&rows, days, now, |e| e.seven_day)
-}
-
-/// Like [`daily_history`] but for Fable 7-day utilization, with the same day
-/// indices. Legacy rows predating Fable contribute nothing.
-pub fn fable_daily_history(
-    paths: &Paths,
-    days: usize,
-    now: DateTime<Utc>,
-) -> Vec<(NaiveDate, Option<f64>)> {
-    let rows = daily_since(days, now).map_or_else(Vec::new, |since| read_recent(paths, since));
-    daily_max(&rows, days, now, |e| e.fable_7d)
-}
-
-/// The last `days` local calendar days ending today, oldest first.
-fn day_list(days: usize, now: DateTime<Utc>) -> Vec<NaiveDate> {
-    let today = now.with_timezone(&Local).date_naive();
-    (0..days as i64)
-        .rev()
-        .map(|i| today - Duration::days(i))
-        .collect()
-}
-
-/// Earliest instant the daily rollup needs (local midnight of the oldest
-/// day), or `None` when `days == 0`.
-fn daily_since(days: usize, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    day_list(days, now).first().map(|d| local_midnight(*d))
-}
-
-/// Max of one field per local day. `rows` may hold entries older than the
-/// range; they are ignored.
-fn daily_max(
-    rows: &[HistoryEntry],
-    days: usize,
-    now: DateTime<Utc>,
-    field: impl Fn(&HistoryEntry) -> Option<f64>,
-) -> Vec<(NaiveDate, Option<f64>)> {
-    if days == 0 {
-        return Vec::new();
-    }
-    let day_list = day_list(days, now);
-    let since = unix_seconds(local_midnight(day_list[0]));
-    let mut by_day: Vec<Option<f64>> = vec![None; days];
-
-    for e in rows.iter().filter(|e| e.ts >= since) {
-        let Some(val) = field(e) else { continue };
-        let Some(day) = from_unix_seconds(e.ts).map(|t| t.with_timezone(&Local).date_naive())
-        else {
-            continue;
-        };
-        if let Some(idx) = day_list.iter().position(|d| *d == day) {
-            // Python seeds the per-day max with 0.
-            by_day[idx] = Some(by_day[idx].unwrap_or(0.0).max(val));
-        }
-    }
-
-    day_list.into_iter().zip(by_day).collect()
-}
-
-/// The instant of local midnight starting `date` (the earliest one if the
-/// clock repeats; one hour later if midnight is skipped by a DST jump).
-fn local_midnight(date: NaiveDate) -> DateTime<Utc> {
-    let midnight = date.and_hms_opt(0, 0, 0).expect("valid time");
-    Local
-        .from_local_datetime(&midnight)
-        .earliest()
-        .or_else(|| {
-            Local
-                .from_local_datetime(&(midnight + Duration::hours(1)))
-                .earliest()
-        })
-        .map_or_else(|| midnight.and_utc(), |t| t.with_timezone(&Utc))
 }
 
 // --- Per-instance attribution from local JSONLs ----------------------------
@@ -727,10 +636,6 @@ mod tests {
         fs::write(paths.history_file(), body).unwrap();
     }
 
-    fn row(ts: DateTime<Utc>, field: &str, v: f64) -> String {
-        json!({"ts": unix_seconds(ts), field: v}).to_string()
-    }
-
     // --- history ------------------------------------------------------------
 
     #[test]
@@ -935,46 +840,8 @@ mod tests {
         assert_eq!(read_latest_snapshot(&paths), None);
     }
 
-    // --- daily history ------------------------------------------------------------
-
     #[test]
-    fn daily_max_per_local_day_oldest_first() {
-        let (_tmp, paths) = temp_paths();
-        write_history(
-            &paths,
-            &[
-                row(local(2026, 10, 4, 12, 0), "seven_day", 90.0), // before range
-                row(local(2026, 10, 5, 0, 30), "seven_day", 7.0),
-                row(local(2026, 10, 9, 9, 0), "seven_day", 10.0),
-                row(local(2026, 10, 9, 20, 0), "seven_day", 15.0),
-                row(local(2026, 10, 9, 22, 0), "seven_day", 11.0),
-                row(local(2026, 10, 11, 1, 0), "seven_day", 20.0),
-                row(local(2026, 10, 11, 2, 0), "fable_7d", 2.0),
-            ],
-        );
-        let now = local(2026, 10, 11, 12, 0);
-        let got = daily_history(&paths, 7, now);
-
-        let days: Vec<NaiveDate> = got.iter().map(|(d, _)| *d).collect();
-        let expected_days: Vec<NaiveDate> = (5..=11)
-            .map(|d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap())
-            .collect();
-        assert_eq!(days, expected_days);
-        let vals: Vec<Option<f64>> = got.iter().map(|(_, v)| *v).collect();
-        assert_eq!(
-            vals,
-            vec![Some(7.0), None, None, None, Some(15.0), None, Some(20.0)]
-        );
-
-        let fable: Vec<Option<f64>> = fable_daily_history(&paths, 7, now)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect();
-        assert_eq!(fable, vec![None, None, None, None, None, None, Some(2.0)]);
-    }
-
-    #[test]
-    fn rollups_match_the_separate_functions() {
+    fn rollups_window_week_and_weekly_series() {
         let (_tmp, paths) = temp_paths();
         let now = local(2026, 10, 11, 12, 0);
         let ws = now - Duration::minutes(100);
@@ -996,16 +863,10 @@ mod tests {
         lines.push("not json".into());
         write_history(&paths, &lines);
 
-        for days in [0, 1, 7] {
-            let got = rollups(&paths, (ws, ws + Duration::hours(5)), week, days, now);
-            assert_eq!(got.daily, daily_history(&paths, days, now));
-            assert_eq!(got.fable_daily, fable_daily_history(&paths, days, now));
-        }
         // Window older than the daily range: the window cutoff wins.
         let old_ws = now - Duration::days(8);
-        let got = rollups(&paths, (old_ws, old_ws + Duration::hours(5)), week, 7, now);
+        let got = rollups(&paths, (old_ws, old_ws + Duration::hours(5)), week, now);
         assert!(got.window_samples.iter().any(|w| w.five_hour.is_some()));
-        assert_eq!(got.daily, daily_history(&paths, 7, now));
         // The weekly samples: the anchor 20 minutes before the 24 h, then
         // the last 24 h every 20 minutes, both ends in.
         let recent = &got.seven_day_recent;
@@ -1034,8 +895,8 @@ mod tests {
         assert!((w[0].t - week.0).num_seconds().abs() <= 1);
         assert!(w.windows(2).all(|p| p[0].t < p[1].t));
         assert!(w.iter().all(|s| s.seven_day.is_some() && s.fable.is_some()));
-        // Even with no daily range, the 24 h and the anchor are read.
-        let got = rollups(&paths, (ws, ws + Duration::hours(5)), week, 0, now);
+        // A recent window and week still read the 24 h and the anchor.
+        let got = rollups(&paths, (ws, ws + Duration::hours(5)), (ws, now), now);
         assert_eq!(got.seven_day_recent.len(), 24 * 3 + 2);
     }
 
@@ -1059,7 +920,7 @@ mod tests {
             ],
         );
         let before = history_reads();
-        let got = rollups(&paths, (ws, ws + Duration::hours(5)), (ws, now), 7, now);
+        let got = rollups(&paths, (ws, ws + Duration::hours(5)), (ws, now), now);
         assert_eq!(history_reads() - before, 1, "rollups reads history once");
         let sample = |m: i64, five, fable| WindowSample {
             t: ws + Duration::minutes(m),
@@ -1076,17 +937,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn daily_zero_days_is_empty() {
-        let (_tmp, paths) = temp_paths();
-        assert!(daily_history(&paths, 0, Utc::now()).is_empty());
-    }
-
     // --- attribution -----------------------------------------------------------------
 
     fn write_lines(path: &Path, lines: &[Value]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        let body: String = lines
+            .iter()
+            .map(|l| {
+                format!(
+                    "{l}
+"
+                )
+            })
+            .collect();
         fs::write(path, body).unwrap();
     }
 

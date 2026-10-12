@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use crate::analytics::{self, WeekSample, WindowSample, BURN_WINDOW_MINUTES, HISTORY_LEN};
 use crate::config::{Settings, MIN_INTERVAL_SECS};
@@ -22,9 +22,6 @@ use crate::fetch::{self, FetchError};
 use crate::model::Snapshot;
 use crate::paths::{self, Paths};
 use crate::storage::{self, InstanceUsage};
-
-/// Days shown in the 7-day daily charts (Python `daily_history(days=7)`).
-const DAILY_DAYS: usize = 7;
 
 /// One timestamped utilization sample for burn-rate math.
 pub type Sample = (DateTime<Utc>, Option<f64>);
@@ -37,8 +34,6 @@ pub struct Dashboard {
     pub history: Vec<Sample>,
     /// In-memory Fable weekly samples, oldest first.
     pub fable_history: Vec<Sample>,
-    pub daily_history: Vec<(NaiveDate, Option<f64>)>,
-    pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     /// 7-day-all samples of the last [`crate::analytics::WEEKLY_RATE_HOURS`]
     /// after their anchor, oldest first, including this poll's, for the
     /// weekly projection.
@@ -237,20 +232,12 @@ fn build_dashboard(
         .unwrap_or(ws + ChronoDuration::hours(5));
     let (week_start, week_end) = analytics::week_window(snapshot.seven_day_resets_at(), now);
     // One history read feeds the rollups, the window samples and the week.
-    let rollups = storage::rollups(
-        paths,
-        (ws, window_end),
-        (week_start, week_end),
-        DAILY_DAYS,
-        now,
-    );
+    let rollups = storage::rollups(paths, (ws, window_end), (week_start, week_end), now);
     let window_samples = with_current_sample(rollups.window_samples, &snapshot, ws, window_end);
     let week_samples = with_current_week_sample(rollups.week_samples, &snapshot);
     Dashboard {
         history: history.five_hour(),
         fable_history: history.fable(),
-        daily_history: rollups.daily,
-        fable_daily: rollups.fable_daily,
         seven_day_recent: with_current(
             rollups.seven_day_recent,
             snapshot.fetched_at,
@@ -841,8 +828,6 @@ mod tests {
             d.window_start,
             d.snapshot.five_hour_resets_at().unwrap() - ChronoDuration::hours(5)
         );
-        assert_eq!(d.daily_history.len(), DAILY_DAYS);
-        assert_eq!(d.fable_daily.len(), DAILY_DAYS);
         assert!(d.burners.is_empty());
         assert_eq!(d.persist_error, None);
         // The just-appended sample is in the window samples.
