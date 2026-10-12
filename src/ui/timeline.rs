@@ -31,6 +31,8 @@ use super::theme::Palette;
 
 /// Height of the timeline in full mode.
 pub const FULL_HEIGHT: f32 = 180.0;
+/// The card's title.
+pub const TITLE: &str = "5-hour window";
 /// A gap between samples longer than this ends a solid line (the app was
 /// closed or polls failed); its two ends are joined by a [`Bridge`].
 pub const GAP_BREAK_MINUTES: i64 = 10;
@@ -90,8 +92,7 @@ impl Axes {
 
     /// y of `pct`, clamped to 0–100%.
     pub fn y_at(&self, pct: f64) -> f32 {
-        let frac = (pct.clamp(0.0, 100.0) / 100.0) as f32;
-        self.plot.bottom() - frac * self.plot.height()
+        y_in(self.plot, pct)
     }
 
     /// The time at `x` (inverse of [`Axes::x_at`]), to the millisecond.
@@ -107,6 +108,27 @@ impl Axes {
     pub fn pos(&self, t: DateTime<Utc>, pct: f64) -> Pos2 {
         pos2(self.x_at(t), self.y_at(pct))
     }
+}
+
+/// y of `pct` in `plot`, on the fixed 0–100% scale every chart shares;
+/// clamped to the plot.
+pub fn y_in(plot: Rect, pct: f64) -> f32 {
+    let frac = (pct.clamp(0.0, 100.0) / 100.0) as f32;
+    plot.bottom() - frac * plot.height()
+}
+
+/// The plot area inside a chart widget `rect`: room on the left for the
+/// "100%" labels (`label_w` wide), on top for the ✕ cap marker or half a
+/// label, at the bottom for the x labels (`text_h` tall). Shared by the
+/// timeline and the 7-day chart so their gridlines line up side by side.
+pub fn plot_rect(rect: Rect, label_w: f32, text_h: f32) -> Rect {
+    Rect::from_min_max(
+        pos2(
+            rect.left() + label_w + 6.0,
+            rect.top() + text_h.max(CAP_MARK + 2.0),
+        ),
+        pos2(rect.right() - CAP_MARK - 2.0, rect.bottom() - text_h - 6.0),
+    )
 }
 
 /// Index ranges of `samples` drawn as one solid line each: only samples
@@ -296,6 +318,21 @@ where
     let local = t.with_timezone(tz);
     let suffix = if local.hour() < 12 { 'a' } else { 'p' };
     format!("{}{suffix}", local.format("%-I:%M"))
+}
+
+/// The card's subtitle: the window's span, "6:10p – 11:10p" in the
+/// [`short_time_in`] format of the "reset 11:10p" label. `None` when the
+/// reset is unknown: the end is then only assumed.
+pub fn window_span_in<Tz: TimeZone>(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    reset_known: bool,
+    tz: &Tz,
+) -> Option<String>
+where
+    Tz::Offset: Display,
+{
+    reset_known.then(|| format!("{} – {}", short_time_in(start, tz), short_time_in(end, tz)))
 }
 
 /// Tooltip over a bridge: "no samples 1:10–1:45 PM", or with both
@@ -581,6 +618,24 @@ pub fn dash_end(from: Pos2, end: Pos2, label: Rect) -> Pos2 {
     }
 }
 
+/// The timeline's card: the title with the window's span as its subtitle
+/// (see [`window_span_in`]), then the timeline, `height` tall.
+pub fn show_timeline_card(
+    ui: &mut Ui,
+    d: &Dashboard,
+    now: DateTime<Utc>,
+    palette: &Palette,
+    height: f32,
+) {
+    let reset_known = d.snapshot.five_hour_resets_at().is_some();
+    let span = window_span_in(d.window_start, d.window_end, reset_known, &Local);
+    super::theme::card(palette).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        super::theme::chart_title(ui, palette, TITLE, span.as_deref());
+        show_timeline(ui, d, now, palette, height);
+    });
+}
+
 /// Paint the timeline for `d` at `now`, `height` tall across the available
 /// width. Hovering shows a crosshair and a tooltip.
 pub fn show_timeline(
@@ -601,20 +656,13 @@ pub fn show_timeline(
         .layout_no_wrap("100%".to_owned(), font.clone(), palette.text_muted)
         .size()
         .x;
-    let text_h = font.size;
     let axes = Axes {
-        plot: Rect::from_min_max(
-            pos2(
-                rect.left() + label_w + 6.0,
-                rect.top() + text_h.max(CAP_MARK + 2.0),
-            ),
-            pos2(rect.right() - CAP_MARK - 2.0, rect.bottom() - text_h - 6.0),
-        ),
+        plot: plot_rect(rect, label_w, font.size),
         start: d.window_start,
         end: d.window_end,
     };
 
-    paint_grid(&painter, &axes, palette, &font);
+    paint_y_axis(&painter, axes.plot, palette, &font);
     paint_time_axis(&painter, &axes, palette, &font, rect.left());
 
     let samples = &d.window_samples;
@@ -669,13 +717,13 @@ pub fn show_timeline(
     response
 }
 
-/// Gridlines at 25/50/75 with labels, the dashed 100% cap line, and the
-/// baseline.
-fn paint_grid(painter: &Painter, axes: &Axes, palette: &Palette, font: &FontId) {
-    let label_x = axes.plot.left() - 4.0;
+/// The y axis of `plot`: gridlines at 25/50/75 with labels, the dashed 100%
+/// cap line, and the baseline. Every chart uses it, so the axes match.
+pub fn paint_y_axis(painter: &Painter, plot: Rect, palette: &Palette, font: &FontId) {
+    let label_x = plot.left() - 4.0;
     for mark in GRID_MARKS {
-        let y = axes.y_at(mark);
-        painter.hline(axes.plot.x_range(), y, Stroke::new(1.0, palette.grid));
+        let y = y_in(plot, mark);
+        painter.hline(plot.x_range(), y, Stroke::new(1.0, palette.grid));
         painter.text(
             pos2(label_x, y),
             Align2::RIGHT_CENTER,
@@ -684,9 +732,9 @@ fn paint_grid(painter: &Painter, axes: &Axes, palette: &Palette, font: &FontId) 
             palette.text_muted,
         );
     }
-    let top = axes.y_at(100.0);
+    let top = y_in(plot, 100.0);
     let cap = Stroke::new(1.0, palette.danger.gamma_multiply(CAP_LINE_ALPHA));
-    let ends = (pos2(axes.plot.left(), top), pos2(axes.plot.right(), top));
+    let ends = (pos2(plot.left(), top), pos2(plot.right(), top));
     paint_dashed(painter, ends.0, ends.1, cap);
     painter.text(
         pos2(label_x, top),
@@ -696,8 +744,8 @@ fn paint_grid(painter: &Painter, axes: &Axes, palette: &Palette, font: &FontId) 
         palette.text_muted,
     );
     painter.hline(
-        axes.plot.x_range(),
-        axes.plot.bottom(),
+        plot.x_range(),
+        plot.bottom(),
         Stroke::new(1.0, palette.border),
     );
 }
@@ -943,7 +991,8 @@ fn paint_hover(
     tip
 }
 
-fn paint_dashed(painter: &Painter, a: Pos2, b: Pos2, stroke: Stroke) {
+/// A dashed line from `a` to `b` in the timeline's dash pattern.
+pub fn paint_dashed(painter: &Painter, a: Pos2, b: Pos2, stroke: Stroke) {
     for seg in dashes(a, b, DASH, DASH_GAP) {
         painter.line_segment(seg, stroke);
     }
@@ -1283,6 +1332,36 @@ mod tests {
         assert_eq!(short_time_in(morning, &Utc), "12:05a");
         let ist = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
         assert_eq!(short_time_in(t, &ist), "9:12p");
+    }
+
+    #[test]
+    fn window_span_subtitle() {
+        let t = |h, m| Utc.with_ymd_and_hms(2026, 10, 11, h, m, 0).unwrap();
+        assert_eq!(
+            window_span_in(t(18, 10), t(23, 10), true, &Utc).as_deref(),
+            Some("6:10p – 11:10p")
+        );
+        assert_eq!(
+            window_span_in(t(9, 30), t(14, 30), true, &Utc).as_deref(),
+            Some("9:30a – 2:30p")
+        );
+        // An unknown reset: the end is only assumed, so no span.
+        assert_eq!(window_span_in(t(18, 10), t(23, 10), false, &Utc), None);
+    }
+
+    #[test]
+    fn plot_rect_insets() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 180.0));
+        let plot = plot_rect(rect, 30.0, 11.5);
+        assert_eq!(plot.left(), 36.0);
+        assert_eq!(plot.top(), 11.5);
+        assert_eq!(plot.right(), 300.0 - CAP_MARK - 2.0);
+        assert_eq!(plot.bottom(), 180.0 - 11.5 - 6.0);
+        // A small font still leaves room for the ✕ at 100%.
+        assert_eq!(plot_rect(rect, 30.0, 4.0).top(), CAP_MARK + 2.0);
+        assert_eq!(y_in(plot, 100.0), plot.top());
+        assert_eq!(y_in(plot, 0.0), plot.bottom());
+        assert_eq!(y_in(plot, 150.0), plot.top());
     }
 
     #[test]
