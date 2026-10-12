@@ -36,7 +36,7 @@ The theme is dark by default, and a light "cream" theme is built in:
 
 ![Light theme](docs/screenshot-light.png)
 
-There is no theme switch in the UI yet. To use the light theme (or follow the system), close the app and change `theme_preference:Dark` to `theme_preference:Light` (or `System`) in the `"egui"` entry of [`app.ron`](#privacy--security).
+Switch between them (or follow the system) with **Theme** in [Settings](#settings).
 
 ## Pill mode
 
@@ -75,12 +75,13 @@ Clicking a notification is meant to bring the window forward, but this has not b
 
 ## Settings
 
-Open Settings with ⚙. Changes take effect on **Apply**, except **Always on top**, which applies at once.
+Open Settings with ⚙. Changes take effect on **Apply**, except **Always on top** and **Theme**, which apply at once.
 
 - **Plan label**: shown in the Details footer line (default "Max").
 - **Poll interval**: default 60 s, minimum 5 s. It accepts plain seconds or a suffix: `30`, `30s`, `2m`, `1h`.
 - **Show all buckets**: list usage windows at 0% in Details too.
 - **Always on top**: keep the full window above other windows. (The pill is always on top.)
+- **Theme**: **System**, **Dark** (the default) or **Light**.
 - **Cookie file**: an explicit `cookies.sqlite`; blank means auto-detect (see [Signing in](#signing-in)).
 - **Client SHA**: see [Refreshing the client SHA](#refreshing-the-client-sha). Settings shows which source is in use.
 - **Window**: **Show tray icon**; **Close button hides to tray** (needs the tray icon); **Start in pill mode**.
@@ -296,7 +297,6 @@ It leaves the Store Python file untouched, and `history.jsonl.bak` holds the pre
 
 - **Clicking a notification** is wired to bring the window forward, but this has not been confirmed on a real banner yet. It may not work from the notification center after the banner is gone, and Windows may show the window without focusing it.
 - **Windows only**: the tray icon, alerts and the rounded pill corners. Other platforms build without them (and are untested in general).
-- **No theme switch in the UI**: see [What it shows](#what-it-shows) for the `app.ron` edit.
 
 ## Caveats
 
