@@ -48,6 +48,8 @@ windows-sys = { version = "0.61", features = [
     # The toasts' app id (notify): the HKCU AppUserModelId key and the
     # process tag. Security: RegCreateKeyExW's SECURITY_ATTRIBUTES.
     "Win32_UI_Shell", "Win32_System_Registry", "Win32_Security",
+    # The tray toggle's double-click debounce (GetDoubleClickTime).
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 # eframe's own (0.6): the HWND of the main window for its startup placement.
 raw-window-handle = "0.6"
