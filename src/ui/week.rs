@@ -513,11 +513,14 @@ pub fn show_week_card(
     super::theme::card(palette)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let top = ui.cursor().top();
+            // Reserved from the cursor, so set before the content.
+            ui.set_min_height(size.min_content);
             super::theme::chart_title(ui, palette, TITLE, Some(&subtitle(&bars)));
             show_week(ui, &bars, today, palette, size.chart);
             outlook_rows(ui, &rows, stale);
-            let natural = ui.min_rect().height();
-            ui.set_min_height(size.min_content);
+            // From the cursor: min_rect includes the reserved height.
+            let natural = ui.cursor().top() - top - ui.spacing().item_spacing.y;
             natural
         })
         .inner
