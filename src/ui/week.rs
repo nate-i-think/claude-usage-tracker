@@ -836,7 +836,7 @@ mod tests {
         analytics::WeeklyRate {
             per_day,
             span: Duration::hours(24),
-            basis: analytics::RateBasis::Anchored,
+            basis: analytics::RateBasis::Anchored { gap: false },
             floored: false,
             since_reset: false,
         }
