@@ -120,6 +120,7 @@ mod tests {
             fable_history: Vec::new(),
             daily_history: Vec::new(),
             fable_daily: Vec::new(),
+            seven_day_recent: Vec::new(),
             burners: Vec::new(),
             window_start: resets_at - Duration::hours(5),
             window_end: resets_at,

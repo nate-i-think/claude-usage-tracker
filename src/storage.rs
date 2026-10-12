@@ -15,7 +15,7 @@ use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc}
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::analytics::{project_display_name, WindowSample};
+use crate::analytics::{project_display_name, WindowSample, WEEKLY_RATE_HOURS};
 use crate::model::{ExtraUsage, Snapshot};
 use crate::paths::Paths;
 
@@ -184,8 +184,9 @@ fn iso(dt: DateTime<Utc>) -> String {
 
 // --- Rollups for charts ----------------------------------------------------
 
-/// The daily rollups plus the raw samples of the five-hour window, from a
-/// single read of history.jsonl. The rollups are identical to calling
+/// The daily rollups plus the raw samples of the five-hour window and the
+/// last [`WEEKLY_RATE_HOURS`] of 7-day-all samples, from a single read of
+/// history.jsonl. The rollups are identical to calling
 /// [`daily_history`] and [`fable_daily_history`] separately, but the
 /// history is read and parsed once (from the earliest cutoff any of them
 /// needs).
@@ -195,6 +196,9 @@ pub struct Rollups {
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     /// Every row in `[window_start, window_end)`, oldest first.
     pub window_samples: Vec<WindowSample>,
+    /// 7-day-all utilization of every row in the last [`WEEKLY_RATE_HOURS`]
+    /// up to `now`, oldest first, for the weekly projection.
+    pub seven_day_recent: Vec<(DateTime<Utc>, Option<f64>)>,
 }
 
 /// See [`Rollups`].
@@ -205,16 +209,35 @@ pub fn rollups(
     days: usize,
     now: DateTime<Utc>,
 ) -> Rollups {
+    let recent_start = now - Duration::hours(WEEKLY_RATE_HOURS);
     let since = match daily_since(days, now) {
         Some(d) => d.min(window_start),
         None => window_start,
-    };
+    }
+    .min(recent_start);
     let rows = read_recent(paths, since);
     Rollups {
         daily: daily_max(&rows, days, now, |e| e.seven_day),
         fable_daily: daily_max(&rows, days, now, |e| e.fable_7d),
         window_samples: window_samples(&rows, window_start, window_end),
+        seven_day_recent: seven_day_recent(&rows, recent_start, now),
     }
+}
+
+/// The rows' 7-day-all values in `[start, now]`, oldest first.
+fn seven_day_recent(
+    rows: &[HistoryEntry],
+    start: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, Option<f64>)> {
+    let (start_ts, end_ts) = (unix_seconds(start), unix_seconds(now));
+    let mut out: Vec<_> = rows
+        .iter()
+        .filter(|e| e.ts >= start_ts && e.ts <= end_ts)
+        .filter_map(|e| Some((from_unix_seconds(e.ts)?, e.seven_day)))
+        .collect();
+    out.sort_by_key(|(t, _)| *t);
+    out
 }
 
 /// The rows in the half-open window `[window_start, window_end)`, as
@@ -936,6 +959,16 @@ mod tests {
         let got = rollups(&paths, old_ws, old_ws + Duration::hours(5), 7, now);
         assert!(got.window_samples.iter().any(|w| w.five_hour.is_some()));
         assert_eq!(got.daily, daily_history(&paths, 7, now));
+        // The weekly samples: the last 24 h every 20 minutes, both ends in.
+        let recent = &got.seven_day_recent;
+        assert_eq!(recent.len(), 24 * 3 + 1);
+        assert!(recent.windows(2).all(|w| w[0].0 < w[1].0));
+        let first = recent.first().unwrap().0;
+        assert!((first - (now - Duration::hours(24))).num_seconds().abs() <= 1);
+        assert!((recent.last().unwrap().0 - now).num_seconds().abs() <= 1);
+        // Even with no daily range, the 24 h are read.
+        let got = rollups(&paths, ws, ws + Duration::hours(5), 0, now);
+        assert_eq!(got.seven_day_recent.len(), 24 * 3 + 1);
     }
 
     #[test]

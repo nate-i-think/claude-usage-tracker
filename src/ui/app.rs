@@ -629,6 +629,7 @@ mod tests {
             fable_history: Vec::new(),
             daily_history: Vec::new(),
             fable_daily: Vec::new(),
+            seven_day_recent: Vec::new(),
             burners: Vec::new(),
             window_start: t,
             window_end: t,
