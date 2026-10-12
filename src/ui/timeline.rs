@@ -502,11 +502,13 @@ fn line_low_over(from: Pos2, end: Pos2, x0: f32, x1: f32) -> f32 {
 /// `clearance` how far the label sits from the end point.
 ///
 /// Tries, in order: above-left, above-right, left at the top of the bounds,
-/// below-right, left (centered on the end point), then below-left dropped
-/// just under the line. Takes
-/// the first whose padded rect misses both the line and the keep-out box.
-/// When the line touches every one, takes the first that still misses the
-/// keep-out box (the dash then stops short of it, see [`dash_end`]).
+/// below-right, left (centered on the end point), below-left dropped just
+/// under the line, then behind the now marker at the top. The projection starts at now, so the vertical now
+/// marker through `from.x` is a keep-out column as well. Takes the first
+/// whose padded rect misses the line, the keep-out box and the now column;
+/// then the first that misses the box and the column (the dash then stops
+/// short of the label, see [`dash_end`]); then the first that misses the
+/// box.
 pub fn place_end_label(
     from: Pos2,
     end: Pos2,
@@ -546,14 +548,22 @@ pub fn place_end_label(
         at(pos2(end.x + c, end.y + c)),
         at(pos2(end.x - c - size.x, end.y - size.y / 2.0)),
         under_line,
+        // Behind now at the top, for a projection too short to hold the
+        // label: usage only grows within a window, so the past line runs
+        // at or below the dot and the line ahead starts right of now.
+        at(pos2(from.x - LABEL_PAD - 1.0 - size.x, bounds.top())),
     ];
     let keep = Rect::from_center_size(end, Vec2::splat(2.0 * keep_out));
     let clear_of_keep = |r: &Rect| !overlaps(r.expand(LABEL_PAD), keep);
-    candidates
-        .iter()
-        .copied()
-        .find(|r| clear_of_keep(r) && segment_entry(from, end, r.expand(LABEL_PAD)).is_none())
-        .or_else(|| candidates.iter().copied().find(clear_of_keep))
+    let clear_of_now = |r: &Rect| {
+        let padded = r.expand(LABEL_PAD);
+        !(padded.left() < from.x && from.x < padded.right())
+    };
+    let clear_of_line = |r: &Rect| segment_entry(from, end, r.expand(LABEL_PAD)).is_none();
+    let first = |ok: &dyn Fn(&Rect) -> bool| candidates.iter().copied().find(|r| ok(r));
+    first(&|r| clear_of_keep(r) && clear_of_now(r) && clear_of_line(r))
+        .or_else(|| first(&|r| clear_of_keep(r) && clear_of_now(r)))
+        .or_else(|| first(&clear_of_keep))
         .unwrap_or(under_line)
 }
 
@@ -1363,6 +1373,13 @@ mod tests {
             None,
             "on the line: {case}"
         );
+        // The projection starts at now, so the now marker is the vertical
+        // line through `from`.
+        let padded = got.expand(LABEL_PAD);
+        assert!(
+            !(padded.left() < from.x && from.x < padded.right()),
+            "on the now line: {case}"
+        );
     }
 
     #[test]
@@ -1371,7 +1388,7 @@ mod tests {
             let bounds = rect(40.0, 0.0, right, 150.0);
             let plot_right = right - CAP_MARK - 2.0;
             for back in [0.0, 10.0, 20.0, 30.0, 40.0, 150.0] {
-                for slope in [0.1, 0.25, 0.5, 1.0, 1.5, 2.0] {
+                for slope in [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0] {
                     assert_cap_label_clear(bounds, pos2(plot_right - back, 11.5), slope);
                 }
             }

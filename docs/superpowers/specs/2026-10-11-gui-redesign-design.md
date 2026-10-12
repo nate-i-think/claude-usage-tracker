@@ -147,7 +147,7 @@ Where the branch differs from the design text above, and why. Sources: the spike
 - **Gap bridging.** A gap of more than 10 minutes without samples still ends the solid segment, but segments separated only by time are joined by a dimmed dotted line over a faint area (and a faint Fable fill when both ends have a value). Hovering a bridge reads "no samples 1:10–1:45 PM". Only a reset (a drop of more than 5 points) or missing values leave a real break. Without this, sparse polling (app closed, laptop asleep) fragmented the chart.
 - Thinning keeps the min and max per pixel column (up to two points), so spikes survive. An isolated single sample is drawn as a dot.
 - The Fable layer has a 1 px surface-colored separator along its top, so it does not rely on hue next to the orange high state.
-- **End label placement**: "cap h:mmp" / "safe" sits on a surface-colored pad at the first of six candidate spots that neither the dashed line nor the ✕ keep-out box touches, and the dash stops short of the label. With an unknown reset there is no ✕ and no label (the line is still drawn), and the footer shows only the rate.
+- **End label placement**: "cap h:mmp" / "safe" sits on a surface-colored pad at the first of seven candidate spots that neither the dashed line, the ✕ keep-out box nor the now marker's column touches (the last spot sits behind now at the top, for projections too short to hold the label), and the dash stops short of the label. With an unknown reset there is no ✕ and no label (the line is still drawn), and the footer shows only the rate.
 - Hover picks, in order: the projection beyond now, the nearest sample within 12 px, a bridge, else just the time.
 
 ### Layout
