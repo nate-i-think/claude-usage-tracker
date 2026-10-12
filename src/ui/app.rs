@@ -515,32 +515,63 @@ fn icon_button(ui: &mut Ui, selected: bool, enabled: bool, icon: &str) -> egui::
 /// Details.
 fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
     let now = Utc::now();
-    charts(ui, d, now);
+    let stale = snapshot_stale(d.snapshot.fetched_at, now, settings);
+    charts(ui, d, now, stale);
     footer::show_footer(ui, d);
     details::show_details(ui, d, settings, now);
 }
 
 /// The hero timeline and the "Last 7 days" chart, each on its titled card:
 /// side by side when the column is wide enough (see
-/// [`layout::chart_widths`]), both [`timeline::FULL_HEIGHT`] tall so the
-/// cards match; else stacked with the timeline first and the 7-day chart
-/// [`week::STACKED_HEIGHT`] tall.
-fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
+/// [`layout::chart_widths`]), both [`timeline::FULL_HEIGHT`] tall and
+/// levelled to the taller card's content (measured the frame before); else
+/// stacked with the timeline first and the 7-day chart
+/// [`week::STACKED_HEIGHT`] tall. The weekly rows are muted when the
+/// snapshot is `stale`.
+fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>, stale: bool) {
     let palette = theme::Palette::for_visuals(ui.visuals());
-    let height = timeline::FULL_HEIGHT;
-    let timeline_card = |ui: &mut Ui| timeline::show_timeline_card(ui, d, now, palette, height);
+    let today = chrono::Local::now().date_naive();
     let Some((left, right)) = layout::chart_widths(ui.available_width()) else {
-        timeline_card(ui);
-        week::show_week_card(ui, d, now, palette, week::STACKED_HEIGHT);
+        let size = |chart| layout::CardSize {
+            chart,
+            min_content: 0.0,
+        };
+        timeline::show_timeline_card(ui, d, now, palette, size(timeline::FULL_HEIGHT));
+        week::show_week_card(ui, d, today, palette, size(week::STACKED_HEIGHT), stale);
         return;
     };
-    let week_card = |ui: &mut Ui| week::show_week_card(ui, d, now, palette, height);
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = GAP;
-        let column = egui::Layout::top_down(egui::Align::Min);
-        ui.allocate_ui_with_layout(egui::vec2(left, 0.0), column, timeline_card);
-        ui.allocate_ui_with_layout(egui::vec2(right, 0.0), column, week_card);
-    });
+    let id = egui::Id::new("charts-level-height");
+    let level: f32 = ui.ctx().data(|m| m.get_temp(id)).unwrap_or(0.0);
+    let size = layout::CardSize {
+        chart: timeline::FULL_HEIGHT,
+        min_content: level,
+    };
+    let natural = ui
+        .horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            let column = egui::Layout::top_down(egui::Align::Min);
+            let a = ui.allocate_ui_with_layout(egui::vec2(left, 0.0), column, |ui| {
+                timeline::show_timeline_card(ui, d, now, palette, size)
+            });
+            let b = ui.allocate_ui_with_layout(egui::vec2(right, 0.0), column, |ui| {
+                week::show_week_card(ui, d, today, palette, size, stale)
+            });
+            [a.inner, b.inner]
+        })
+        .inner;
+    let next = layout::level_height(&natural);
+    if (next - level).abs() > 0.5 {
+        ui.ctx().data_mut(|m| m.insert_temp(id, next));
+        ui.ctx().request_repaint();
+    }
+}
+
+/// Whether a snapshot fetched at `fetched` is stale at `now`: older than
+/// two poll intervals (polls are failing, or the machine slept).
+fn snapshot_stale(fetched: DateTime<Utc>, now: DateTime<Utc>, settings: &Settings) -> bool {
+    let interval = crate::poller::poll_interval(settings);
+    let limit = chrono::Duration::from_std(interval * 2).unwrap_or(chrono::Duration::MAX);
+    now - fetched > limit
 }
 
 /// Lay `add` out in the content column: at most
@@ -630,6 +661,7 @@ mod tests {
             daily_history: Vec::new(),
             fable_daily: Vec::new(),
             seven_day_recent: Vec::new(),
+            fable_recent: Vec::new(),
             burners: Vec::new(),
             window_start: t,
             window_end: t,
@@ -643,6 +675,19 @@ mod tests {
             message: message.to_owned(),
             stale_sha_hint: false,
         })
+    }
+
+    #[test]
+    fn snapshot_stale_after_two_poll_intervals() {
+        let t = DateTime::from_timestamp(1_791_000_000, 0).unwrap();
+        let settings = Settings {
+            interval_secs: 60,
+            ..Settings::default()
+        };
+        let at = |s: i64| t + chrono::Duration::seconds(s);
+        assert!(!snapshot_stale(t, at(0), &settings));
+        assert!(!snapshot_stale(t, at(120), &settings));
+        assert!(snapshot_stale(t, at(121), &settings));
     }
 
     #[test]
