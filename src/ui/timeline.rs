@@ -899,7 +899,7 @@ impl TimeStyle {
 }
 
 /// Which meter a [`Line`] belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LineKind {
     /// The chart's main meter (5-hour, or 7-day all).
     Main,
@@ -1061,15 +1061,14 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
     let ends: Vec<Ends> = chart
         .lines
         .iter()
-        .enumerate()
-        .map(|(i, line)| Ends {
-            pct: motion::eased(&ctx, Id::new((chart.id, i, "now-pct")), line.pct),
+        .map(|line| Ends {
+            pct: motion::eased(&ctx, Id::new((chart.id, line.kind, "now-pct")), line.pct),
             projection: line.projection,
             label: line.label,
             share: line.projection.map_or(1.0, |p| {
                 motion::draw_in(
                     &ctx,
-                    Id::new((chart.id, i, "projection")),
+                    Id::new((chart.id, line.kind, "projection")),
                     chart.poll_key,
                     p.end_pct,
                 )
@@ -1320,15 +1319,15 @@ where
 
 /// Whether an end label's text goes in the plot. "At cap" never does (a ✕
 /// on the 100% line marks it; the row under the chart has the words), and
-/// a "cap …" label only when the projection runs far enough right to hold
-/// it (`run` from now to the cap, `room` the label's width plus its
-/// clearance); otherwise only the ✕ shows, so a cap minutes away doesn't
-/// crowd the plot's corner.
+/// a "cap …" or "safe" label only when the projection runs far enough
+/// right to hold it (`run` from now to its end, `room` the label's width
+/// plus its clearance); otherwise only the ✕ (or nothing, for "safe")
+/// shows, so an end minutes away doesn't crowd the plot's corner. The row
+/// under the chart carries the words either way.
 pub fn label_shown(label: EndLabel, run: f32, room: f32) -> bool {
     match label {
         EndLabel::AtCap => false,
-        EndLabel::Cap(_) => run >= room,
-        EndLabel::Safe => true,
+        EndLabel::Cap(_) | EndLabel::Safe => run >= room,
     }
 }
 
@@ -2374,7 +2373,8 @@ mod tests {
         assert!(label_shown(cap, 80.0, 70.0));
         assert!(!label_shown(cap, 60.0, 70.0));
         assert!(!label_shown(EndLabel::AtCap, 500.0, 10.0));
-        assert!(label_shown(EndLabel::Safe, 0.0, 70.0));
+        assert!(!label_shown(EndLabel::Safe, 0.0, 70.0));
+        assert!(label_shown(EndLabel::Safe, 80.0, 70.0));
     }
 
     #[test]
