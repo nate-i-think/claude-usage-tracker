@@ -42,6 +42,84 @@ pub fn week_window(
     (end - Duration::days(7), end)
 }
 
+/// A drop of more than this many points between consecutive samples can
+/// only be a reset: within a window the meters only rise.
+pub const RESET_DROP: f64 = 5.0;
+
+/// The 5-hour window's state at some moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiveHourState {
+    /// A known window, `resets_at - 5h` to `resets_at`, not yet over.
+    Active,
+    /// No reset reported but usage above 0, an unexpected API shape: a
+    /// trailing 5 hours ending now, from the last reset on.
+    Trailing,
+    /// No active window. After a 5-hour window ends the API reports 0%
+    /// with no reset until the next message starts one. Also a known
+    /// window whose reset has passed since the poll (it rolled over),
+    /// until the next poll says more.
+    Idle,
+}
+
+/// The 5-hour window's state at `now` from its reported reset and
+/// utilization (see [`FiveHourState`]).
+pub fn five_hour_state(
+    resets_at: Option<DateTime<Utc>>,
+    pct: Option<f64>,
+    now: DateTime<Utc>,
+) -> FiveHourState {
+    match resets_at {
+        Some(r) if now < r => FiveHourState::Active,
+        Some(_) => FiveHourState::Idle,
+        None if pct.is_some_and(|p| p > 0.0) => FiveHourState::Trailing,
+        None => FiveHourState::Idle,
+    }
+}
+
+/// The 5-hour figures to show at `now`: the [`five_hour_state`], and the
+/// utilization and reset time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FiveHourNow {
+    pub state: FiveHourState,
+    pub pct: Option<f64>,
+    /// Only for an [`FiveHourState::Active`] window.
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+/// [`FiveHourNow`] for a poll reporting `resets_at` and `pct`, at `now`. A
+/// window that rolled over since the poll reads 0% with no reset: it is
+/// over, and the next one starts from 0.
+pub fn five_hour_now(
+    resets_at: Option<DateTime<Utc>>,
+    pct: Option<f64>,
+    now: DateTime<Utc>,
+) -> FiveHourNow {
+    let state = five_hour_state(resets_at, pct, now);
+    let rolled_over = resets_at.is_some() && state == FiveHourState::Idle;
+    FiveHourNow {
+        state,
+        pct: if rolled_over { Some(0.0) } else { pct },
+        resets_at: resets_at.filter(|_| state == FiveHourState::Active),
+    }
+}
+
+/// `samples` (oldest first) from the most recent 5-hour reset on: from the
+/// sample after a drop of more than [`RESET_DROP`] points, or a drop to 0
+/// from anything higher; all of them when there is none. Samples without
+/// a 5-hour value are skipped when comparing.
+pub fn since_last_reset(samples: &[WindowSample]) -> &[WindowSample] {
+    let mut start = 0;
+    let mut prev: Option<f64> = None;
+    for (i, s) in samples.iter().enumerate() {
+        let Some(v) = s.five_hour else { continue };
+        if prev.is_some_and(|p| p - v > RESET_DROP || (v <= 0.0 && p > 0.0)) {
+            start = i;
+        }
+        prev = Some(v);
+    }
+    &samples[start..]
+}
+
 /// A week of samples (oldest first) thinned to a bounded size: one sample
 /// per [`WEEK_THIN_BUCKET_MINUTES`] bucket, at the bucket's last time with
 /// each meter's last value in the bucket (a later row missing a meter
@@ -448,6 +526,117 @@ mod tests {
             s(10, Some(12.0), Some(9.0)), // drop below baseline -> 0
         ];
         assert_eq!(fable_layer(&samples), [Some(0.0), Some(12.0), Some(0.0)]);
+    }
+
+    // --- the 5-hour window's state --------------------------------------------
+
+    #[test]
+    fn five_hour_state_idle_trailing_active() {
+        let now = at(60);
+        let reset = at(120);
+        assert_eq!(
+            five_hour_state(Some(reset), Some(30.0), now),
+            FiveHourState::Active
+        );
+        assert_eq!(
+            five_hour_state(Some(reset), Some(0.0), now),
+            FiveHourState::Active,
+            "a known window is active even at 0%"
+        );
+        assert_eq!(five_hour_state(None, Some(0.0), now), FiveHourState::Idle);
+        assert_eq!(five_hour_state(None, None, now), FiveHourState::Idle);
+        assert_eq!(
+            five_hour_state(None, Some(12.0), now),
+            FiveHourState::Trailing
+        );
+        // The reset passed since the poll: over.
+        assert_eq!(
+            five_hour_state(Some(reset), Some(80.0), reset),
+            FiveHourState::Idle
+        );
+        assert_eq!(
+            five_hour_state(Some(reset), Some(80.0), at(121)),
+            FiveHourState::Idle
+        );
+    }
+
+    #[test]
+    fn five_hour_now_drops_a_passed_reset_and_its_usage() {
+        let reset = at(120);
+        let live = five_hour_now(Some(reset), Some(40.0), at(60));
+        assert_eq!(
+            live,
+            FiveHourNow {
+                state: FiveHourState::Active,
+                pct: Some(40.0),
+                resets_at: Some(reset),
+            }
+        );
+        let rolled = five_hour_now(Some(reset), Some(40.0), at(125));
+        assert_eq!(
+            rolled,
+            FiveHourNow {
+                state: FiveHourState::Idle,
+                pct: Some(0.0),
+                resets_at: None,
+            }
+        );
+        let idle = five_hour_now(None, Some(0.0), at(60));
+        assert_eq!((idle.state, idle.pct), (FiveHourState::Idle, Some(0.0)));
+        let unknown = five_hour_now(None, None, at(60));
+        assert_eq!(unknown.pct, None, "nothing reported stays unknown");
+        let trailing = five_hour_now(None, Some(7.0), at(60));
+        assert_eq!(
+            (trailing.state, trailing.pct, trailing.resets_at),
+            (FiveHourState::Trailing, Some(7.0), None)
+        );
+    }
+
+    #[test]
+    fn since_last_reset_cuts_at_a_big_drop() {
+        let samples = [
+            s(0, Some(40.0), None),
+            s(5, Some(80.0), None),
+            s(10, Some(3.0), None),
+            s(15, Some(6.0), None),
+        ];
+        assert_eq!(since_last_reset(&samples), &samples[2..]);
+    }
+
+    #[test]
+    fn since_last_reset_cuts_at_a_drop_to_zero() {
+        let samples = [
+            s(0, Some(2.0), None),
+            s(5, Some(4.0), None),
+            s(10, Some(0.0), None),
+            s(15, Some(0.0), None),
+        ];
+        assert_eq!(since_last_reset(&samples), &samples[2..]);
+    }
+
+    #[test]
+    fn since_last_reset_takes_the_last_and_skips_gaps() {
+        let samples = [
+            s(0, Some(90.0), None),
+            s(5, Some(1.0), None),
+            s(10, Some(50.0), None),
+            s(15, None, None),
+            s(20, Some(2.0), None),
+            s(25, Some(4.0), None),
+        ];
+        assert_eq!(since_last_reset(&samples), &samples[4..]);
+    }
+
+    #[test]
+    fn since_last_reset_keeps_a_rising_window_and_small_dips() {
+        let samples = [
+            s(0, Some(0.0), None),
+            s(5, Some(10.0), None),
+            s(10, Some(8.0), None),
+            s(15, Some(12.0), None),
+        ];
+        assert_eq!(since_last_reset(&samples), &samples[..]);
+        assert!(since_last_reset(&[]).is_empty());
     }
 
     #[test]

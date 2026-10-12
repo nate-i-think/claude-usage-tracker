@@ -25,8 +25,9 @@ pub use names::{
 };
 
 pub use timeline::{
-    fable_layer, pace, projection, seven_day_pace, thin_week, week_window, Projection, WeekSample,
-    WindowSample, WEEK_KEEP_ALL_MINUTES, WEEK_THIN_BUCKET_MINUTES,
+    fable_layer, five_hour_now, five_hour_state, pace, projection, seven_day_pace,
+    since_last_reset, thin_week, week_window, FiveHourNow, FiveHourState, Projection, WeekSample,
+    WindowSample, RESET_DROP, WEEK_KEEP_ALL_MINUTES, WEEK_THIN_BUCKET_MINUTES,
 };
 pub use weekly::{
     fmt_days, fmt_rate_per_day, fmt_span, rate_basis_text, weekly_outlook, weekly_rate, RateBasis,

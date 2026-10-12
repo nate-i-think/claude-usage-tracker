@@ -45,8 +45,10 @@ pub struct Dashboard {
     /// End of the current five-hour window: its `resets_at`, else
     /// `window_start + 5h`.
     pub window_end: DateTime<Utc>,
-    /// Every history sample in `[window_start, window_end)`, oldest first,
-    /// including this poll's.
+    /// Every history sample in `[window_start, window_end)` from the last
+    /// reset on ([`analytics::since_last_reset`]), oldest first, including
+    /// this poll's. Empty while no window is active
+    /// ([`analytics::FiveHourState::Idle`]).
     pub window_samples: Vec<WindowSample>,
     /// The current weekly window (see [`analytics::week_window`]).
     pub week_start: DateTime<Utc>,
@@ -57,6 +59,19 @@ pub struct Dashboard {
     /// Saving this poll to history.jsonl failed; the data above is still
     /// fresh. Shown as a warning.
     pub persist_error: Option<String>,
+}
+
+impl Dashboard {
+    /// The 5-hour window's state and figures at `now` (see
+    /// [`analytics::five_hour_now`]): a window that rolled over since this
+    /// poll is idle until the next one.
+    pub fn five_hour_now(&self, now: DateTime<Utc>) -> analytics::FiveHourNow {
+        analytics::five_hour_now(
+            self.snapshot.five_hour_resets_at(),
+            self.snapshot.five_hour_pct(),
+            now,
+        )
+    }
 }
 
 /// Control messages into the poller thread.
@@ -233,7 +248,11 @@ fn build_dashboard(
     let (week_start, week_end) = analytics::week_window(snapshot.seven_day_resets_at(), now);
     // One history read feeds the rollups, the window samples and the week.
     let rollups = storage::rollups(paths, (ws, window_end), (week_start, week_end), now);
-    let window_samples = with_current_sample(rollups.window_samples, &snapshot, ws, window_end);
+    let window_samples = five_hour_samples(
+        with_current_sample(rollups.window_samples, &snapshot, ws, window_end),
+        &snapshot,
+        now,
+    );
     let week_samples = with_current_week_sample(rollups.week_samples, &snapshot);
     Dashboard {
         history: history.five_hour(),
@@ -257,6 +276,21 @@ fn build_dashboard(
         week_samples,
         persist_error: None,
         snapshot,
+    }
+}
+
+/// The 5-hour chart's samples: none while no window is active (the chart
+/// starts over, empty, like the old TUI after a reset), else those from
+/// the last reset on, so the previous window's climb never shows (a
+/// trailing view, or `resets_at` jitter at a window's start edge).
+fn five_hour_samples(
+    samples: Vec<WindowSample>,
+    snap: &Snapshot,
+    now: DateTime<Utc>,
+) -> Vec<WindowSample> {
+    match analytics::five_hour_state(snap.five_hour_resets_at(), snap.five_hour_pct(), now) {
+        analytics::FiveHourState::Idle => Vec::new(),
+        _ => analytics::since_last_reset(&samples).to_vec(),
     }
 }
 
@@ -890,6 +924,106 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A history file with the previous window's climb (to 80% at 2:19p)
+    /// and a 0% sample after its 2:20p reset; returns the fake paths.
+    fn history_across_a_reset(
+        tmp: &tempfile::TempDir,
+        reset: DateTime<Utc>,
+    ) -> (Paths, SessionDirs) {
+        let paths = Paths::with_data_dir(tmp.path().join("data"));
+        let dirs = SessionDirs {
+            claude_code: tmp.path().join("cc"),
+            cowork: tmp.path().join("cw"),
+        };
+        let ts = |m: i64| (reset + ChronoDuration::minutes(m)).timestamp() as f64;
+        fs::create_dir_all(paths.data_dir()).unwrap();
+        let lines: Vec<String> = [(-120, 30.0), (-60, 60.0), (-1, 80.0), (10, 0.0)]
+            .iter()
+            .map(|(m, v)| format!(r#"{{"ts": {}, "five_hour": {v}}}"#, ts(*m)))
+            .collect();
+        fs::write(
+            paths.history_file(),
+            lines.join(
+                "
+",
+            ) + "
+",
+        )
+        .unwrap();
+        (paths, dirs)
+    }
+
+    fn five_hour_only(at: DateTime<Utc>, pct: f64, resets_at: Option<DateTime<Utc>>) -> Snapshot {
+        Snapshot {
+            fetched_at: at,
+            windows: vec![UsageWindow {
+                label: "5-hour".into(),
+                utilization: Some(pct),
+                resets_at,
+            }],
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn idle_window_charts_nothing_from_the_old_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reset = Utc::now() - ChronoDuration::minutes(33);
+        let (paths, dirs) = history_across_a_reset(&tmp, reset);
+        let now = Utc::now();
+        let d = build_dashboard(
+            five_hour_only(now, 0.0, None),
+            &BurnHistory::default(),
+            &paths,
+            &dirs,
+            now,
+        );
+        assert_eq!(d.five_hour_now(now).state, analytics::FiveHourState::Idle);
+        assert!(d.window_samples.is_empty(), "{:?}", d.window_samples);
+    }
+
+    #[test]
+    fn trailing_window_keeps_only_samples_after_the_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reset = Utc::now() - ChronoDuration::minutes(33);
+        let (paths, dirs) = history_across_a_reset(&tmp, reset);
+        let now = Utc::now();
+        let d = build_dashboard(
+            five_hour_only(now - ChronoDuration::seconds(1), 4.0, None),
+            &BurnHistory::default(),
+            &paths,
+            &dirs,
+            now,
+        );
+        assert_eq!(
+            d.five_hour_now(now).state,
+            analytics::FiveHourState::Trailing
+        );
+        let values: Vec<_> = d.window_samples.iter().map(|s| s.five_hour).collect();
+        assert_eq!(values, [Some(0.0), Some(4.0)]);
+    }
+
+    #[test]
+    fn new_window_starts_empty_without_the_previous_ones_samples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reset = Utc::now() - ChronoDuration::minutes(33);
+        let (paths, dirs) = history_across_a_reset(&tmp, reset);
+        let now = Utc::now();
+        // A new window started 3 minutes ago, back to back with the old
+        // one's end even with its reset jittered 2 minutes early.
+        let new_reset = reset + ChronoDuration::hours(5) - ChronoDuration::minutes(2);
+        let d = build_dashboard(
+            five_hour_only(now, 2.0, Some(new_reset)),
+            &BurnHistory::default(),
+            &paths,
+            &dirs,
+            now,
+        );
+        assert_eq!(d.window_start, new_reset - ChronoDuration::hours(5));
+        let values: Vec<_> = d.window_samples.iter().map(|s| s.five_hour).collect();
+        assert_eq!(values, [Some(0.0), Some(2.0)], "no 80% from before 2:20p");
     }
 
     #[test]
