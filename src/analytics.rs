@@ -26,8 +26,9 @@ pub use names::{
 
 pub use timeline::{fable_layer, pace, projection, seven_day_pace, Projection, WindowSample};
 pub use weekly::{
-    fmt_days, fmt_rate_per_day, weekly_outlook, weekly_rate, WeeklyOutlook, WEEKLY_MIN_SPAN_HOURS,
-    WEEKLY_RATE_HOURS, WEEKLY_STEADY_PER_DAY,
+    fmt_days, fmt_rate_per_day, rate_basis_text, weekly_outlook, weekly_rate, RateBasis,
+    WeeklyOutlook, WeeklyRate, WEEKLY_FLOOR_HOURS, WEEKLY_MIN_SPAN_HOURS, WEEKLY_RATE_HOURS,
+    WEEKLY_STEADY_PER_DAY,
 };
 
 /// Burn rate is measured over the most recent this-many minutes of history.

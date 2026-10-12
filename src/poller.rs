@@ -39,9 +39,12 @@ pub struct Dashboard {
     pub fable_history: Vec<Sample>,
     pub daily_history: Vec<(NaiveDate, Option<f64>)>,
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
-    /// 7-day-all samples of the last [`crate::analytics::WEEKLY_RATE_HOURS`],
-    /// oldest first, including this poll's, for the weekly projection.
+    /// 7-day-all samples of the last [`crate::analytics::WEEKLY_RATE_HOURS`]
+    /// after their anchor, oldest first, including this poll's, for the
+    /// weekly projection.
     pub seven_day_recent: Vec<Sample>,
+    /// The same for Fable's 7-day limit.
+    pub fable_recent: Vec<Sample>,
     pub burners: Vec<InstanceUsage>,
     pub window_start: DateTime<Utc>,
     /// End of the current five-hour window: its `resets_at`, else
@@ -234,7 +237,16 @@ fn build_dashboard(
         fable_history: history.fable(),
         daily_history: rollups.daily,
         fable_daily: rollups.fable_daily,
-        seven_day_recent: with_current_weekly(rollups.seven_day_recent, &snapshot),
+        seven_day_recent: with_current(
+            rollups.seven_day_recent,
+            snapshot.fetched_at,
+            snapshot.seven_day_pct(),
+        ),
+        fable_recent: with_current(
+            rollups.fable_recent,
+            snapshot.fetched_at,
+            snapshot.fable_pct(),
+        ),
         burners: storage::attribute_recent(&dirs.claude_code, &dirs.cowork, ws),
         window_start: ws,
         window_end,
@@ -244,12 +256,11 @@ fn build_dashboard(
     }
 }
 
-/// `samples` with this poll's 7-day-all value at its exact fetch time in
-/// place of its persisted copy (if any), kept sorted.
-fn with_current_weekly(mut samples: Vec<Sample>, snap: &Snapshot) -> Vec<Sample> {
-    let t = snap.fetched_at;
+/// `samples` with this poll's value at its exact fetch time `t` in place
+/// of its persisted copy (if any), kept sorted.
+fn with_current(mut samples: Vec<Sample>, t: DateTime<Utc>, value: Option<f64>) -> Vec<Sample> {
     samples.retain(|(s, _)| (*s - t).abs() >= ChronoDuration::milliseconds(1));
-    samples.push((t, snap.seven_day_pct()));
+    samples.push((t, value));
     samples.sort_by_key(|(s, _)| *s);
     samples
 }
@@ -783,6 +794,7 @@ mod tests {
             d.seven_day_recent,
             [(d.snapshot.fetched_at, d.snapshot.seven_day_pct())]
         );
+        assert_eq!(d.fable_recent, [(d.snapshot.fetched_at, None)]);
         assert!(paths.history_file().exists());
         assert!(paths.latest_file().exists());
         assert_eq!(
