@@ -121,6 +121,9 @@ mod tests {
             window_start: now() - Duration::hours(5),
             window_end: now(),
             window_samples: Vec::new(),
+            week_start: now() - Duration::days(7),
+            week_end: now(),
+            week_samples: Vec::new(),
             persist_error: None,
         }
     }

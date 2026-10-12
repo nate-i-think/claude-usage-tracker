@@ -24,7 +24,10 @@ pub use names::{
     project_display_name, PROJECT_NAME_CHARS,
 };
 
-pub use timeline::{fable_layer, pace, projection, seven_day_pace, Projection, WindowSample};
+pub use timeline::{
+    fable_layer, pace, projection, seven_day_pace, thin_week, week_window, Projection, WeekSample,
+    WindowSample, WEEK_KEEP_ALL_MINUTES, WEEK_THIN_BUCKET_MINUTES,
+};
 pub use weekly::{
     fmt_days, fmt_rate_per_day, fmt_span, rate_basis_text, weekly_outlook, weekly_rate, RateBasis,
     WeeklyOutlook, WeeklyRate, ANCHOR_GAP_MINUTES, WEEKLY_FLOOR_HOURS, WEEKLY_MIN_SPAN_HOURS,

@@ -126,6 +126,9 @@ mod tests {
             window_start: resets_at - Duration::hours(5),
             window_end: resets_at,
             window_samples: Vec::new(),
+            week_start: resets_at - Duration::days(7),
+            week_end: resets_at,
+            week_samples: Vec::new(),
             persist_error: None,
         }
     }
