@@ -105,14 +105,16 @@ pub fn register(paths: &Paths) -> AppId {
 
 /// Start the notifier thread; each [`AlertCopy`] sent becomes one toast.
 /// `on_click` runs (on a system thread) when a toast is clicked while the
-/// app runs.
+/// app runs. Each toast is shown under [`crate::crash::catch_recoverable`],
+/// so a panic in WinRT is logged, keeps the thread alive and shows no
+/// "crashed" box.
 pub fn spawn_notifier(app: AppId, on_click: OnClick) -> Sender<AlertCopy> {
     let (tx, rx) = channel::<AlertCopy>();
     let spawned = std::thread::Builder::new()
         .name("notifier".to_owned())
         .spawn(move || {
             for copy in rx {
-                imp::show(app, &copy, on_click.clone());
+                let _ = crate::crash::catch_recoverable(|| imp::show(app, &copy, on_click.clone()));
             }
         });
     // No thread: sends fail quietly, nothing is shown.
@@ -215,8 +217,10 @@ mod imp {
     use super::{AlertCopy, AppId, OnClick};
     use crate::paths::Paths;
 
+    /// Nothing to register outside Windows (and nothing to log on every
+    /// launch): toasts are never shown there.
     pub fn register(_paths: &Paths) -> Result<(), String> {
-        Err("toasts are Windows-only".to_owned())
+        Ok(())
     }
 
     pub fn show(_app: AppId, _copy: &AlertCopy, _on_click: OnClick) {}
