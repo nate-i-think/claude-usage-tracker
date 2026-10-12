@@ -84,7 +84,7 @@ pub enum WeeklyOutlook {
 
 impl WeeklyOutlook {
     /// Color of the outlook: green when steady or safe, red for a cap
-    /// within [`WEEKLY_RED_HOURS`], orange for a later one, dim without a
+    /// within a day, orange for a later one, dim without a
     /// rate. The rate alone is colored by the %/day (green at a pace that
     /// would fill a week in more than a week, i.e. under 100/7 %/day).
     pub fn level(&self) -> Level {

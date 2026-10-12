@@ -8,19 +8,20 @@ Written in Rust with [egui](https://github.com/emilk/egui). It ships two binarie
 
 ## What it shows
 
-The window opens at 420x460 (minimum 360x320) in a warm dark theme. From top to bottom:
+The window opens at 420x640 (minimum 360x320) in a warm dark theme. From top to bottom:
 
 - **Stat chips**: one chip each for the 5-hour window, the 7-day window (all models), and Fable when the API reports it. Each shows the utilization (rounded down, so 99.6% never reads as the cap) in its state color: green below 50%, yellow from 50%, orange from 75%, red from 90%. Next to it is the **pace**: utilization minus the share of the window that has elapsed, so `▲+6` means you are 6 points ahead of an even burn that would land exactly at 100% at the reset, and `▼-4` means 4 points behind. The delta is muted unless it is 10 points or more either way (ahead in amber, behind in green). Hover a chip for the reset time and the pace in words. To the right are three buttons: refresh now (⟳, rests 5 s after a click), pill mode (◱), and Settings (⚙).
-- **Hero timeline**: the current 5-hour window, from its start to the reset, on a 0–100% scale.
+- **5-hour window** (the hero timeline, titled with the window's span, "6:10p – 11:10p"): the current 5-hour window, from its start to the reset, on a 0–100% scale.
   - The 5-hour utilization as a filled area drawn from the saved samples, in the current state color.
   - The Fable share as a clay layer at the bottom of the area.
   - A "now" marker, and a dashed projection from now at the 15-minute burn rate. If the projection reaches 100% before the reset, a red ✕ marks the cap with its time ("cap 4:10p"); otherwise the line ends at the reset with a green "safe". A dashed line marks the 100% cap.
   - Stretches with no samples (the app was closed, the laptop slept) are bridged with a faint dotted line instead of leaving a hole. A reset still breaks the line.
   - Hover for a crosshair with the time, the utilization and the Fable share; past "now" it shows the projected value.
-- **Footer strip**:
-  - **7d**: a sparkline of the last 7 days: one bar per day for that day's highest 7-day utilization, on a fixed 0–100% scale, with the Fable share at the bottom of each bar and today outlined. Hover a bar for the day and its value.
-  - **Burn**: the 15-minute rate for all usage ("+0.21%/min") and either "cap in 1h 48m" or "safe until reset". Hover for the full burn line. The rate is available right after a restart, because it is seeded from the saved history.
-  - **Extra**: credits used against your monthly limit as a small gauge ("$23 / $35"), when extra usage is set up. Hover for the details, including why extra usage is disabled if it is.
+  - **5h burn** under the chart: the 15-minute rate for all usage ("+0.21%/min") and either "cap in 1h 48m" or "safe until reset". Hover for the full burn line. The rate is available right after a restart, because it is seeded from the saved history.
+- **Last 7 days**: one bar per local day (today at the right, labelled "today" and outlined) for that day's highest 7-day utilization, on the same 0–100% axis as the timeline, with the Fable share at the bottom of each bar. A day without samples is a faint dashed stub, not a zero bar. The title's subtitle is the week's peak. Hover a bar for the day, its value and the Fable share ("Tue Oct 7 · 63% (Fable 30%)").
+  - **7d pace** under the chart: the 7-day rate per day, measured over the last 24 hours of samples (only since the weekly reset, if that is later; at least 2 hours of samples are needed), projected to the weekly reset. If that crosses 100% first it warns "cap in 2d 5h (Tue 3p)" in orange (red under a day); otherwise it reads "≈78% at reset · safe until Thu 9a" in green. With no known reset it shows the rate alone.
+- When the window is wide (a content column of 640 pt or more; the column grows to 1000 pt), the two charts sit side by side, the timeline taking about 62%. Narrower, they stack.
+- **Extra**: credits used against your monthly limit as a small gauge ("$23 / $35"), when extra usage is set up. Hover for the details, including why extra usage is disabled if it is.
 - **Details** (click to expand; it stays open or closed across restarts):
   - The other usage windows (per-model caps beyond Fable). Windows at 0% are hidden unless "Show all buckets" is on.
   - The ALL and FABLE burn lines in full, and the projected-use advice ("safe to spin up another agent").
@@ -262,7 +263,7 @@ This project used to be a Python terminal dashboard (`claude_usage_tui.py`). The
 - **The TLS-impersonation profile sweep in debug.** The Python version used `curl_cffi` to mimic browser TLS fingerprints, and `--debug` retried with several profiles. The Rust app uses plain rustls with Firefox-like headers, which Cloudflare currently accepts, and `debug` sends one request.
 - **`--no-fullscreen`**, which only made sense for the terminal UI.
 
-Other differences: `--once` and `--debug` became the `once` and `debug` subcommands of `claude-usage-cli`; the poll interval, plan label, cookie file, and client SHA are set in the GUI's Settings instead of on the command line; and the GUI replaces the terminal's bar charts with the timeline, chips and sparkline described in [What it shows](#what-it-shows).
+Other differences: `--once` and `--debug` became the `once` and `debug` subcommands of `claude-usage-cli`; the poll interval, plan label, cookie file, and client SHA are set in the GUI's Settings instead of on the command line; and the GUI replaces the terminal's bar charts with the timeline, chips and 7-day chart described in [What it shows](#what-it-shows).
 
 ### Migrating history from the Python version
 
