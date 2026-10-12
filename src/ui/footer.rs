@@ -1,46 +1,28 @@
-//! The footer strip under the charts: the 5-hour burn summary and the
-//! extra-usage mini gauge, packed into one row that wraps when narrow.
+//! The 5-hour burn row (shown under the timeline, labelled "5h burn") and
+//! the footer strip under the charts: the extra-usage mini gauge.
 
 use chrono::{DateTime, Utc};
-use eframe::egui::{vec2, Align, Id, Layout, Rect, Sense, Ui};
+use eframe::egui::{vec2, Id, Rect, Sense, Ui};
 
 use crate::analytics::{self, BurnLine, Eta, Level};
 use crate::model::ExtraUsage;
 use crate::poller::Dashboard;
 
-use super::layout::{self, GAP};
 use super::theme::Palette;
-use super::{digits, layout_job, motion, rows, Run, Tone};
+use super::{digits, motion, rows, Run, Tone};
 
 /// Width of the extra-usage gauge's bar.
 const GAUGE_W: f32 = 48.0;
 /// Thickness of the extra-usage gauge's bar.
 const GAUGE_H: f32 = 4.0;
-/// Space between a footer item's caption and its content.
+/// Space between the gauge's caption and its content.
 const CAPTION_GAP: f32 = 6.0;
-
-/// The strip's items, in order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FooterItem {
-    Burn,
-    Extra,
-}
-
-/// Which items show: the burn summary always, the extra gauge when
-/// analytics says the block is visible.
-pub fn footer_items(extra_visible: bool) -> Vec<FooterItem> {
-    [
-        Some(FooterItem::Burn),
-        extra_visible.then_some(FooterItem::Extra),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
+/// The burn row's label, so the 5-hour figure never reads as a 7-day one.
+pub const BURN_LABEL: &str = "5h burn  ";
 
 /// The 5-hour burn in brief: "+0.21%/min · cap in 1h 48m" (rate and ETA in
 /// their level colors) when the cap comes before the reset, "+0.34%/min ·
-/// safe till reset" when the reset comes first, "steady", or "need 2
+/// safe until reset" when the reset comes first, "steady", or "need 2
 /// samples". With no known reset (`reset_known` false) the cap time can't
 /// be weighed against one, so only the rate shows, matching the timeline,
 /// which then claims neither "safe" nor a cap.
@@ -60,7 +42,7 @@ pub fn burn_summary(line: Option<&BurnLine>, reset_known: bool) -> Vec<Run> {
         } => vec![
             Run::new(analytics::fmt_rate(line.rate), Tone::Level(line.rate_level)),
             Run::new(" · ", Tone::Dim),
-            Run::new("safe till reset", Tone::Level(Level::Green)),
+            Run::new("safe until reset", Tone::Level(Level::Green)),
         ],
         Eta::Minutes { minutes, level, .. } => vec![
             Run::new(analytics::fmt_rate(line.rate), Tone::Level(line.rate_level)),
@@ -93,98 +75,41 @@ pub fn extra_gauge(e: &ExtraUsage) -> ExtraGauge {
     }
 }
 
-/// The footer strip on a card.
-pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
-    let palette = Palette::for_visuals(ui.visuals());
+/// The 5-hour burn row under the timeline: a muted "5h burn" label, then
+/// [`burn_summary`] (wrapping when narrow), with the full burn line on
+/// hover. Labelled so it never reads as a 7-day figure.
+pub fn show_burn_row(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     let snap = &d.snapshot;
-    let extra = analytics::visible_extra(snap);
-    let items = footer_items(extra.is_some());
-    let burn = analytics::burn_line(
-        &d.history,
-        snap.five_hour_pct(),
-        snap.five_hour_resets_at(),
-        now,
-    );
-    let mut burn_job = layout_job(
-        &burn_summary(burn.as_ref(), snap.five_hour_resets_at().is_some()),
-        ui,
-    );
-    let small = eframe::egui::TextStyle::Small.resolve(ui.style());
+    let resets = snap.five_hour_resets_at();
+    let burn = analytics::burn_line(&d.history, snap.five_hour_pct(), resets, now);
+    let mut runs = vec![Run::new(BURN_LABEL, Tone::Dim)];
+    runs.extend(burn_summary(burn.as_ref(), resets.is_some()));
+    super::show_runs(ui, &runs).on_hover_text(burn_hover(burn.as_ref()));
+}
+
+/// The footer strip on a card: the extra-usage gauge, when analytics says
+/// the block is visible; nothing otherwise.
+pub fn show_footer(ui: &mut Ui, d: &Dashboard) {
+    let Some(extra) = analytics::visible_extra(&d.snapshot) else {
+        return;
+    };
+    let palette = Palette::for_visuals(ui.visuals());
+    let g = extra_gauge(extra);
     let painter = ui.painter().clone();
-    let caption =
-        |text: &str| painter.layout_no_wrap(text.to_owned(), small.clone(), palette.text_muted);
-    let gauge = extra.map(extra_gauge);
-
-    // Measure every item first so the strip can pack them.
-    let extra_caption = caption("extra");
-    let gauge_text = gauge.as_ref().map(|g| {
-        let body = eframe::egui::TextStyle::Body.resolve(ui.style());
-        digits::number_galley(&painter, &g.text, body, palette.level(g.level))
-    });
-
+    let small = eframe::egui::TextStyle::Small.resolve(ui.style());
+    let caption = painter.layout_no_wrap("extra".to_owned(), small, palette.text_muted);
+    let body = eframe::egui::TextStyle::Body.resolve(ui.style());
+    let (galley, w) = digits::number_galley(&painter, &g.text, body, palette.level(g.level));
+    let hover = super::plain_text(&rows::extra_runs(extra));
     super::theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let available = ui.available_width();
-        // The burn summary wraps rather than run past a narrow row.
-        burn_job.wrap.max_width = available;
-        let burn_galley = painter.layout_job(burn_job);
-        let row_h = burn_galley.size().y;
-        let widths: Vec<f32> = items
-            .iter()
-            .map(|item| match item {
-                FooterItem::Burn => burn_galley.size().x,
-                FooterItem::Extra => {
-                    let text_w = gauge_text.as_ref().map_or(0.0, |(_, w)| *w);
-                    extra_caption.size().x + CAPTION_GAP + text_w + CAPTION_GAP + GAUGE_W
-                }
-            })
-            .collect();
-        let gap = 1.5 * GAP;
-        let rows = layout::pack_rows(&widths, available, gap);
-        let mut it = items.iter().zip(&widths);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing = vec2(gap, GAP);
-            for count in rows {
-                ui.horizontal(|ui| {
-                    ui.set_min_height(row_h);
-                    for (item, &w) in it.by_ref().take(count) {
-                        let size = vec2(w, row_h);
-                        ui.allocate_ui_with_layout(
-                            size,
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = CAPTION_GAP;
-                                match item {
-                                    FooterItem::Burn => {
-                                        centered_galley(ui, burn_galley.clone(), palette.text)
-                                            .on_hover_text(burn_hover(burn.as_ref()));
-                                    }
-                                    FooterItem::Extra => {
-                                        if let (Some(g), Some((galley, w)), Some(e)) =
-                                            (&gauge, gauge_text.clone(), extra)
-                                        {
-                                            let hover = super::plain_text(&rows::extra_runs(e));
-                                            centered_galley(
-                                                ui,
-                                                extra_caption.clone(),
-                                                palette.text_muted,
-                                            )
-                                            .on_hover_text(&hover);
-                                            let (r, resp) = ui.allocate_exact_size(
-                                                vec2(w, galley.size().y),
-                                                Sense::hover(),
-                                            );
-                                            ui.painter().galley(r.min, galley, palette.text);
-                                            resp.on_hover_text(&hover);
-                                            gauge_bar(ui, g, palette).on_hover_text(&hover);
-                                        }
-                                    }
-                                }
-                            },
-                        );
-                    }
-                });
-            }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = CAPTION_GAP;
+            centered_galley(ui, caption, palette.text_muted).on_hover_text(&hover);
+            let (r, resp) = ui.allocate_exact_size(vec2(w, galley.size().y), Sense::hover());
+            ui.painter().galley(r.min, galley, palette.text);
+            resp.on_hover_text(&hover);
+            gauge_bar(ui, &g, palette).on_hover_text(&hover);
         });
     });
 }
@@ -236,13 +161,6 @@ mod tests {
     }
 
     #[test]
-    fn items_shown() {
-        use FooterItem::*;
-        assert_eq!(footer_items(true), vec![Burn, Extra]);
-        assert_eq!(footer_items(false), vec![Burn]);
-    }
-
-    #[test]
     fn burn_summary_cap_before_reset() {
         let l = line(
             0.214,
@@ -271,8 +189,8 @@ mod tests {
             },
         );
         let runs = burn_summary(Some(&l), true);
-        assert_eq!(plain_text(&runs), "+0.34%/min · safe till reset");
-        assert!(runs.contains(&Run::new("safe till reset", Tone::Level(Level::Green))));
+        assert_eq!(plain_text(&runs), "+0.34%/min · safe until reset");
+        assert!(runs.contains(&Run::new("safe until reset", Tone::Level(Level::Green))));
         assert!(!plain_text(&runs).contains("cap"));
     }
 

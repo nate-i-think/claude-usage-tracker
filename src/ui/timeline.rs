@@ -619,7 +619,8 @@ pub fn dash_end(from: Pos2, end: Pos2, label: Rect) -> Pos2 {
 }
 
 /// The timeline's card: the title with the window's span as its subtitle
-/// (see [`window_span_in`]), then the timeline, `height` tall.
+/// (see [`window_span_in`]), the timeline, `height` tall, and the "5h burn"
+/// row under it.
 pub fn show_timeline_card(
     ui: &mut Ui,
     d: &Dashboard,
@@ -633,6 +634,7 @@ pub fn show_timeline_card(
         ui.set_width(ui.available_width());
         super::theme::chart_title(ui, palette, TITLE, span.as_deref());
         show_timeline(ui, d, now, palette, height);
+        super::footer::show_burn_row(ui, d, now);
     });
 }
 

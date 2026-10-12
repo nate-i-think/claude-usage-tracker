@@ -516,7 +516,7 @@ fn icon_button(ui: &mut Ui, selected: bool, enabled: bool, icon: &str) -> egui::
 fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
     let now = Utc::now();
     charts(ui, d, now);
-    footer::show_footer(ui, d, now);
+    footer::show_footer(ui, d);
     details::show_details(ui, d, settings, now);
 }
 
@@ -531,10 +531,10 @@ fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     let timeline_card = |ui: &mut Ui| timeline::show_timeline_card(ui, d, now, palette, height);
     let Some((left, right)) = layout::chart_widths(ui.available_width()) else {
         timeline_card(ui);
-        week::show_week_card(ui, d, palette, week::STACKED_HEIGHT);
+        week::show_week_card(ui, d, now, palette, week::STACKED_HEIGHT);
         return;
     };
-    let week_card = |ui: &mut Ui| week::show_week_card(ui, d, palette, height);
+    let week_card = |ui: &mut Ui| week::show_week_card(ui, d, now, palette, height);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
         let column = egui::Layout::top_down(egui::Align::Min);
