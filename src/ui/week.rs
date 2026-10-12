@@ -4,7 +4,9 @@
 //! line up side by side). Each bar carries its orange Fable floor; today's
 //! slot gets a neutral outline and the "today" label; a day without samples
 //! is a faint dashed stub, never a zero bar. Hovering a slot reads
-//! "Tue Oct 7 · 63% (Fable 30%)" or "Tue Oct 7 · no data".
+//! "Tue Oct 7 · 63% (Fable share 30%)" or "Tue Oct 7 · no data". Under the
+//! chart, one row per weekly limit (7-day all, and Fable's own 7-day limit
+//! when reported) gives its projection to the weekly reset.
 //!
 //! The bar split (Fable floor vs the rest) is the old TUI chart's rule (see
 //! git history for `ui/charts.rs`). Geometry and text are pure functions
@@ -12,7 +14,7 @@
 
 use std::fmt::Display;
 
-use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, DurationRound, Local, NaiveDate, TimeZone, Timelike, Utc};
 use eframe::egui::{
     pos2, vec2, Align2, CornerRadius, Painter, Pos2, Rect, Response, Sense, Stroke, StrokeKind,
     TextStyle, Ui,
@@ -21,6 +23,7 @@ use eframe::egui::{
 use crate::analytics::{self, Level, WeeklyOutlook, CHART_HEIGHT, FABLE_TO_WEEKLY_ALL_RATIO};
 use crate::poller::Dashboard;
 
+use super::layout::CardSize;
 use super::theme::Palette;
 use super::{timeline, Run, Tone};
 
@@ -140,15 +143,16 @@ pub fn bar_shape(bar: &DayBar) -> BarShape {
     }
 }
 
-/// Hover text: "Tue Oct 7 · 63% (Fable 30%)", without the Fable part when
-/// Fable has no share, or "Tue Oct 7 · no data".
+/// Hover text: "Tue Oct 7 · 63% (Fable share 30%)", without the Fable part
+/// when Fable has no share, or "Tue Oct 7 · no data". The share is of the
+/// bar (the 7-day-all scale), not Fable's own %.
 pub fn day_tip(bar: &DayBar) -> String {
     let day = bar.date.format("%a %b %-d");
     let Some(pct) = bar.value.filter(|v| !v.is_nan()) else {
         return format!("{day} · no data");
     };
     match bar.split.filter(|s| s.fable > 0.0) {
-        Some(s) => format!("{day} · {pct:.0}% (Fable {:.0}%)", s.fable),
+        Some(s) => format!("{day} · {pct:.0}% (Fable share {:.0}%)", s.fable),
         None => format!("{day} · {pct:.0}%"),
     }
 }
@@ -174,18 +178,41 @@ pub fn subtitle(bars: &[DayBar]) -> String {
         )
 }
 
-/// The outlook row's label, so the weekly figure never reads as a 5-hour
-/// one.
-pub const OUTLOOK_LABEL: &str = "7d pace  ";
-/// The outlook row's tooltip: how the figure is made.
-pub const OUTLOOK_HOVER: &str = "7-day all: the rate over the last 24 h (since the \
-weekly reset, if later), projected to the weekly reset";
+/// A weekly limit with a projection row under the chart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Meter {
+    /// 7-day all.
+    All,
+    /// Fable's own 7-day limit.
+    Fable,
+}
 
-/// A weekday and compact time: "Tue 3p" on the hour, else "Thu 9:30a".
+impl Meter {
+    /// The row's label: "7d all" muted, "Fable" in the Fable clay (like the
+    /// Details "FABLE:" tag).
+    pub fn label(self) -> Run {
+        match self {
+            Meter::All => Run::new("7d all", Tone::Dim),
+            Meter::Fable => Run::new("Fable", Tone::Fable),
+        }
+    }
+
+    /// The meter's name in the row's tooltip.
+    fn name(self) -> &'static str {
+        match self {
+            Meter::All => "7-day all",
+            Meter::Fable => "Fable 7-day",
+        }
+    }
+}
+
+/// A weekday and compact time, rounded to the nearest minute: "Tue 3p" on
+/// the hour, else "Thu 9:30a".
 pub fn weekday_time_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
 where
     Tz::Offset: Display,
 {
+    let t = t.duration_round(Duration::minutes(1)).unwrap_or(t);
     let local = t.with_timezone(tz);
     let suffix = if local.hour() < 12 { 'a' } else { 'p' };
     let clock = if local.minute() == 0 {
@@ -196,21 +223,35 @@ where
     format!("{} {clock}{suffix}", local.format("%a"))
 }
 
-/// The weekly projection in brief, in its level colors: "+21%/day · cap
-/// in 2d 5h (Tue 3p)", "+6%/day · ≈78% at reset · safe until Thu 9a",
-/// "+0.2%/day · steady", the rate alone without a reset, or "need more
-/// history".
-pub fn outlook_runs<Tz: TimeZone>(o: &WeeklyOutlook, tz: &Tz) -> Vec<Run>
+/// A weekly projection in brief, in its level colors:
+/// - "+21%/day · cap in 2d 5h (Tue 3p)" (`compact`: without the time),
+/// - "+6%/day · ≈78% at reset · safe until Thu 9a" (`compact`: without the
+///   % at reset),
+/// - "at cap · resets Mon 11p", "+0.2%/day · steady", the rate alone
+///   without a reset, or "need more history".
+pub fn outlook_runs<Tz: TimeZone>(o: &WeeklyOutlook, tz: &Tz, compact: bool) -> Vec<Run>
 where
     Tz::Offset: Display,
 {
     let tone = Tone::Level(o.level());
-    let rate = |r: f64| Run::new(analytics::fmt_rate_per_day(r), tone);
-    match *o {
+    let sep = || Run::new(" · ", Tone::Dim);
+    let rate = |r: &analytics::WeeklyRate| Run::new(analytics::fmt_rate_per_day(r.per_day), tone);
+    match o {
         WeeklyOutlook::NeedHistory => vec![Run::new("need more history", Tone::Dim)],
+        WeeklyOutlook::AtCap { reset } => {
+            let mut runs = vec![Run::new("at cap", tone)];
+            if let Some(r) = reset {
+                runs.push(sep());
+                runs.push(Run::new(
+                    format!("resets {}", weekday_time_in(*r, tz)),
+                    tone,
+                ));
+            }
+            runs
+        }
         WeeklyOutlook::Steady { rate: r } => vec![
             rate(r),
-            Run::new(" · ", Tone::Dim),
+            sep(),
             Run::new("steady", Tone::Level(Level::Green)),
         ],
         WeeklyOutlook::RateOnly { rate: r } => vec![rate(r)],
@@ -219,24 +260,77 @@ where
             at,
             minutes,
             ..
-        } => vec![
-            rate(r),
-            Run::new(" · cap in ", Tone::Dim),
-            Run::new(analytics::fmt_days(minutes), tone),
-            Run::new(format!(" ({})", weekday_time_in(at, tz)), Tone::Dim),
-        ],
+        } => {
+            let mut runs = vec![
+                rate(r),
+                Run::new(" · cap in ", Tone::Dim),
+                Run::new(analytics::fmt_days(*minutes), tone),
+            ];
+            if !compact {
+                runs.push(Run::new(
+                    format!(" ({})", weekday_time_in(*at, tz)),
+                    Tone::Dim,
+                ));
+            }
+            runs
+        }
         WeeklyOutlook::Safe {
             rate: r,
             at_reset,
             reset,
-        } => vec![
-            rate(r),
-            Run::new(" · ", Tone::Dim),
-            Run::new(format!("≈{at_reset:.0}% at reset"), tone),
-            Run::new(" · ", Tone::Dim),
-            Run::new(format!("safe until {}", weekday_time_in(reset, tz)), tone),
-        ],
+        } => {
+            let mut runs = vec![rate(r), sep()];
+            if !compact {
+                runs.push(Run::new(format!("≈{at_reset:.0}% at reset"), tone));
+                runs.push(sep());
+            }
+            runs.push(Run::new(
+                format!("safe until {}", weekday_time_in(*reset, tz)),
+                tone,
+            ));
+            runs
+        }
     }
+}
+
+/// A row's tooltip: the meter, its full projection, and what the rate was
+/// measured over ("7-day all: +51%/day · cap in 16h 0m (Mon 3p)\nrate over
+/// last 24h, projected to the weekly reset").
+pub fn outlook_hover<Tz: TimeZone>(meter: Meter, o: &WeeklyOutlook, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    let full = super::plain_text(&outlook_runs(o, tz, false));
+    let how = match (o, o.rate()) {
+        (_, Some(r)) => format!(
+            "rate {}, projected to the weekly reset",
+            analytics::rate_basis_text(&r)
+        ),
+        (WeeklyOutlook::NeedHistory, _) => format!(
+            "needs {}h of samples in the last {}h",
+            analytics::WEEKLY_MIN_SPAN_HOURS,
+            analytics::WEEKLY_RATE_HOURS
+        ),
+        _ => "frees up at the weekly reset".to_owned(),
+    };
+    format!("{}: {full}\n{how}", meter.name())
+}
+
+/// `runs` all muted: the rows of a stale snapshot.
+pub fn dimmed(runs: Vec<Run>) -> Vec<Run> {
+    runs.into_iter()
+        .map(|r| Run::new(r.text, Tone::Dim))
+        .collect()
+}
+
+/// The meters with a row: 7-day all always, Fable when the snapshot
+/// reports its window.
+pub fn meters(has_fable: bool) -> Vec<Meter> {
+    let mut out = vec![Meter::All];
+    if has_fable {
+        out.push(Meter::Fable);
+    }
+    out
 }
 
 /// Slot `i` of `n` across `plot`: its x range over the plot's full height.
@@ -297,8 +391,15 @@ pub fn no_data_outline(column: Rect) -> [Pos2; 4] {
 }
 
 /// Paint the chart of `bars`, `height` tall across the available width, on
-/// the timeline's axis. Hovering a slot highlights it and shows its tip.
-pub fn show_week(ui: &mut Ui, bars: &[DayBar], palette: &Palette, height: f32) -> Response {
+/// the timeline's axis, with `today`'s slot marked. Hovering a slot
+/// highlights it and shows its tip.
+pub fn show_week(
+    ui: &mut Ui,
+    bars: &[DayBar],
+    today: NaiveDate,
+    palette: &Palette,
+    height: f32,
+) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     if !ui.is_rect_visible(rect) {
@@ -321,7 +422,6 @@ pub fn show_week(ui: &mut Ui, bars: &[DayBar], palette: &Palette, height: f32) -
     }
     timeline::paint_y_axis(&painter, plot, palette, &font);
 
-    let today = Local::now().date_naive();
     for (i, bar) in bars.iter().enumerate() {
         let slot = slot_rect(plot, i, n);
         let column = bar_column(slot);
@@ -375,30 +475,92 @@ pub fn show_week(ui: &mut Ui, bars: &[DayBar], palette: &Palette, height: f32) -
 }
 
 /// The chart's card: the title with the peak as its subtitle, the chart,
-/// `height` tall, and the "7d pace" row (the weekly projection) under it.
+/// and one projection row per weekly limit under it (see [`meters`]). The
+/// projections are taken at the snapshot's fetch time; `stale` mutes them.
+/// Returns the content's natural height (before `size.min_content`).
 pub fn show_week_card(
     ui: &mut Ui,
     d: &Dashboard,
-    now: DateTime<Utc>,
+    today: NaiveDate,
     palette: &Palette,
-    height: f32,
-) {
+    size: CardSize,
+    stale: bool,
+) -> f32 {
     let bars = day_bars(&d.daily_history, &d.fable_daily);
     let snap = &d.snapshot;
-    let outlook = analytics::weekly_outlook(
-        &d.seven_day_recent,
-        snap.seven_day_pct(),
-        snap.seven_day_resets_at(),
-        now,
-    );
-    let mut runs = vec![Run::new(OUTLOOK_LABEL, Tone::Dim)];
-    runs.extend(outlook_runs(&outlook, &Local));
-    super::theme::card(palette).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        super::theme::chart_title(ui, palette, TITLE, Some(&subtitle(&bars)));
-        show_week(ui, &bars, palette, height);
-        super::show_runs(ui, &runs).on_hover_text(OUTLOOK_HOVER);
-    });
+    let at = snap.fetched_at;
+    let has_fable = snap.window(crate::model::FABLE_LABEL).is_some();
+    let rows: Vec<(Meter, WeeklyOutlook)> = meters(has_fable)
+        .into_iter()
+        .map(|m| {
+            let o = match m {
+                Meter::All => analytics::weekly_outlook(
+                    &d.seven_day_recent,
+                    snap.seven_day_pct(),
+                    snap.seven_day_resets_at(),
+                    at,
+                ),
+                Meter::Fable => analytics::weekly_outlook(
+                    &d.fable_recent,
+                    snap.fable_pct(),
+                    snap.fable_resets_at(),
+                    at,
+                ),
+            };
+            (m, o)
+        })
+        .collect();
+    super::theme::card(palette)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            super::theme::chart_title(ui, palette, TITLE, Some(&subtitle(&bars)));
+            show_week(ui, &bars, today, palette, size.chart);
+            outlook_rows(ui, &rows, stale);
+            let natural = ui.min_rect().height();
+            ui.set_min_height(size.min_content);
+            natural
+        })
+        .inner
+}
+
+/// The projection rows: labels in an aligned column, then the projection,
+/// compact when the full one would wrap (the tooltip has it in full).
+fn outlook_rows(ui: &mut Ui, rows: &[(Meter, WeeklyOutlook)], stale: bool) {
+    let painter = ui.painter().clone();
+    let label_w = rows
+        .iter()
+        .map(|(m, _)| {
+            painter
+                .layout_job(super::layout_job(&[m.label()], ui))
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let gap = 8.0;
+    for (meter, outlook) in rows {
+        let hover = outlook_hover(*meter, outlook, &Local);
+        let text_w = ui.available_width() - label_w - gap;
+        let full = outlook_runs(outlook, &Local, false);
+        let full_w = painter.layout_job(super::layout_job(&full, ui)).size().x;
+        let runs = if full_w > text_w {
+            outlook_runs(outlook, &Local, true)
+        } else {
+            full
+        };
+        let (label, runs) = if stale {
+            (dimmed(vec![meter.label()]), dimmed(runs))
+        } else {
+            (vec![meter.label()], runs)
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let r = super::show_runs(ui, &label);
+            ui.add_space(label_w - r.rect.width() + gap);
+            super::show_runs(ui, &runs);
+        })
+        .response
+        .on_hover_text(hover);
+    }
 }
 
 /// One day's bar in `column` (full plot height): the dashed no-data stub,
@@ -572,7 +734,7 @@ mod tests {
             &[(day(6), None), (day(7), Some(60.0)), (day(8), None)],
         );
         assert_eq!(day_tip(&bars[0]), "Tue Oct 6 · 22%");
-        assert_eq!(day_tip(&bars[1]), "Wed Oct 7 · 63% (Fable 30%)");
+        assert_eq!(day_tip(&bars[1]), "Wed Oct 7 · 63% (Fable share 30%)");
         assert_eq!(day_tip(&bars[2]), "Thu Oct 8 · no data");
     }
 
@@ -657,10 +819,24 @@ mod tests {
 
     #[test]
     fn weekday_times() {
-        let t = |d, h, m| Utc.with_ymd_and_hms(2026, 10, d, h, m, 0).unwrap();
-        assert_eq!(weekday_time_in(t(13, 15, 0), &Utc), "Tue 3p");
-        assert_eq!(weekday_time_in(t(15, 9, 30), &Utc), "Thu 9:30a");
-        assert_eq!(weekday_time_in(t(11, 0, 5), &Utc), "Sun 12:05a");
+        let t = |d, h, m, s| Utc.with_ymd_and_hms(2026, 10, d, h, m, s).unwrap();
+        assert_eq!(weekday_time_in(t(13, 15, 0, 0), &Utc), "Tue 3p");
+        assert_eq!(weekday_time_in(t(15, 9, 30, 0), &Utc), "Thu 9:30a");
+        assert_eq!(weekday_time_in(t(11, 0, 5, 0), &Utc), "Sun 12:05a");
+        // Rounded to the nearest minute first.
+        assert_eq!(weekday_time_in(t(13, 14, 59, 31), &Utc), "Tue 3p");
+        assert_eq!(weekday_time_in(t(13, 15, 0, 29), &Utc), "Tue 3p");
+        assert_eq!(weekday_time_in(t(13, 15, 0, 31), &Utc), "Tue 3:01p");
+    }
+
+    fn rate(per_day: f64) -> analytics::WeeklyRate {
+        analytics::WeeklyRate {
+            per_day,
+            span: Duration::hours(24),
+            basis: analytics::RateBasis::Anchored,
+            floored: false,
+            since_reset: false,
+        }
     }
 
     #[test]
@@ -668,38 +844,116 @@ mod tests {
         use crate::ui::plain_text;
         let t = |d, h| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
         let cap = WeeklyOutlook::Cap {
-            rate: 21.3,
-            at: t(13, 15),
-            minutes: 2.0 * 1440.0 + 5.0 * 60.0,
-            level: Level::Orange,
+            rate: rate(51.3),
+            at: t(12, 15),
+            minutes: 16.0 * 60.0,
+            level: Level::Red,
         };
-        let runs = outlook_runs(&cap, &Utc);
-        assert_eq!(plain_text(&runs), "+21%/day · cap in 2d 5h (Tue 3p)");
-        assert!(runs.contains(&Run::new("2d 5h", Tone::Level(Level::Orange))));
-        assert!(runs.contains(&Run::new("+21%/day", Tone::Level(Level::Orange))));
+        let runs = outlook_runs(&cap, &Utc, false);
+        assert_eq!(plain_text(&runs), "+51%/day · cap in 16h 00m (Mon 3p)");
+        assert!(runs.contains(&Run::new("16h 00m", Tone::Level(Level::Red))));
+        assert!(runs.contains(&Run::new("+51%/day", Tone::Level(Level::Red))));
+        assert_eq!(
+            plain_text(&outlook_runs(&cap, &Utc, true)),
+            "+51%/day · cap in 16h 00m"
+        );
 
         let safe = WeeklyOutlook::Safe {
-            rate: 6.0,
+            rate: rate(6.0),
             at_reset: 77.6,
             reset: t(15, 9),
         };
-        let runs = outlook_runs(&safe, &Utc);
+        let runs = outlook_runs(&safe, &Utc, false);
         assert_eq!(
             plain_text(&runs),
             "+6%/day · ≈78% at reset · safe until Thu 9a"
         );
         assert!(runs.contains(&Run::new("safe until Thu 9a", Tone::Level(Level::Green))));
+        assert_eq!(
+            plain_text(&outlook_runs(&safe, &Utc, true)),
+            "+6%/day · safe until Thu 9a"
+        );
 
-        let steady = outlook_runs(&WeeklyOutlook::Steady { rate: 0.2 }, &Utc);
+        let at_cap = WeeklyOutlook::AtCap {
+            reset: Some(t(12, 23)),
+        };
+        let runs = outlook_runs(&at_cap, &Utc, false);
+        assert_eq!(plain_text(&runs), "at cap · resets Mon 11p");
+        assert!(runs.contains(&Run::new("at cap", Tone::Level(Level::Red))));
+        assert_eq!(
+            plain_text(&outlook_runs(
+                &WeeklyOutlook::AtCap { reset: None },
+                &Utc,
+                false
+            )),
+            "at cap"
+        );
+
+        let steady = outlook_runs(&WeeklyOutlook::Steady { rate: rate(0.2) }, &Utc, false);
         assert_eq!(plain_text(&steady), "+0.2%/day · steady");
-        let only = outlook_runs(&WeeklyOutlook::RateOnly { rate: 20.0 }, &Utc);
+        let only = outlook_runs(&WeeklyOutlook::RateOnly { rate: rate(20.0) }, &Utc, false);
         assert_eq!(only, vec![Run::new("+20%/day", Tone::Level(Level::Orange))]);
-        let need = outlook_runs(&WeeklyOutlook::NeedHistory, &Utc);
+        let need = outlook_runs(&WeeklyOutlook::NeedHistory, &Utc, false);
         assert_eq!(need, vec![Run::new("need more history", Tone::Dim)]);
-        // Neither ever says "till".
-        for o in [cap, safe] {
-            assert!(!plain_text(&outlook_runs(&o, &Utc)).contains("till"));
+        for o in [cap, safe, at_cap] {
+            assert!(!plain_text(&outlook_runs(&o, &Utc, false)).contains("till"));
         }
+    }
+
+    #[test]
+    fn outlook_hovers_say_what_the_rate_covers() {
+        let t = |d, h| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        let cap = WeeklyOutlook::Cap {
+            rate: rate(51.0),
+            at: t(12, 15),
+            minutes: 16.0 * 60.0,
+            level: Level::Red,
+        };
+        assert_eq!(
+            outlook_hover(Meter::All, &cap, &Utc),
+            "7-day all: +51%/day · cap in 16h 00m (Mon 3p)\nrate over last 24h, projected to the weekly reset"
+        );
+        let partial = WeeklyOutlook::RateOnly {
+            rate: analytics::WeeklyRate {
+                per_day: 12.0,
+                span: Duration::hours(3),
+                basis: analytics::RateBasis::Partial,
+                floored: true,
+                since_reset: false,
+            },
+        };
+        assert_eq!(
+            outlook_hover(Meter::Fable, &partial, &Utc),
+            "Fable 7-day: +12%/day\nrate over last 3h (app was closed), spread over 6h, projected to the weekly reset"
+        );
+        assert_eq!(
+            outlook_hover(Meter::All, &WeeklyOutlook::NeedHistory, &Utc),
+            "7-day all: need more history\nneeds 2h of samples in the last 24h"
+        );
+        assert_eq!(
+            outlook_hover(Meter::Fable, &WeeklyOutlook::AtCap { reset: None }, &Utc),
+            "Fable 7-day: at cap\nfrees up at the weekly reset"
+        );
+    }
+
+    #[test]
+    fn rows_per_meter_and_labels() {
+        assert_eq!(meters(false), vec![Meter::All]);
+        assert_eq!(meters(true), vec![Meter::All, Meter::Fable]);
+        assert_eq!(Meter::All.label(), Run::new("7d all", Tone::Dim));
+        assert_eq!(Meter::Fable.label(), Run::new("Fable", Tone::Fable));
+    }
+
+    #[test]
+    fn stale_rows_are_muted() {
+        let runs = vec![
+            Run::new("+51%/day", Tone::Level(Level::Red)),
+            Run::new(" · ", Tone::Dim),
+        ];
+        assert_eq!(
+            dimmed(runs),
+            vec![Run::new("+51%/day", Tone::Dim), Run::new(" · ", Tone::Dim)]
+        );
     }
 
     #[test]

@@ -28,6 +28,20 @@ pub fn centered_inset(available: f32) -> f32 {
     ((available - content_width(available)) / 2.0).max(0.0)
 }
 
+/// How a chart card is sized: the chart's height, and the least height of
+/// the card's content, so cards side by side end level (0 when stacked).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CardSize {
+    pub chart: f32,
+    pub min_content: f32,
+}
+
+/// The content height the next frame gives both side-by-side cards: the
+/// taller of their natural heights this frame.
+pub fn level_height(natural: &[f32]) -> f32 {
+    natural.iter().copied().fold(0.0, f32::max)
+}
+
 /// The widths of the timeline and the 7-day chart side by side in a row
 /// `width` wide with a [`GAP`] between them, or `None` when they stack.
 pub fn chart_widths(width: f32) -> Option<(f32, f32)> {
@@ -92,6 +106,13 @@ mod tests {
         assert_eq!(content_width(1400.0), MAX_CONTENT_WIDTH);
         assert_eq!(centered_inset(1400.0), 200.0);
         assert_eq!(content_width(-5.0), 0.0);
+    }
+
+    #[test]
+    fn cards_level_to_the_taller() {
+        assert_eq!(level_height(&[230.0, 262.0]), 262.0);
+        assert_eq!(level_height(&[262.0, 230.0]), 262.0);
+        assert_eq!(level_height(&[]), 0.0);
     }
 
     #[test]

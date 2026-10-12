@@ -621,21 +621,28 @@ pub fn dash_end(from: Pos2, end: Pos2, label: Rect) -> Pos2 {
 /// The timeline's card: the title with the window's span as its subtitle
 /// (see [`window_span_in`]), the timeline, `height` tall, and the "5h burn"
 /// row under it.
+///
+/// Returns the content's natural height (before `size.min_content`).
 pub fn show_timeline_card(
     ui: &mut Ui,
     d: &Dashboard,
     now: DateTime<Utc>,
     palette: &Palette,
-    height: f32,
-) {
+    size: super::layout::CardSize,
+) -> f32 {
     let reset_known = d.snapshot.five_hour_resets_at().is_some();
     let span = window_span_in(d.window_start, d.window_end, reset_known, &Local);
-    super::theme::card(palette).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        super::theme::chart_title(ui, palette, TITLE, span.as_deref());
-        show_timeline(ui, d, now, palette, height);
-        super::footer::show_burn_row(ui, d, now);
-    });
+    super::theme::card(palette)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            super::theme::chart_title(ui, palette, TITLE, span.as_deref());
+            show_timeline(ui, d, now, palette, size.chart);
+            super::footer::show_burn_row(ui, d, now);
+            let natural = ui.min_rect().height();
+            ui.set_min_height(size.min_content);
+            natural
+        })
+        .inner
 }
 
 /// Paint the timeline for `d` at `now`, `height` tall across the available
