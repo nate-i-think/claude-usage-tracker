@@ -137,7 +137,7 @@ Where the branch differs from the design text above, and why. Sources: the spike
 ### Theme
 
 - Palette roles beyond the design: `control_border` (input, checkbox and button outlines at ≥ 3:1), `bar` (neutral chart bars that stand apart from the Fable clay), plus `field`, `raised_hover`, `grid`, `track` and `shadow`. (`accent_text`, `text_faint`, the `Hero` text style and `digits::paint_number` were built but never used, and were removed in the final review; one `theme::contrast` serves the contrast tests and the tray's digit color.) `high` became #ECA04A (dark) and #864700 (light), so the high state is at least 1.3:1 in luminance from the Fable clay. `danger` and `fable` still differ by hue only.
-- Accent and Fable are the same clay, so non-Fable items (the ALL tag, chart bars, today's sparkline outline) use neutral colors.
+- Accent and Fable are the same clay, so non-Fable items (the ALL tag, chart bars, today's outline on the 7-day chart) use neutral colors.
 - Inter v4.1 (variable) is bundled; the semibold family is the same file pinned to wght 600 via `FontTweak::coords`. Numbers go through a fixed-width digit-cell helper (`ui::digits`).
 - **Theme selector.** Settings has a Theme row (System / Dark / Light radio buttons) that calls `ctx.set_theme` the moment one is picked, like Always on top; it is not a `Settings` field because egui persists `theme_preference` in its own memory. The first launch (no egui memory yet) still defaults to Dark.
 - **✕ is drawn with two painter lines.** No font in the chain renders U+2715.
@@ -154,10 +154,11 @@ Where the branch differs from the design text above, and why. Sources: the spike
 
 - The "claude.ai usage · plan" title and the 📌 button are gone from the header. Always-on-top lives in Settings only; the plan label moved to the Details footer line ("Max plan · last polled Ns ago").
 - Chip % is floored (99.6 never reads 100). The pace delta is muted below 10 points; ahead is amber, behind green. Chips wrap to a second row when they don't fit (the Fable chip wraps at 360 pt).
-- **The sparkline uses a fixed 0–100% scale.** A scale relative to the week's maximum made a 47% day look near the cap.
-- **Footer burn copy**: "+0.21%/min · cap in 1h 48m" when the cap lands before the reset, **"+0.34%/min · safe till reset"** when it lands after (`Eta::Minutes` carries a `lands_after_reset` flag from the shared helper), and the rate alone when the reset is unknown.
+- **The 7-day chart uses a fixed 0–100% scale.** A scale relative to the week's maximum made a 47% day look near the cap. (It began as a footer sparkline; after user feedback it became a full titled "Last 7 days" card on the timeline's shared axis, with no-data days as dashed stubs, and the cards sit side by side from a 640 pt column; the column cap went from 720 to 1000 pt and the default window from 420x460 to 420x640.)
+- **Every chart has a title** (`theme::chart_title`: semibold title, muted right-aligned subtitle). The 5-hour burn moved into the timeline card as a labelled "5h burn" row; the 7-day card has a "7d pace" row from the weekly projection (24 h rate clipped to the weekly window, projected to the weekly reset).
+- **Burn copy**: "+0.21%/min · cap in 1h 48m" when the cap lands before the reset, **"+0.34%/min · safe until reset"** when it lands after (`Eta::Minutes` carries a `lands_after_reset` flag from the shared helper), and the rate alone when the reset is unknown.
 - **Burner names come from the session JSONL `cwd`** (the last path component of the latest timestamped entry), with `prettify_project` only as the fallback: the folder-name encoding is ambiguous (`__tomos` → `tomos-…`). Long names are cut at the front so the tail stays.
-- The content column is capped at 720 pt and centered; `layout::pack_rows` wraps chips and footer items.
+- The content column is capped (now 1000 pt) and centered; `layout::pack_rows` wraps the chips.
 
 ### Motion
 

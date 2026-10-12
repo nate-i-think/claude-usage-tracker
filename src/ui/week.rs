@@ -273,7 +273,7 @@ pub fn shape_top(plot: Rect, shape: BarShape) -> f32 {
     }
 }
 
-/// Today's outline: [`TODAY_PAD`] around the bar (or stub) in `column`,
+/// Today's outline: a few points around the bar (or stub) in `column`,
 /// down to the baseline, so it hugs the bar instead of boxing the slot.
 pub fn today_outline(plot: Rect, column: Rect, shape: BarShape) -> Rect {
     let top = (shape_top(plot, shape) - TODAY_PAD).max(plot.top());
