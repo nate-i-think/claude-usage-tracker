@@ -86,7 +86,7 @@ Open Settings with ⚙. Changes take effect on **Apply**, except **Always on top
 - **Client SHA**: see [Refreshing the client SHA](#refreshing-the-client-sha). Settings shows which source is in use.
 - **Window**: **Show tray icon**; **Close button hides to tray** (needs the tray icon); **Start in pill mode**.
 - **Alerts**: **5-hour window reaches 75%**; **5-hour window reaches 90%**; **Projected to hit the cap before reset**; **Send test notification**.
-- **Motion**: **Reduce motion** (values snap instead of gliding, and the near-cap chip holds steady instead of pulsing); **Keep pulsing near cap** (the chip and pill dot keep breathing for as long as the 5-hour window is at 90% or more, instead of three breaths. It repaints 15–20 times a second, which costs a few percent of a CPU core while it lasts: about 9% of one core in testing, against about 2.5% when idle).
+- **Motion**: **Reduce motion** (values snap instead of gliding, and the near-cap chip holds steady instead of pulsing); **Keep pulsing near cap** (the chip and pill dot keep breathing for as long as the 5-hour window is at 90% or more, instead of three breaths. It repaints about 10 times a second, which costs a few percent of a CPU core while it lasts: about 9% of one core in testing at an earlier 15 times a second, against about 2.5% when idle).
 
 ## Install
 

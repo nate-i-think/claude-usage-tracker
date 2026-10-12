@@ -18,7 +18,7 @@ pub enum BannerKind {
     Error,
     /// Data is fine but something needs attention (orange "!").
     Warning,
-    /// Waiting on the first poll (muted, spinner).
+    /// Waiting on the first poll (muted, three dots).
     Loading,
 }
 
@@ -54,18 +54,18 @@ pub fn banner(ui: &mut Ui, kind: BannerKind, add: impl FnOnce(&mut Ui)) {
         });
 }
 
-/// The round icon: "!" on the kind color, or a spinner while loading.
+/// The round icon on the kind color: "!", or three static dots while
+/// loading (a spinner would repaint every frame until the first poll).
 fn badge(ui: &mut Ui, kind: BannerKind, color: Color32, palette: &Palette) {
-    if kind == BannerKind::Loading {
-        ui.add_sized(
-            vec2(BADGE, BADGE),
-            eframe::egui::Spinner::new().size(BADGE - 2.0),
-        );
-        return;
-    }
     let (rect, _) = ui.allocate_exact_size(vec2(BADGE, BADGE), Sense::hover());
     let painter = ui.painter();
     painter.circle_filled(rect.center(), BADGE / 2.0, color);
+    if kind == BannerKind::Loading {
+        for dx in [-4.5, 0.0, 4.5] {
+            painter.circle_filled(rect.center() + vec2(dx, 0.0), 1.5, palette.surface);
+        }
+        return;
+    }
     let font = theme::semibold(TextStyle::Small.resolve(ui.style()).size + 1.0);
     painter.text(
         rect.center(),

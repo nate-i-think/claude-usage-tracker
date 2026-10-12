@@ -55,7 +55,7 @@ pub fn to_pill_commands(pos: Option<Pos2>, unmaximize: bool) -> Vec<ViewportComm
     cmds
 }
 
-/// Pill → full: decorations, resizable, the pin's window level, the full
+/// Pill → full: decorations, resizable, the Always on top window level, the full
 /// min size, then the saved size and position (if known), and maximize
 /// last so un-maximizing later returns to that normal rect.
 pub fn to_full_commands(

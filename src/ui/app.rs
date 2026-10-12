@@ -212,6 +212,12 @@ impl App {
         app
     }
 
+    /// The last poll failed or the poller has stopped (the tray tooltip
+    /// and the pill's state dot say so).
+    fn poll_failing(&self) -> bool {
+        self.state.error.is_some() || !self.poller.is_alive()
+    }
+
     fn drain_events(&mut self) {
         while let Some(event) = self.poller.try_recv() {
             self.state.apply(event);
@@ -278,8 +284,8 @@ impl App {
         self.last_refresh = Some(Instant::now());
     }
 
-    /// Hand settings changes (from the panel, the pin, later the tray) to
-    /// the poller and to storage.
+    /// Hand settings changes (from the panel, Always on top, the Details
+    /// toggle, the alerts' edge state) to the poller and to storage.
     fn sync_settings(&mut self, frame: &mut eframe::Frame) {
         if !self.storage_cleaned {
             self.storage_cleaned = true;
@@ -375,7 +381,7 @@ impl App {
         let snap = self.state.data.as_ref().map(|d| &d.snapshot);
         let pct = snap.and_then(|s| s.five_hour_pct());
         let resets_at = snap.and_then(|s| s.five_hour_resets_at());
-        let failed = self.state.error.is_some() || !self.poller.is_alive();
+        let failed = self.poll_failing();
         let pill = self.settings.ui_mode == UiMode::Pill;
         if let Some(t) = self.tray.as_mut() {
             t.update(
@@ -542,7 +548,7 @@ impl App {
             .as_ref()
             .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now))
             .unwrap_or_default();
-        let failed = self.state.error.is_some() || !self.poller.is_alive();
+        let failed = self.poll_failing();
         let ready = refresh_ready(self.last_refresh, Instant::now());
         let frame = Frame::NONE.fill(palette.surface);
         let action = CentralPanel::default()
@@ -801,13 +807,13 @@ mod tests {
         let idle = settings_sync(&base, &base, &base);
         assert!(idle.poller.is_none() && !idle.persist);
 
-        // UI-only change (pin, a toggle): persist, poller not bothered.
-        let pinned = Settings {
+        // UI-only change (Always on top, a toggle): persist, poller not bothered.
+        let on_top = Settings {
             always_on_top: true,
             reduce_motion: true,
             ..base.clone()
         };
-        let sync = settings_sync(&pinned, &base, &base);
+        let sync = settings_sync(&on_top, &base, &base);
         assert!(sync.poller.is_none() && sync.persist);
 
         // Interval change: both.

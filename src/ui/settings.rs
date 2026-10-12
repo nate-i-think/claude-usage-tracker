@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn build_applies_trimmed_fields_and_keeps_live_pin() {
+    fn build_applies_trimmed_fields_and_keeps_live_always_on_top() {
         let current = Settings {
             always_on_top: true,
             ..Settings::default()
@@ -674,7 +674,7 @@ mod tests {
         // The panel opened on these settings...
         let opened = Settings::default();
         let d = SettingsDraft::from_settings(&opened);
-        // ...then Details was toggled, the window moved and the pin flipped
+        // ...then Details was toggled, the window moved and Always on top flipped
         // before Apply. Apply builds over the live settings, not the
         // snapshot the draft came from.
         let live = Settings {

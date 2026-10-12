@@ -397,9 +397,11 @@ fn hwnd_of(
 /// can't land in a gap of an L-shaped layout or on an unplugged monitor),
 /// then maximize it if it was. Call from `App::new`.
 ///
-/// Maximizing goes through winit so its window state stays in sync. Note
-/// that winit (like eframe's own `with_maximized`) maximizes with
-/// `ShowWindow(SW_MAXIMIZE)`, which shows the window before the first paint.
+/// Maximizing goes through winit so its window state stays in sync. winit
+/// 0.30.13's `apply_diff` (`window_state.rs`) calls `ShowWindow(SW_MAXIMIZE)`
+/// and then, because the window is not yet marked visible,
+/// `ShowWindow(SW_HIDE)` in the same pass, so the window stays hidden until
+/// eframe shows it after the first paint.
 #[cfg(windows)]
 pub fn apply_placement(cc: &eframe::CreationContext<'_>, placement: Placement) {
     if let (Some(pos), Some(hwnd)) = (placement.pos, hwnd_of(cc)) {
