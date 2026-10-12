@@ -107,16 +107,30 @@ pub fn five_hour_now(
 /// sample after a drop of more than [`RESET_DROP`] points, or a drop to 0
 /// from anything higher; all of them when there is none. Samples without
 /// a 5-hour value are skipped when comparing.
+///
+/// A drop counts only if it persists: when the next sample with a value
+/// rises back to within [`RESET_DROP`] of the value before the drop, it
+/// was a glitch (40, 0, 41 never cuts; 4, 0, 0 does). A drop on the latest sample cuts
+/// until the next poll says otherwise.
 pub fn since_last_reset(samples: &[WindowSample]) -> &[WindowSample] {
-    let mut start = 0;
-    let mut prev: Option<f64> = None;
-    for (i, s) in samples.iter().enumerate() {
-        let Some(v) = s.five_hour else { continue };
-        if prev.is_some_and(|p| p - v > RESET_DROP || (v <= 0.0 && p > 0.0)) {
-            start = i;
-        }
-        prev = Some(v);
-    }
+    let valued: Vec<(usize, f64)> = samples
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.five_hour.map(|v| (i, v)))
+        .collect();
+    let start = valued
+        .windows(2)
+        .enumerate()
+        .rev()
+        .find(|(k, pair)| {
+            let (p, (_, v)) = (pair[0].1, pair[1]);
+            let dropped = p - v > RESET_DROP || (v <= 0.0 && p > 0.0);
+            let recovered = valued
+                .get(k + 2)
+                .is_some_and(|(_, next)| *next > v && *next >= p - RESET_DROP);
+            dropped && !recovered
+        })
+        .map_or(0, |(_, pair)| pair[1].0);
     &samples[start..]
 }
 
@@ -625,6 +639,46 @@ mod tests {
             s(25, Some(4.0), None),
         ];
         assert_eq!(since_last_reset(&samples), &samples[4..]);
+    }
+
+    #[test]
+    fn since_last_reset_ignores_a_lone_glitch() {
+        let samples = [
+            s(0, Some(30.0), None),
+            s(5, Some(40.0), None),
+            s(10, Some(0.0), None),
+            s(15, Some(41.0), None),
+        ];
+        assert_eq!(since_last_reset(&samples), &samples[..]);
+        // Recovered across a gap without a value, too.
+        let gap = [
+            s(0, Some(40.0), None),
+            s(5, Some(0.0), None),
+            s(10, None, None),
+            s(15, Some(36.0), None),
+        ];
+        assert_eq!(since_last_reset(&gap), &gap[..]);
+    }
+
+    #[test]
+    fn since_last_reset_cuts_a_persisting_drop_and_heals_a_latest_glitch() {
+        let real = [
+            s(0, Some(80.0), None),
+            s(5, Some(0.0), None),
+            s(10, Some(0.0), None),
+            s(15, Some(2.0), None),
+        ];
+        assert_eq!(since_last_reset(&real), &real[1..]);
+        // A drop on the latest poll cuts for now...
+        let latest = [
+            s(0, Some(30.0), None),
+            s(5, Some(40.0), None),
+            s(10, Some(0.0), None),
+        ];
+        assert_eq!(since_last_reset(&latest), &latest[2..]);
+        // ...and the next poll back at 41 heals it.
+        let healed = [latest[0], latest[1], latest[2], s(15, Some(41.0), None)];
+        assert_eq!(since_last_reset(&healed), &healed[..]);
     }
 
     #[test]
