@@ -524,23 +524,21 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
     details::show_details(ui, d, settings, now);
 }
 
-/// The hero timeline and the "Last 7 days" chart, each on its titled card:
-/// side by side when the column is wide enough (see
-/// [`layout::chart_widths`]), both [`timeline::FULL_HEIGHT`] tall and
-/// levelled to the taller card's content (measured the frame before); else
-/// stacked with the timeline first and the 7-day chart
-/// [`week::STACKED_HEIGHT`] tall. The weekly rows are muted when the
-/// snapshot is stale (see [`week::Freshness`]).
+/// The 5-hour and the 7-day timelines, each on its titled card, both
+/// [`timeline::FULL_HEIGHT`] tall: side by side when the column is wide
+/// enough (see [`layout::chart_widths`]), levelled to the taller card's
+/// content (measured the frame before); else stacked, 5-hour first. The
+/// weekly rows are muted when the snapshot is stale (see
+/// [`week::Freshness`]).
 fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>, fresh: week::Freshness) {
     let palette = theme::Palette::for_visuals(ui.visuals());
-    let today = chrono::Local::now().date_naive();
     let Some((left, right)) = layout::chart_widths(ui.available_width()) else {
-        let size = |chart| layout::CardSize {
-            chart,
+        let size = layout::CardSize {
+            chart: timeline::FULL_HEIGHT,
             min_content: 0.0,
         };
-        timeline::show_timeline_card(ui, d, now, palette, size(timeline::FULL_HEIGHT));
-        week::show_week_card(ui, d, today, palette, size(week::STACKED_HEIGHT), fresh);
+        timeline::show_timeline_card(ui, d, now, palette, size);
+        week::show_week_card(ui, d, now, palette, size, fresh);
         return;
     };
     let id = egui::Id::new("charts-level-height");
@@ -557,7 +555,7 @@ fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>, fresh: week::Freshness
                 timeline::show_timeline_card(ui, d, now, palette, size)
             });
             let b = ui.allocate_ui_with_layout(egui::vec2(right, 0.0), column, |ui| {
-                week::show_week_card(ui, d, today, palette, size, fresh)
+                week::show_week_card(ui, d, now, palette, size, fresh)
             });
             [a.inner, b.inner]
         })

@@ -1,29 +1,34 @@
-//! The hero timeline: the current 5-hour window as a smooth area chart.
+//! The hero timelines: a usage window (the 5-hour one, or the 7-day one in
+//! [`super::week`]) as a smooth area chart, described by a [`Chart`].
 //!
 //! x runs from the window start to its reset, y from 0 to 100%. On top of
 //! light gridlines it paints the usage area (raw window samples, a gradient
-//! [`Mesh`] in the state color with a stroked line), the Fable layer under
-//! it, a "now" marker with a dot at the current %, the dashed projection to
-//! the reset or the cap (with a ✕ and "cap 4:10p", or a "safe" end label),
-//! the dashed 100% cap line, and a hover crosshair with a tooltip. Time
-//! gaps in the samples (the app was closed) are bridged with a faint dotted
-//! line: 5-hour utilization only rises within a window, so the straight
-//! line is the best guess; only resets and missing values truly break.
+//! [`Mesh`] in the state color with a stroked line), the overlay (the
+//! 5-hour chart's Fable share under the area, or the weekly chart's Fable
+//! 7-day line), a "now" marker with a dot per meter, each meter's dashed
+//! projection to the reset or the cap (with a ✕ and "cap 4:10p", or a
+//! "safe" end label; "at cap" when it is there), the dashed 100% cap line,
+//! and a hover crosshair with a tooltip. Time gaps in the samples (the app
+//! was closed) are bridged with a faint dotted line: utilization only rises
+//! within a window, so the straight line is the best guess; only resets
+//! and missing values truly break. How long a gap breaks the line is per
+//! chart (10 minutes for 5 hours, an hour for a week).
 //!
-//! Geometry (mapping, segmenting, thinning, dashes, ticks, hover lookup) is
-//! in pure functions tested without a GPU; [`show_timeline`] only paints.
+//! Geometry (mapping, segmenting, thinning, dashes, ticks, labels, hover
+//! lookup) is in pure functions tested without a GPU; [`show_chart`] only
+//! paints.
 
 use std::fmt::Display;
 use std::ops::Range;
 
-use chrono::{DateTime, Duration, Local, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, DurationRound, Local, NaiveTime, TimeZone, Timelike, Utc};
 use eframe::egui::{
     epaint::{Mesh, PathStroke},
     pos2, vec2, Align2, Color32, FontId, Id, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
     TextStyle, Ui, Vec2,
 };
 
-use crate::analytics::{self, alerts::fmt_clock_in, Projection, WindowSample};
+use crate::analytics::{self, alerts::fmt_clock_in, Projection, WeekSample, WindowSample};
 use crate::poller::Dashboard;
 
 use super::motion;
@@ -33,9 +38,12 @@ use super::theme::Palette;
 pub const FULL_HEIGHT: f32 = 180.0;
 /// The card's title.
 pub const TITLE: &str = "5-hour window";
-/// A gap between samples longer than this ends a solid line (the app was
-/// closed or polls failed); its two ends are joined by a [`Bridge`].
+/// On the 5-hour chart, a gap between samples longer than this ends a
+/// solid line (the app was closed or polls failed); its two ends are joined
+/// by a [`Bridge`].
 pub const GAP_BREAK_MINUTES: i64 = 10;
+/// The same on the weekly chart.
+pub const WEEK_GAP_BREAK_MINUTES: i64 = 60;
 /// A drop of more than this many points between samples is a reset and
 /// breaks the line (the rule of [`analytics::recent_window`]).
 pub const RESET_DROP: f64 = 5.0;
@@ -65,6 +73,52 @@ const DOT: f32 = 2.0;
 const DOT_GAP: f32 = 3.0;
 /// Hover snaps to a sample at most this far away horizontally.
 pub const SNAP_PX: f32 = 12.0;
+
+/// One sample on a chart: the main meter and the overlay's raw value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Point {
+    pub t: DateTime<Utc>,
+    /// The main meter (5-hour, or 7-day all).
+    pub value: Option<f64>,
+    /// The overlay's meter (Fable 7-day), drawn by [`Overlay::Line`].
+    pub overlay: Option<f64>,
+}
+
+impl From<&WindowSample> for Point {
+    fn from(s: &WindowSample) -> Self {
+        Point {
+            t: s.t,
+            value: s.five_hour,
+            overlay: s.fable,
+        }
+    }
+}
+
+impl From<&WeekSample> for Point {
+    fn from(s: &WeekSample) -> Self {
+        Point {
+            t: s.t,
+            value: s.seven_day,
+            overlay: s.fable,
+        }
+    }
+}
+
+/// Which of a point's values a line follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Series {
+    Main,
+    Overlay,
+}
+
+impl Point {
+    pub fn get(&self, series: Series) -> Option<f64> {
+        match series {
+            Series::Main => self.value,
+            Series::Overlay => self.overlay,
+        }
+    }
+}
 
 /// Maps the window's time and 0–100% onto the plot rectangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,22 +186,27 @@ pub fn plot_rect(rect: Rect, label_w: f32, text_h: f32) -> Rect {
 }
 
 /// Index ranges of `samples` drawn as one solid line each: only samples
-/// with a 5-hour value, broken where a value is missing, the time between
-/// neighbors exceeds [`GAP_BREAK_MINUTES`] (see [`bridges`]), or the value
-/// drops by more than [`RESET_DROP`] points. Single-sample ranges are kept.
-pub fn segments(samples: &[WindowSample]) -> Vec<Range<usize>> {
-    let max_gap = Duration::minutes(GAP_BREAK_MINUTES);
+/// with a main value, broken where a value is missing, the time between
+/// neighbors exceeds `gap_break` (see [`bridges`]), or the value drops by
+/// more than [`RESET_DROP`] points. Single-sample ranges are kept.
+pub fn segments(samples: &[Point], gap_break: Duration) -> Vec<Range<usize>> {
+    segments_of(samples, gap_break, Series::Main)
+}
+
+/// [`segments`] of either series.
+pub fn segments_of(samples: &[Point], gap_break: Duration, series: Series) -> Vec<Range<usize>> {
+    let max_gap = gap_break;
     let mut out = Vec::new();
     let mut current: Option<Range<usize>> = None;
     for (i, s) in samples.iter().enumerate() {
-        let Some(v) = s.five_hour else {
+        let Some(v) = s.get(series) else {
             out.extend(current.take());
             continue;
         };
         current = match current.take() {
             Some(r) => {
                 let prev = &samples[r.end - 1];
-                let prev_v = prev.five_hour.unwrap_or(v);
+                let prev_v = prev.get(series).unwrap_or(v);
                 if s.t - prev.t > max_gap || prev_v - v > RESET_DROP {
                     out.push(r);
                     Some(i..i + 1)
@@ -172,14 +231,19 @@ pub struct Bridge {
 
 /// Bridges between consecutive `segs` (from [`segments`]) that only a time
 /// gap separates: none where a missing value or a reset broke the line.
-pub fn bridges(samples: &[WindowSample], segs: &[Range<usize>]) -> Vec<Bridge> {
+pub fn bridges(samples: &[Point], segs: &[Range<usize>]) -> Vec<Bridge> {
+    bridges_of(samples, segs, Series::Main)
+}
+
+/// [`bridges`] of either series.
+pub fn bridges_of(samples: &[Point], segs: &[Range<usize>], series: Series) -> Vec<Bridge> {
     segs.windows(2)
         .filter_map(|pair| {
             let (from, to) = (pair[0].end - 1, pair[1].start);
             if to != from + 1 {
                 return None; // missing values in between
             }
-            let (a, b) = (samples[from].five_hour?, samples[to].five_hour?);
+            let (a, b) = (samples[from].get(series)?, samples[to].get(series)?);
             (a - b <= RESET_DROP).then_some(Bridge { from, to })
         })
         .collect()
@@ -320,6 +384,79 @@ where
     format!("{}{suffix}", local.format("%-I:%M"))
 }
 
+/// A weekday and compact time, rounded to the nearest minute: "Tue 3p" on
+/// the hour, else "Thu 9:30a".
+pub fn weekday_time_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    let t = t.duration_round(Duration::minutes(1)).unwrap_or(t);
+    let local = t.with_timezone(tz);
+    let suffix = if local.hour() < 12 { 'a' } else { 'p' };
+    let clock = if local.minute() == 0 {
+        local.format("%-I").to_string()
+    } else {
+        local.format("%-I:%M").to_string()
+    };
+    format!("{} {clock}{suffix}", local.format("%a"))
+}
+
+/// Every local midnight in `[start, end]` with its short weekday ("Tue"),
+/// for the weekly chart's ticks. A midnight a DST jump skips is taken at
+/// the first valid instant after it.
+pub fn day_ticks_in<Tz: TimeZone>(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    tz: &Tz,
+) -> Vec<(DateTime<Utc>, String)>
+where
+    Tz::Offset: Display,
+{
+    let mut out = Vec::new();
+    if end < start {
+        return out;
+    }
+    let mut day = start.with_timezone(tz).date_naive();
+    let last = end.with_timezone(tz).date_naive();
+    while day <= last {
+        let midnight = day.and_time(NaiveTime::MIN);
+        let t = tz
+            .from_local_datetime(&midnight)
+            .earliest()
+            .or_else(|| {
+                tz.from_local_datetime(&(midnight + Duration::hours(1)))
+                    .earliest()
+            })
+            .map(|t| t.with_timezone(&Utc));
+        if let Some(t) = t.filter(|t| *t >= start && *t <= end) {
+            out.push((t, day.format("%a").to_string()));
+        }
+        let Some(next) = day.succ_opt() else { break };
+        day = next;
+    }
+    out
+}
+
+/// The weekly card's subtitle: "Mon 11p – Mon 11p", from the window start
+/// to its reset. `None` when the reset is unknown.
+pub fn week_span_in<Tz: TimeZone>(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    reset_known: bool,
+    tz: &Tz,
+) -> Option<String>
+where
+    Tz::Offset: Display,
+{
+    reset_known.then(|| {
+        format!(
+            "{} – {}",
+            weekday_time_in(start, tz),
+            weekday_time_in(end, tz)
+        )
+    })
+}
+
 /// The card's subtitle: the window's span, "6:10p – 11:10p" in the
 /// [`short_time_in`] format of the "reset 11:10p" label. `None` when the
 /// reset is unknown: the end is then only assumed.
@@ -350,12 +487,12 @@ where
     format!("no samples {start}–{}", fmt_clock_in(to, tz))
 }
 
-/// The sample with a 5-hour value nearest in time to `t`.
-pub fn nearest_sample(samples: &[WindowSample], t: DateTime<Utc>) -> Option<usize> {
+/// The sample with a main value nearest in time to `t`.
+pub fn nearest_sample(samples: &[Point], t: DateTime<Utc>) -> Option<usize> {
     samples
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.five_hour.is_some())
+        .filter(|(_, s)| s.value.is_some())
         .min_by_key(|(_, s)| (s.t - t).abs())
         .map(|(i, _)| i)
 }
@@ -390,6 +527,24 @@ pub fn projected_tip(time: &str, pct: f64) -> String {
     format!("{time} · projected {pct:.0}%")
 }
 
+/// Weekly tooltip for a sample: "Sat 3:12p · 7d all 41% · Fable 52%",
+/// without the Fable part when there is none.
+pub fn week_sample_tip(time: &str, pct: f64, fable: Option<f64>) -> String {
+    match fable {
+        Some(f) => format!("{time} · 7d all {pct:.0}% · Fable {f:.0}%"),
+        None => format!("{time} · 7d all {pct:.0}%"),
+    }
+}
+
+/// Weekly tooltip on the projections: "Mon 3p · projected 7d all 71% ·
+/// Fable 90%".
+pub fn week_projected_tip(time: &str, pct: f64, fable: Option<f64>) -> String {
+    match fable {
+        Some(f) => format!("{time} · projected 7d all {pct:.0}% · Fable {f:.0}%"),
+        None => format!("{time} · projected 7d all {pct:.0}%"),
+    }
+}
+
 /// What the pointer at `x` points at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HoverTarget {
@@ -408,7 +563,7 @@ pub enum HoverTarget {
 /// bare time. `projection` is `(pct now, line)`.
 pub fn hover_target(
     axes: &Axes,
-    samples: &[WindowSample],
+    samples: &[Point],
     bridges: &[Bridge],
     now: DateTime<Utc>,
     projection: Option<(f64, Projection)>,
@@ -497,6 +652,8 @@ pub enum EndLabel {
     Cap(DateTime<Utc>),
     /// "safe": the window resets first.
     Safe,
+    /// "at cap": the meter is at 100% (no projection).
+    AtCap,
 }
 
 /// The end label for projection `p`, or none: without a known reset the
@@ -545,7 +702,8 @@ fn line_low_over(from: Pos2, end: Pos2, x0: f32, x1: f32) -> f32 {
 /// whose padded rect misses the line, the keep-out box and the now column;
 /// then the first that misses the box and the column (the dash then stops
 /// short of the label, see [`dash_end`]); then the first that misses the
-/// box.
+/// box. Every tier also keeps clear of `avoid` (other meters' labels and
+/// ✕ marks) when it can.
 pub fn place_end_label(
     from: Pos2,
     end: Pos2,
@@ -553,6 +711,7 @@ pub fn place_end_label(
     clearance: f32,
     keep_out: f32,
     bounds: Rect,
+    avoid: &[Rect],
 ) -> Rect {
     let c = clearance;
     let at = |min: Pos2| shift_inside(Rect::from_min_size(min, size), bounds);
@@ -597,10 +756,17 @@ pub fn place_end_label(
         !(padded.left() < from.x && from.x < padded.right())
     };
     let clear_of_line = |r: &Rect| segment_entry(from, end, r.expand(LABEL_PAD)).is_none();
+    let clear_of_avoid = |r: &Rect| avoid.iter().all(|a| !overlaps(r.expand(LABEL_PAD), *a));
     let first = |ok: &dyn Fn(&Rect) -> bool| candidates.iter().copied().find(|r| ok(r));
-    first(&|r| clear_of_keep(r) && clear_of_now(r) && clear_of_line(r))
-        .or_else(|| first(&|r| clear_of_keep(r) && clear_of_now(r)))
-        .or_else(|| first(&clear_of_keep))
+    let tiers: [&dyn Fn(&Rect) -> bool; 3] = [
+        &|r| clear_of_keep(r) && clear_of_now(r) && clear_of_line(r),
+        &|r| clear_of_keep(r) && clear_of_now(r),
+        &clear_of_keep,
+    ];
+    tiers
+        .iter()
+        .find_map(|ok| first(&|r| ok(r) && clear_of_avoid(r)))
+        .or_else(|| tiers.iter().find_map(|ok| first(ok)))
         .unwrap_or(under_line)
 }
 
@@ -618,9 +784,129 @@ pub fn dash_end(from: Pos2, end: Pos2, label: Rect) -> Pos2 {
     }
 }
 
+/// What a chart draws with its main area besides the main line.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Overlay {
+    /// Nothing.
+    None,
+    /// A clay area under the main area, one value per point (the 5-hour
+    /// chart's Fable share).
+    Share(Vec<Option<f64>>),
+    /// A clay line of each point's [`Point::overlay`] (the weekly chart's
+    /// Fable 7-day meter, its own limit).
+    Line,
+}
+
+/// How a chart writes times: "3:10p" for a 5-hour window, "Mon 3p" for a
+/// week.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeStyle {
+    Clock,
+    Weekday,
+}
+
+impl TimeStyle {
+    /// A compact time for labels: [`short_time_in`] or [`weekday_time_in`].
+    pub fn short<Tz: TimeZone>(self, t: DateTime<Utc>, tz: &Tz) -> String
+    where
+        Tz::Offset: Display,
+    {
+        match self {
+            TimeStyle::Clock => short_time_in(t, tz),
+            TimeStyle::Weekday => weekday_time_in(t, tz),
+        }
+    }
+
+    /// A time for tooltips: "1:35 PM", or "Sat 3:12p".
+    pub fn tip<Tz: TimeZone>(self, t: DateTime<Utc>, tz: &Tz) -> String
+    where
+        Tz::Offset: Display,
+    {
+        match self {
+            TimeStyle::Clock => fmt_clock_in(t, tz),
+            TimeStyle::Weekday => weekday_time_in(t, tz),
+        }
+    }
+}
+
+/// One meter's now dot and dashed projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Line {
+    /// The meter's % now (the dot eases to it).
+    pub pct: f64,
+    pub projection: Option<Projection>,
+    pub label: Option<EndLabel>,
+    /// The dot and the dash.
+    pub color: Color32,
+    /// The ✕ and the "cap …" label.
+    pub cap_color: Color32,
+}
+
+/// Everything a timeline draws: the window, the samples, the meters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chart {
+    /// Distinguishes this chart's eased values.
+    pub id: &'static str,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub now: DateTime<Utc>,
+    pub points: Vec<Point>,
+    /// A longer gap between samples ends a solid line (see [`segments`]).
+    pub gap_break: Duration,
+    /// The main area's state color.
+    pub state: Color32,
+    pub overlay: Overlay,
+    /// Labelled ticks along the bottom.
+    pub ticks: Vec<(DateTime<Utc>, String)>,
+    /// At the right end of the time axis: "reset 11:10p".
+    pub end_label: Option<String>,
+    /// The main meter first, then the overlay's.
+    pub lines: Vec<Line>,
+    pub style: TimeStyle,
+    /// The snapshot's fetch time in ms, so projections draw in per poll.
+    pub poll_key: i64,
+}
+
+/// The 5-hour chart for `d` at `now`.
+pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> Chart {
+    let snap = &d.snapshot;
+    let pct = snap.five_hour_pct();
+    let state = palette.level(analytics::color_for(pct));
+    let reset_known = snap.five_hour_resets_at().is_some();
+    let lines = pct
+        .map(|p| {
+            let rate = analytics::compute_rate(&d.history, now);
+            let projection = analytics::projection(now, p, rate, d.window_end);
+            Line {
+                pct: p,
+                projection: Some(projection),
+                label: end_label(reset_known, &projection, now),
+                color: state,
+                cap_color: palette.danger,
+            }
+        })
+        .into_iter()
+        .collect();
+    Chart {
+        id: "timeline",
+        start: d.window_start,
+        end: d.window_end,
+        now,
+        points: d.window_samples.iter().map(Point::from).collect(),
+        gap_break: Duration::minutes(GAP_BREAK_MINUTES),
+        state,
+        overlay: Overlay::Share(analytics::fable_layer(&d.window_samples)),
+        ticks: hour_ticks_in(d.window_start, d.window_end, &Local),
+        end_label: Some(format!("reset {}", short_time_in(d.window_end, &Local))),
+        lines,
+        style: TimeStyle::Clock,
+        poll_key: snap.fetched_at.timestamp_millis(),
+    }
+}
+
 /// The timeline's card: the title with the window's span as its subtitle
-/// (see [`window_span_in`]), the timeline, `height` tall, and the "5h burn"
-/// row under it.
+/// (see [`window_span_in`]), the timeline, `size.chart` tall, and the "5h
+/// burn" row under it.
 ///
 /// Returns the content's natural height (before `size.min_content`).
 pub fn show_timeline_card(
@@ -632,6 +918,7 @@ pub fn show_timeline_card(
 ) -> f32 {
     let reset_known = d.snapshot.five_hour_resets_at().is_some();
     let span = window_span_in(d.window_start, d.window_end, reset_known, &Local);
+    let chart = five_hour_chart(d, now, palette);
     super::theme::card(palette)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -639,24 +926,17 @@ pub fn show_timeline_card(
             // Reserved from the cursor, so set before the content.
             ui.set_min_height(size.min_content);
             super::theme::chart_title(ui, palette, TITLE, span.as_deref());
-            show_timeline(ui, d, now, palette, size.chart);
+            show_chart(ui, &chart, palette, size.chart);
             super::footer::show_burn_row(ui, d, now);
             // From the cursor: min_rect includes the reserved height.
-            let natural = ui.cursor().top() - top - ui.spacing().item_spacing.y;
-            natural
+            ui.cursor().top() - top - ui.spacing().item_spacing.y
         })
         .inner
 }
 
-/// Paint the timeline for `d` at `now`, `height` tall across the available
-/// width. Hovering shows a crosshair and a tooltip.
-pub fn show_timeline(
-    ui: &mut Ui,
-    d: &Dashboard,
-    now: DateTime<Utc>,
-    palette: &Palette,
-    height: f32,
-) -> Response {
+/// Paint `chart`, `height` tall across the available width. Hovering shows
+/// a crosshair and a tooltip.
+pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     if !ui.is_rect_visible(rect) {
@@ -670,15 +950,15 @@ pub fn show_timeline(
         .x;
     let axes = Axes {
         plot: plot_rect(rect, label_w, font.size),
-        start: d.window_start,
-        end: d.window_end,
+        start: chart.start,
+        end: chart.end,
     };
 
     paint_y_axis(&painter, axes.plot, palette, &font);
-    paint_time_axis(&painter, &axes, palette, &font, rect.left());
+    paint_time_axis(&painter, &axes, palette, &font, rect.left(), chart);
 
-    let samples = &d.window_samples;
-    let segs = segments(samples);
+    let samples = &chart.points;
+    let segs = segments(samples, chart.gap_break);
     if segs.is_empty() {
         painter.text(
             axes.plot.center(),
@@ -689,40 +969,42 @@ pub fn show_timeline(
         );
         return response;
     }
-
-    let pct = d.snapshot.five_hour_pct();
-    let state = palette.level(analytics::color_for(pct));
-    let fable = analytics::fable_layer(samples);
     let gaps = bridges(samples, &segs);
-    paint_areas(
-        &painter, &axes, palette, state, samples, &fable, &segs, &gaps,
-    );
+    paint_areas(&painter, &axes, palette, chart, &segs, &gaps);
 
-    let projection = pct.map(|p| {
-        let rate = analytics::compute_rate(&d.history, now);
-        (p, analytics::projection(now, p, rate, d.window_end))
-    });
-    let reset_known = d.snapshot.five_hour_resets_at().is_some();
-    // The dot eases to each poll's %; the projection draws in when it
-    // first appears and when a poll moves its end.
+    // Each dot eases to its poll's %; each projection draws in when it first
+    // appears and when a poll moves its end.
     let ctx = ui.ctx().clone();
-    let ends = projection.map(|(pct, p)| Ends {
-        pct: motion::eased(&ctx, Id::new("timeline-now-pct"), pct),
-        projection: p,
-        label: end_label(reset_known, &p, now),
-        share: motion::draw_in(
-            &ctx,
-            Id::new("timeline-projection"),
-            d.snapshot.fetched_at.timestamp_millis(),
-            p.end_pct,
-        ),
-    });
-    paint_now(&painter, &axes, palette, state, now, ends, &font);
+    let ends: Vec<Ends> = chart
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| Ends {
+            pct: motion::eased(&ctx, Id::new((chart.id, i, "now-pct")), line.pct),
+            projection: line.projection,
+            label: line.label,
+            share: line.projection.map_or(1.0, |p| {
+                motion::draw_in(
+                    &ctx,
+                    Id::new((chart.id, i, "projection")),
+                    chart.poll_key,
+                    p.end_pct,
+                )
+            }),
+            color: line.color,
+            cap_color: line.cap_color,
+        })
+        .collect();
+    paint_now(&painter, &axes, palette, chart, &ends, &font);
 
     if let Some(pointer) = response.hover_pos() {
         if axes.plot.x_range().contains(pointer.x) {
-            let target = hover_target(&axes, samples, &gaps, now, projection, pointer.x);
-            let tip = paint_hover(&painter, &axes, palette, samples, &fable, target, pointer.x);
+            let main = chart
+                .lines
+                .first()
+                .and_then(|l| l.projection.map(|p| (l.pct, p)));
+            let target = hover_target(&axes, samples, &gaps, chart.now, main, pointer.x);
+            let tip = paint_hover(&painter, &axes, palette, chart, target, pointer.x);
             return response.on_hover_text_at_pointer(tip);
         }
     }
@@ -762,51 +1044,64 @@ pub fn paint_y_axis(painter: &Painter, plot: Rect, palette: &Palette, font: &Fon
     );
 }
 
-/// Hour ticks along the bottom and "reset 3:42p" at the right end; hour
-/// labels that would collide with it or leave the widget are skipped.
-fn paint_time_axis(painter: &Painter, axes: &Axes, palette: &Palette, font: &FontId, left: f32) {
+/// The chart's ticks along the bottom and its end label ("reset 3:42p") at
+/// the right end; tick labels that would collide with it or leave the
+/// widget are skipped.
+fn paint_time_axis(
+    painter: &Painter,
+    axes: &Axes,
+    palette: &Palette,
+    font: &FontId,
+    left: f32,
+    chart: &Chart,
+) {
     let y = axes.plot.bottom() + 3.0;
-    let reset = painter.layout_no_wrap(
-        format!("reset {}", short_time_in(axes.end, &Local)),
-        font.clone(),
-        palette.text_muted,
-    );
-    let reset_left = axes.plot.right() + CAP_MARK + 2.0 - reset.size().x;
+    let right = axes.plot.right() + CAP_MARK + 2.0;
+    let end = chart
+        .end_label
+        .as_ref()
+        .map(|text| painter.layout_no_wrap(text.clone(), font.clone(), palette.text_muted));
+    let end_left = end.as_ref().map_or(right, |g| right - g.size().x);
     let tick = Stroke::new(1.0, palette.border);
-    for (t, label) in hour_ticks_in(axes.start, axes.end, &Local) {
-        let x = axes.x_at(t);
+    for (t, label) in &chart.ticks {
+        let x = axes.x_at(*t);
         painter.vline(x, axes.plot.bottom()..=axes.plot.bottom() + 3.0, tick);
-        let galley = painter.layout_no_wrap(label, font.clone(), palette.text_muted);
+        let galley = painter.layout_no_wrap(label.clone(), font.clone(), palette.text_muted);
         let w = galley.size().x;
         let lx = x - w / 2.0;
-        if lx >= left && lx + w <= reset_left - 6.0 {
+        if lx >= left && lx + w <= end_left - 6.0 {
             painter.galley(pos2(lx, y), galley, palette.text_muted);
         }
     }
-    painter.galley(pos2(reset_left, y), reset, palette.text_muted);
+    if let Some(g) = end {
+        painter.galley(pos2(end_left, y), g, palette.text_muted);
+    }
 }
 
-/// The faint bridge fills (usage and Fable), the usage area per segment
-/// (gradient fill), the Fable layer over its base with a surface-colored
-/// separator on top, then the usage lines and the dotted bridge lines.
-#[allow(clippy::too_many_arguments)]
+/// The faint bridge fills, the main area per segment (gradient fill), the
+/// overlay (the Fable share area with a surface-colored separator on top,
+/// or the Fable line), then the main lines and the dotted bridge lines.
 fn paint_areas(
     painter: &Painter,
     axes: &Axes,
     palette: &Palette,
-    state: Color32,
-    samples: &[WindowSample],
-    fable: &[Option<f64>],
+    chart: &Chart,
     segs: &[Range<usize>],
     gaps: &[Bridge],
 ) {
+    let samples = &chart.points;
+    let state = chart.state;
     let baseline = axes.plot.bottom();
     let top = state.gamma_multiply(AREA_TOP_ALPHA);
     let bottom = state.gamma_multiply(AREA_BASE_ALPHA);
     let fable_fill = palette.fable.gamma_multiply(FABLE_ALPHA);
-    let five = |i: usize| axes.pos(samples[i].t, samples[i].five_hour.unwrap_or(0.0));
+    let share = match &chart.overlay {
+        Overlay::Share(share) => Some(share.as_slice()),
+        _ => None,
+    };
+    let main = |i: usize| axes.pos(samples[i].t, samples[i].value.unwrap_or(0.0));
     for b in gaps {
-        let ends = [five(b.from), five(b.to)];
+        let ends = [main(b.from), main(b.to)];
         let scale = BRIDGE_FILL_SCALE;
         painter.add(area_mesh(
             &ends,
@@ -814,7 +1109,7 @@ fn paint_areas(
             top.gamma_multiply(scale),
             bottom.gamma_multiply(scale),
         ));
-        if let (Some(a), Some(z)) = (fable[b.from], fable[b.to]) {
+        if let Some((Some(a), Some(z))) = share.map(|f| (f[b.from], f[b.to])) {
             let ends = [axes.pos(samples[b.from].t, a), axes.pos(samples[b.to].t, z)];
             let faint = fable_fill.gamma_multiply(scale);
             painter.add(area_mesh(&ends, baseline, faint, faint));
@@ -827,50 +1122,79 @@ fn paint_areas(
         raw.extend(
             samples[seg.clone()]
                 .iter()
-                .filter_map(|s| s.five_hour.map(|v| axes.pos(s.t, v))),
+                .filter_map(|s| s.value.map(|v| axes.pos(s.t, v))),
         );
         let line = thin_columns(&raw);
         painter.add(area_mesh(&line, baseline, top, bottom));
-
-        for run in present_runs(fable, seg.clone()) {
-            raw.clear();
-            raw.extend(run.map(|i| axes.pos(samples[i].t, fable[i].unwrap_or(0.0))));
-            let layer = thin_columns(&raw);
-            if layer.len() >= 2 {
-                painter.add(area_mesh(&layer, baseline, fable_fill, fable_fill));
-                painter.add(Shape::line(layer, Stroke::new(1.0, palette.surface)));
+        if let Some(share) = share {
+            for run in present_runs(share, seg.clone()) {
+                raw.clear();
+                raw.extend(run.map(|i| axes.pos(samples[i].t, share[i].unwrap_or(0.0))));
+                let layer = thin_columns(&raw);
+                if layer.len() >= 2 {
+                    painter.add(area_mesh(&layer, baseline, fable_fill, fable_fill));
+                    painter.add(Shape::line(layer, Stroke::new(1.0, palette.surface)));
+                }
             }
         }
         lines.push(line);
     }
     let dotted = Stroke::new(1.5, state.gamma_multiply(BRIDGE_LINE_ALPHA));
     for b in gaps {
-        for seg in dashes(five(b.from), five(b.to), DOT, DOT_GAP) {
+        for seg in dashes(main(b.from), main(b.to), DOT, DOT_GAP) {
             painter.line_segment(seg, dotted);
         }
     }
     for line in lines {
-        match line[..] {
-            [] => {}
-            // A lone sample between gaps or breaks: a dot, not a line.
-            [p] => {
-                painter.circle_filled(p, LONE_RADIUS, state);
-            }
-            _ => {
-                painter.add(Shape::line(line, PathStroke::new(2.0, state)));
-            }
+        paint_polyline(painter, line, state);
+    }
+    if chart.overlay == Overlay::Line {
+        paint_overlay_line(painter, axes, palette, chart);
+    }
+}
+
+/// The overlay meter as a clay line, with its own breaks and dotted bridges.
+fn paint_overlay_line(painter: &Painter, axes: &Axes, palette: &Palette, chart: &Chart) {
+    let samples = &chart.points;
+    let segs = segments_of(samples, chart.gap_break, Series::Overlay);
+    let gaps = bridges_of(samples, &segs, Series::Overlay);
+    let at = |i: usize| axes.pos(samples[i].t, samples[i].overlay.unwrap_or(0.0));
+    let dotted = Stroke::new(1.5, palette.fable.gamma_multiply(BRIDGE_LINE_ALPHA));
+    for b in &gaps {
+        for seg in dashes(at(b.from), at(b.to), DOT, DOT_GAP) {
+            painter.line_segment(seg, dotted);
+        }
+    }
+    for seg in segs {
+        let raw: Vec<Pos2> = seg.map(at).collect();
+        paint_polyline(painter, thin_columns(&raw), palette.fable);
+    }
+}
+
+/// A solid 2 pt line, or a dot for a lone sample.
+fn paint_polyline(painter: &Painter, line: Vec<Pos2>, color: Color32) {
+    match line[..] {
+        [] => {}
+        // A lone sample between gaps or breaks: a dot, not a line.
+        [p] => {
+            painter.circle_filled(p, LONE_RADIUS, color);
+        }
+        _ => {
+            painter.add(Shape::line(line, PathStroke::new(2.0, color)));
         }
     }
 }
 
-/// What [`paint_now`] draws beyond the marker line.
+/// What [`paint_now`] draws for one meter.
 struct Ends {
     /// The dot's % (eased).
     pct: f64,
-    projection: Projection,
+    projection: Option<Projection>,
     label: Option<EndLabel>,
     /// Share of the projection drawn in so far, 0..=1.
     share: f32,
+    color: Color32,
+    cap_color: Color32,
 }
 
 /// Opacity of the projection's end mark and label for a draw-in `share`:
@@ -879,86 +1203,106 @@ pub fn end_fade(share: f32) -> f32 {
     ((share - 0.7) / 0.3).clamp(0.0, 1.0)
 }
 
-/// The now marker, the dashed projection with its cap ✕ and label or the
-/// "safe" end label, and the dot at the current %.
+/// The text of an end label: "cap 4:10p" (or "cap Mon 10:45a"), "safe",
+/// "at cap".
+pub fn end_label_text<Tz: TimeZone>(label: EndLabel, style: TimeStyle, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    match label {
+        EndLabel::Cap(t) => format!("cap {}", style.short(t, tz)),
+        EndLabel::Safe => "safe".to_owned(),
+        EndLabel::AtCap => "at cap".to_owned(),
+    }
+}
+
+/// The now marker, each meter's dashed projection with its cap ✕ and
+/// label (or "safe" / "at cap"), and the dots at the current %. Labels are
+/// placed in turn, each clear of the ✕ marks and the labels before it.
 fn paint_now(
     painter: &Painter,
     axes: &Axes,
     palette: &Palette,
-    state: Color32,
-    now: DateTime<Utc>,
-    ends: Option<Ends>,
+    chart: &Chart,
+    ends: &[Ends],
     font: &FontId,
 ) {
-    let x = axes.x_at(now);
+    let x = axes.x_at(chart.now);
     painter.vline(
         x,
         axes.plot.y_range(),
         Stroke::new(1.0, palette.text_muted.gamma_multiply(0.6)),
     );
-    let Some(Ends {
-        pct,
-        projection: p,
-        label: kind,
-        share,
-    }) = ends
-    else {
-        return;
-    };
-    let fade = end_fade(share);
-    let from = axes.pos(now, pct);
-    let to = axes.pos(p.end_t, p.end_pct);
-    // The end label ("cap 4:10p" by the ✕, or "safe"), placed off the line
-    // inside the widget; the dash stops short of it if it must.
-    let label = kind.map(|k| match k {
-        EndLabel::Cap(cap) => (
-            format!("cap {}", short_time_in(cap, &Local)),
-            palette.danger,
-            CAP_LABEL_CLEARANCE,
-            CAP_KEEP_OUT,
-        ),
-        EndLabel::Safe => (
-            "safe".to_owned(),
-            palette.good,
-            SAFE_LABEL_CLEARANCE,
-            SAFE_KEEP_OUT,
-        ),
-    });
     let bounds = Rect::from_min_max(
         pos2(axes.plot.left(), painter.clip_rect().top()),
         pos2(painter.clip_rect().right(), axes.plot.bottom()),
     );
-    let placed = label.map(|(text, color, clearance, keep_out)| {
-        let galley = painter.layout_no_wrap(text, font.clone(), color);
-        let rect = place_end_label(from, to, galley.size(), clearance, keep_out, bounds);
-        (galley, rect, color)
-    });
-    let stop = placed
-        .as_ref()
-        .map_or(to, |(_, rect, _)| dash_end(from, to, *rect));
-    paint_dashed(
-        painter,
-        from,
-        from + (stop - from) * share,
-        Stroke::new(1.5, state),
-    );
-
-    if matches!(kind, Some(EndLabel::Cap(_))) && fade > 0.0 {
-        let stroke = Stroke::new(2.0, palette.danger.gamma_multiply(fade));
-        let (a, b) = (vec2(CAP_MARK, CAP_MARK), vec2(CAP_MARK, -CAP_MARK));
-        painter.line_segment([to - a, to + a], stroke);
-        painter.line_segment([to - b, to + b], stroke);
+    let from = |e: &Ends| axes.pos(chart.now, e.pct);
+    let to = |e: &Ends| {
+        e.projection
+            .map_or(from(e), |p| axes.pos(p.end_t, p.end_pct))
+    };
+    // Every ✕ is a keep-out for every label.
+    let marks: Vec<Rect> = ends
+        .iter()
+        .filter(|e| matches!(e.label, Some(EndLabel::Cap(_))))
+        .map(|e| Rect::from_center_size(to(e), Vec2::splat(2.0 * CAP_KEEP_OUT)))
+        .collect();
+    let mut avoid = marks.clone();
+    for e in ends {
+        let (from, to) = (from(e), to(e));
+        let fade = if e.projection.is_some() {
+            end_fade(e.share)
+        } else {
+            1.0
+        };
+        let placed = e.label.map(|kind| {
+            let (color, clearance, keep_out) = match kind {
+                EndLabel::Cap(_) => (e.cap_color, CAP_LABEL_CLEARANCE, CAP_KEEP_OUT),
+                EndLabel::Safe => (palette.good, SAFE_LABEL_CLEARANCE, SAFE_KEEP_OUT),
+                EndLabel::AtCap => (palette.danger, SAFE_LABEL_CLEARANCE, DOT_RADIUS + 1.0),
+            };
+            let text = end_label_text(kind, chart.style, &Local);
+            let galley = painter.layout_no_wrap(text, font.clone(), color);
+            let own: Vec<Rect> = avoid.iter().copied().filter(|r| !r.contains(to)).collect();
+            let rect = place_end_label(from, to, galley.size(), clearance, keep_out, bounds, &own);
+            avoid.push(rect.expand(LABEL_PAD));
+            (galley, rect, color)
+        });
+        if e.projection.is_some() {
+            let stop = placed
+                .as_ref()
+                .map_or(to, |(_, rect, _)| dash_end(from, to, *rect));
+            paint_dashed(
+                painter,
+                from,
+                from + (stop - from) * e.share,
+                Stroke::new(1.5, e.color),
+            );
+        }
+        if matches!(e.label, Some(EndLabel::Cap(_))) && fade > 0.0 {
+            let stroke = Stroke::new(2.0, e.cap_color.gamma_multiply(fade));
+            let (a, b) = (vec2(CAP_MARK, CAP_MARK), vec2(CAP_MARK, -CAP_MARK));
+            painter.line_segment([to - a, to + a], stroke);
+            painter.line_segment([to - b, to + b], stroke);
+        }
+        if let Some((galley, rect, color)) = placed.filter(|_| fade > 0.0) {
+            painter.rect_filled(
+                rect.expand(LABEL_PAD),
+                3.0,
+                palette.surface.gamma_multiply(fade),
+            );
+            painter.galley_with_override_text_color(rect.min, galley, color.gamma_multiply(fade));
+        }
     }
-    if let Some((galley, rect, color)) = placed.filter(|_| fade > 0.0) {
-        painter.rect_filled(
-            rect.expand(LABEL_PAD),
-            3.0,
-            palette.surface.gamma_multiply(fade),
+    for e in ends {
+        painter.circle(
+            from(e),
+            DOT_RADIUS,
+            e.color,
+            Stroke::new(1.5, palette.surface),
         );
-        painter.galley_with_override_text_color(rect.min, galley, color.gamma_multiply(fade));
     }
-
-    painter.circle(from, DOT_RADIUS, state, Stroke::new(1.5, palette.surface));
 }
 
 /// Crosshair for the hover `target` and its tooltip text: a full
@@ -968,29 +1312,47 @@ fn paint_hover(
     painter: &Painter,
     axes: &Axes,
     palette: &Palette,
-    samples: &[WindowSample],
-    fable: &[Option<f64>],
+    chart: &Chart,
     target: HoverTarget,
     pointer_x: f32,
 ) -> String {
+    let samples = &chart.points;
+    let style = chart.style;
+    let time = |t: DateTime<Utc>| style.tip(t, &Local);
     let point = |t: DateTime<Utc>, pct: f64| Some(axes.pos(t, pct));
     let (x, point, tip) = match target {
-        HoverTarget::Projected { t, pct } => (
-            axes.x_at(t),
-            point(t, pct),
-            projected_tip(&fmt_clock_in(t, &Local), pct),
-        ),
+        HoverTarget::Projected { t, pct } => {
+            let overlay = chart.lines.get(1).and_then(|l| {
+                l.projection
+                    .and_then(|p| projected_pct(chart.now, l.pct, &p, t))
+                    .or(Some(l.pct))
+            });
+            let tip = match style {
+                TimeStyle::Clock => projected_tip(&time(t), pct),
+                TimeStyle::Weekday => week_projected_tip(&time(t), pct, overlay),
+            };
+            (axes.x_at(t), point(t, pct), tip)
+        }
         HoverTarget::Sample(i) => {
             let s = &samples[i];
-            let pct = s.five_hour.unwrap_or(0.0);
-            let tip = sample_tip(&fmt_clock_in(s.t, &Local), pct, fable[i]);
+            let pct = s.value.unwrap_or(0.0);
+            let tip = match (&chart.overlay, style) {
+                (Overlay::Share(share), _) => sample_tip(&time(s.t), pct, share[i]),
+                (Overlay::Line, TimeStyle::Weekday) => week_sample_tip(&time(s.t), pct, s.overlay),
+                (_, TimeStyle::Weekday) => week_sample_tip(&time(s.t), pct, None),
+                (_, TimeStyle::Clock) => sample_tip(&time(s.t), pct, None),
+            };
             (axes.x_at(s.t), point(s.t, pct), tip)
         }
         HoverTarget::Gap(b) => {
             let (from, to) = (samples[b.from].t, samples[b.to].t);
-            (pointer_x, None, gap_tip_in(from, to, &Local))
+            let tip = match style {
+                TimeStyle::Clock => gap_tip_in(from, to, &Local),
+                TimeStyle::Weekday => format!("no samples {} – {}", time(from), time(to)),
+            };
+            (pointer_x, None, tip)
         }
-        HoverTarget::Time(t) => (pointer_x, None, fmt_clock_in(t, &Local)),
+        HoverTarget::Time(t) => (pointer_x, None, time(t)),
     };
     let stroke = Stroke::new(1.0, palette.text_muted.gamma_multiply(0.7));
     if let Some(p) = point {
@@ -1024,12 +1386,16 @@ mod tests {
         t0() + Duration::minutes(minutes)
     }
 
-    fn s(m: i64, five: Option<f64>) -> WindowSample {
-        WindowSample {
+    fn s(m: i64, five: Option<f64>) -> Point {
+        Point {
             t: at(m),
-            five_hour: five,
-            fable: None,
+            value: five,
+            overlay: None,
         }
+    }
+
+    fn gap() -> Duration {
+        Duration::minutes(GAP_BREAK_MINUTES)
     }
 
     /// 300 px wide (one px per minute), 100 px tall (one px per %), at (10, 20).
@@ -1089,7 +1455,7 @@ mod tests {
     #[test]
     fn steady_samples_are_one_segment() {
         let samples = [s(0, Some(1.0)), s(5, Some(2.0)), s(10, Some(4.0))];
-        assert_eq!(segments(&samples), vec![0..3]);
+        assert_eq!(segments(&samples, gap()), vec![0..3]);
     }
 
     #[test]
@@ -1101,7 +1467,7 @@ mod tests {
             s(3, Some(3.0)),
             s(4, Some(4.0)),
         ];
-        assert_eq!(segments(&samples), vec![0..2, 3..5]);
+        assert_eq!(segments(&samples, gap()), vec![0..2, 3..5]);
     }
 
     #[test]
@@ -1111,7 +1477,7 @@ mod tests {
             s(10, Some(2.0)), // exactly 10 min: still joined
             s(21, Some(3.0)), // 11 min: break
         ];
-        assert_eq!(segments(&samples), vec![0..2, 2..3]);
+        assert_eq!(segments(&samples, gap()), vec![0..2, 2..3]);
     }
 
     #[test]
@@ -1122,14 +1488,14 @@ mod tests {
             s(2, Some(29.0)), // drop of 6: reset
             s(3, Some(30.0)),
         ];
-        assert_eq!(segments(&samples), vec![0..2, 2..4]);
+        assert_eq!(segments(&samples, gap()), vec![0..2, 2..4]);
     }
 
     #[test]
     fn single_and_no_samples() {
-        assert!(segments(&[]).is_empty());
-        assert!(segments(&[s(0, None)]).is_empty());
-        assert_eq!(segments(&[s(0, Some(3.0))]), vec![0..1]);
+        assert!(segments(&[], gap()).is_empty());
+        assert!(segments(&[s(0, None)], gap()).is_empty());
+        assert_eq!(segments(&[s(0, Some(3.0))], gap()), vec![0..1]);
     }
 
     #[test]
@@ -1149,7 +1515,7 @@ mod tests {
             s(35, Some(5.0)),
             s(80, Some(6.0)), // 45 min gap to a lone sample: bridged
         ];
-        let segs = segments(&samples);
+        let segs = segments(&samples, gap());
         assert_eq!(segs, vec![0..2, 2..4, 4..5]);
         assert_eq!(
             bridges(&samples, &segs),
@@ -1168,7 +1534,7 @@ mod tests {
             s(34, Some(5.0)),
             s(60, Some(1.0)), // gap with a drop of exactly 4: bridged
         ];
-        let segs = segments(&samples);
+        let segs = segments(&samples, gap());
         assert_eq!(segs, vec![0..1, 1..3, 4..6, 6..7]);
         assert_eq!(bridges(&samples, &segs), vec![Bridge { from: 5, to: 6 }]);
     }
@@ -1177,7 +1543,7 @@ mod tests {
     fn bridges_need_two_segments() {
         assert!(bridges(&[], &[]).is_empty());
         let samples = [s(0, Some(1.0)), s(1, Some(2.0))];
-        assert!(bridges(&samples, &segments(&samples)).is_empty());
+        assert!(bridges(&samples, &segments(&samples, gap())).is_empty());
     }
 
     // --- thinning -----------------------------------------------------------
@@ -1424,7 +1790,15 @@ mod tests {
     #[test]
     fn end_label_above_left_of_a_rising_line() {
         let bounds = rect(0.0, 0.0, 200.0, 120.0);
-        let got = place_end_label(pos2(0.0, 100.0), pos2(100.0, 40.0), LABEL, 4.0, 2.0, bounds);
+        let got = place_end_label(
+            pos2(0.0, 100.0),
+            pos2(100.0, 40.0),
+            LABEL,
+            4.0,
+            2.0,
+            bounds,
+            &[],
+        );
         assert_eq!(got, rect(70.0, 26.0, 100.0, 36.0));
     }
 
@@ -1432,7 +1806,7 @@ mod tests {
     fn end_label_above_right_when_the_top_is_tight() {
         let bounds = rect(0.0, 0.0, 200.0, 120.0);
         let (from, end) = (pos2(0.0, 100.0), pos2(100.0, 8.0));
-        let got = place_end_label(from, end, LABEL, 4.0, 2.0, bounds);
+        let got = place_end_label(from, end, LABEL, 4.0, 2.0, bounds, &[]);
         assert_eq!(got, rect(104.0, 0.0, 134.0, 10.0));
         assert_eq!(segment_entry(from, end, got.expand(LABEL_PAD)), None);
     }
@@ -1441,7 +1815,7 @@ mod tests {
     fn end_label_flat_line_sits_above_it() {
         let bounds = rect(0.0, 0.0, 102.0, 120.0);
         let (from, end) = (pos2(50.0, 60.0), pos2(100.0, 60.0));
-        let got = place_end_label(from, end, LABEL, 4.0, 2.0, bounds);
+        let got = place_end_label(from, end, LABEL, 4.0, 2.0, bounds, &[]);
         assert_eq!(got, rect(70.0, 46.0, 100.0, 56.0));
     }
 
@@ -1451,7 +1825,15 @@ mod tests {
         let size = vec2(60.0, 14.0);
         let dx = (200.0_f32).min((bounds.bottom() - 2.0 - end.y) / slope);
         let from = pos2(end.x - dx, end.y + slope * dx);
-        let got = place_end_label(from, end, size, CAP_LABEL_CLEARANCE, CAP_KEEP_OUT, bounds);
+        let got = place_end_label(
+            from,
+            end,
+            size,
+            CAP_LABEL_CLEARANCE,
+            CAP_KEEP_OUT,
+            bounds,
+            &[],
+        );
         let case = format!("end {end:?} slope {slope} -> {got:?}");
         assert!(bounds.contains_rect(got), "outside: {case}");
         let keep = Rect::from_center_size(end, Vec2::splat(2.0 * CAP_KEEP_OUT));
@@ -1492,7 +1874,7 @@ mod tests {
         // mark, and the dash stops short of the label.
         let bounds = rect(0.0, 0.0, 70.0, 40.0);
         let (from, end) = (pos2(0.0, 30.0), pos2(64.0, 11.5));
-        let got = place_end_label(from, end, vec2(60.0, 14.0), 8.0, 5.0, bounds);
+        let got = place_end_label(from, end, vec2(60.0, 14.0), 8.0, 5.0, bounds, &[]);
         let keep = Rect::from_center_size(end, Vec2::splat(10.0));
         assert!(!overlaps(got.expand(LABEL_PAD), keep), "{got:?}");
         let stop = dash_end(from, end, got);
@@ -1562,7 +1944,7 @@ mod tests {
         // One px per minute.
         let a = axes();
         let samples = [s(0, Some(1.0)), s(10, Some(2.0)), s(60, Some(5.0))];
-        let gaps = bridges(&samples, &segments(&samples));
+        let gaps = bridges(&samples, &segments(&samples, gap()));
         assert_eq!(gaps, vec![Bridge { from: 1, to: 2 }]);
         let now = at(100);
         let x = |m: f32| a.plot.left() + m;
@@ -1633,6 +2015,137 @@ mod tests {
             cap_at: None,
         };
         assert_eq!(projected_pct(now, 40.0, &zero, at(150)), None);
+    }
+
+    #[test]
+    fn day_ticks_at_local_midnights() {
+        let t = |d, h| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        // UTC: Mon 12 23:00 → Mon 19 23:00 has six midnights, Tue..Sun.
+        let ticks = day_ticks_in(t(12, 23), t(19, 23), &Utc);
+        let labels: Vec<&str> = ticks.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(labels, ["Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon"]);
+        assert_eq!(ticks[0].0, t(13, 0));
+        // A window starting at midnight includes it.
+        assert_eq!(
+            day_ticks_in(t(13, 0), t(13, 5), &Utc),
+            [(t(13, 0), "Tue".into())]
+        );
+        // In UTC-4, local midnight is 04:00 UTC.
+        let edt = FixedOffset::west_opt(4 * 3600).unwrap();
+        let ticks = day_ticks_in(t(12, 0), t(13, 12), &edt);
+        assert_eq!(ticks, [(t(12, 4), "Mon".into()), (t(13, 4), "Tue".into())]);
+        assert!(day_ticks_in(t(13, 1), t(13, 23), &Utc).is_empty());
+        assert!(day_ticks_in(t(14, 0), t(13, 0), &Utc).is_empty());
+    }
+
+    #[test]
+    fn week_span_and_end_labels() {
+        let t = |d, h| Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap();
+        assert_eq!(
+            week_span_in(t(6, 23), t(13, 23), true, &Utc).as_deref(),
+            Some("Tue 11p – Tue 11p")
+        );
+        assert_eq!(week_span_in(t(6, 23), t(13, 23), false, &Utc), None);
+        let cap = EndLabel::Cap(Utc.with_ymd_and_hms(2026, 10, 12, 10, 45, 0).unwrap());
+        assert_eq!(end_label_text(cap, TimeStyle::Clock, &Utc), "cap 10:45a");
+        assert_eq!(
+            end_label_text(cap, TimeStyle::Weekday, &Utc),
+            "cap Mon 10:45a"
+        );
+        assert_eq!(
+            end_label_text(EndLabel::Safe, TimeStyle::Weekday, &Utc),
+            "safe"
+        );
+        assert_eq!(
+            end_label_text(EndLabel::AtCap, TimeStyle::Clock, &Utc),
+            "at cap"
+        );
+    }
+
+    #[test]
+    fn week_tips() {
+        assert_eq!(
+            week_sample_tip("Sat 3:12p", 41.2, Some(52.0)),
+            "Sat 3:12p · 7d all 41% · Fable 52%"
+        );
+        assert_eq!(
+            week_sample_tip("Sat 3:12p", 41.2, None),
+            "Sat 3:12p · 7d all 41%"
+        );
+        assert_eq!(
+            week_projected_tip("Mon 3p", 71.4, Some(90.0)),
+            "Mon 3p · projected 7d all 71% · Fable 90%"
+        );
+        assert_eq!(
+            week_projected_tip("Mon 3p", 71.4, None),
+            "Mon 3p · projected 7d all 71%"
+        );
+    }
+
+    #[test]
+    fn overlay_series_segments_on_its_own_values() {
+        let p = |m: i64, v: Option<f64>, o: Option<f64>| Point {
+            t: at(m),
+            value: v,
+            overlay: o,
+        };
+        let samples = [
+            p(0, Some(10.0), Some(20.0)),
+            p(30, Some(11.0), None),
+            p(60, Some(12.0), Some(22.0)),
+            p(200, Some(13.0), Some(23.0)),
+        ];
+        let hour = Duration::minutes(WEEK_GAP_BREAK_MINUTES);
+        assert_eq!(segments(&samples, hour), vec![0..3, 3..4]);
+        let o = segments_of(&samples, hour, Series::Overlay);
+        assert_eq!(o, vec![0..1, 2..3, 3..4]);
+        // Only the time gap is bridged; the missing value is not.
+        assert_eq!(
+            bridges_of(&samples, &o, Series::Overlay),
+            vec![Bridge { from: 2, to: 3 }]
+        );
+    }
+
+    #[test]
+    fn points_from_window_and_week_samples() {
+        let w = WindowSample {
+            t: at(0),
+            five_hour: Some(1.0),
+            fable: Some(2.0),
+        };
+        assert_eq!(
+            Point::from(&w),
+            Point {
+                t: at(0),
+                value: Some(1.0),
+                overlay: Some(2.0)
+            }
+        );
+        let k = WeekSample {
+            t: at(0),
+            seven_day: Some(3.0),
+            fable: None,
+        };
+        assert_eq!(
+            Point::from(&k),
+            Point {
+                t: at(0),
+                value: Some(3.0),
+                overlay: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_second_label_keeps_clear_of_the_first() {
+        let bounds = rect(0.0, 0.0, 200.0, 120.0);
+        let (from, end) = (pos2(0.0, 100.0), pos2(100.0, 40.0));
+        let first = place_end_label(from, end, LABEL, 4.0, 2.0, bounds, &[]);
+        // The same spot is taken: the next label goes elsewhere.
+        let taken = [first.expand(LABEL_PAD)];
+        let second = place_end_label(from, end, LABEL, 4.0, 2.0, bounds, &taken);
+        assert_ne!(second, first);
+        assert!(!overlaps(second.expand(LABEL_PAD), taken[0]));
     }
 
     #[test]
