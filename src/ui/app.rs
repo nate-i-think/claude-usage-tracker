@@ -135,6 +135,8 @@ pub struct App {
     hidden: bool,
     /// Quit was chosen: the close that follows is not turned into a hide.
     quitting: bool,
+    /// When a tray toggle last acted (see [`tray::toggle_accepted`]).
+    last_toggle: Option<Instant>,
     /// Threshold alerts, checked once per poll and sent to the notifier
     /// thread.
     alerts: AlertHook,
@@ -202,6 +204,7 @@ impl App {
             tray_failed: false,
             hidden: false,
             quitting: false,
+            last_toggle: None,
             alerts: AlertHook::new(toasts),
             toast_clicks,
         };
@@ -407,6 +410,11 @@ impl App {
     fn tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
         match action {
             TrayAction::ToggleVisible => {
+                let now = Instant::now();
+                if !tray::toggle_accepted(self.last_toggle, now, tray::double_click_time()) {
+                    return;
+                }
+                self.last_toggle = Some(now);
                 let minimized = ctx.input(|i| i.viewport().minimized) == Some(true);
                 if self.hidden || minimized {
                     self.show(ctx);

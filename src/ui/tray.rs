@@ -11,6 +11,7 @@
 use std::fmt::Display;
 #[cfg(not(windows))]
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use eframe::egui::Color32;
@@ -50,6 +51,28 @@ pub fn menu_action(id: &str) -> Option<TrayAction> {
         MENU_QUIT => Some(TrayAction::Quit),
         _ => None,
     }
+}
+
+/// Whether a [`TrayAction::ToggleVisible`] at `now` should act, given the
+/// last one that did. A double click on the icon reports two left-button
+/// releases (down, up, double-click, up); the second, inside the system
+/// double-click time `window`, is dropped so the window does not show and
+/// hide again at once.
+pub fn toggle_accepted(last: Option<Instant>, now: Instant, window: Duration) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= window)
+}
+
+/// The system double-click time (Windows), else 500 ms.
+pub fn double_click_time() -> Duration {
+    #[cfg(windows)]
+    {
+        // SAFETY: plain query, no pointers.
+        let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+        if ms > 0 {
+            return Duration::from_millis(ms.into());
+        }
+    }
+    Duration::from_millis(500)
 }
 
 /// What the window close button (or Alt+F4) does.
@@ -321,6 +344,8 @@ mod native {
 
     /// The action for a click on the icon: only a left button release
     /// (right click opens the menu; moves, enters and leaves are dropped).
+    /// A double click yields two releases; the app drops the second
+    /// ([`super::toggle_accepted`]).
     pub fn click_action(event: &TrayIconEvent) -> Option<TrayAction> {
         match event {
             TrayIconEvent::Click {
@@ -544,6 +569,30 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn toggle_debounces_the_double_clicks_second_release() {
+        let w = Duration::from_millis(500);
+        let t = Instant::now();
+        assert!(toggle_accepted(None, t, w));
+        // Second release of a double click: dropped.
+        assert!(!toggle_accepted(Some(t), t + Duration::from_millis(180), w));
+        assert!(!toggle_accepted(Some(t), t + Duration::from_millis(499), w));
+        // A separate click later: acts.
+        assert!(toggle_accepted(Some(t), t + w, w));
+        assert!(toggle_accepted(Some(t), t + Duration::from_secs(3), w));
+        // A clock oddity (now before last) never panics; it is dropped.
+        assert!(!toggle_accepted(Some(t + w), t, w));
+    }
+
+    #[test]
+    fn double_click_time_is_sane() {
+        let d = double_click_time();
+        assert!(
+            d >= Duration::from_millis(100) && d <= Duration::from_secs(5),
+            "{d:?}"
+        );
     }
 
     #[test]
