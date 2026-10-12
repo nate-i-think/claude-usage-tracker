@@ -16,8 +16,8 @@
 //!   `surface`, so text on cards should not use them.
 
 use eframe::egui::{
-    self, epaint::Shadow, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
-    Frame, Margin, Response, Stroke, Style, TextStyle, Theme, Ui, Visuals,
+    self, epaint::Shadow, pos2, vec2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily,
+    FontId, Frame, Margin, Response, Sense, Stroke, Style, TextStyle, Theme, Ui, Visuals,
 };
 use egui::epaint::text::{FontTweak, VariationCoords};
 
@@ -290,6 +290,37 @@ pub fn card(palette: &Palette) -> Frame {
         })
 }
 
+/// Least space between a chart title and its subtitle.
+pub const CHART_TITLE_GAP: f32 = 12.0;
+
+/// Whether a subtitle `sub_w` wide fits right-aligned beside a title
+/// `title_w` wide in a row `width` wide; when it doesn't, it is dropped.
+pub fn subtitle_fits(width: f32, title_w: f32, sub_w: f32) -> bool {
+    title_w + CHART_TITLE_GAP + sub_w <= width
+}
+
+/// A chart's title row, the one style every chart card uses: the title at
+/// the left in semibold body text in the text color, and an optional
+/// `subtitle` right-aligned in small muted text (dropped when the row is
+/// too narrow for both).
+pub fn chart_title(ui: &mut Ui, palette: &Palette, title: &str, subtitle: Option<&str>) {
+    let title_font = semibold(TextStyle::Body.resolve(ui.style()).size);
+    let small = TextStyle::Small.resolve(ui.style());
+    let painter = ui.painter();
+    let title = painter.layout_no_wrap(title.to_owned(), title_font, palette.text);
+    let sub = subtitle.map(|s| painter.layout_no_wrap(s.to_owned(), small, palette.text_muted));
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(width, title.size().y), Sense::hover());
+    let title_w = title.size().x;
+    let painter = ui.painter_at(rect);
+    painter.galley(rect.left_top(), title, palette.text);
+    if let Some(sub) = sub.filter(|g| subtitle_fits(width, title_w, g.size().x)) {
+        let size = sub.size();
+        let pos = pos2(rect.right() - size.x, rect.center().y - size.y / 2.0);
+        painter.galley(pos, sub, palette.text_muted);
+    }
+}
+
 /// Write `palette` into `style`: visuals, spacing and text styles.
 pub fn style_with(style: &mut Style, p: &Palette) {
     style.visuals = visuals(p);
@@ -411,6 +442,14 @@ mod tests {
 
     const TEXT: f64 = 4.5;
     const GRAPHIC: f64 = 3.0;
+
+    #[test]
+    fn subtitle_dropped_when_the_row_is_too_narrow() {
+        assert!(subtitle_fits(300.0, 100.0, 80.0));
+        assert!(subtitle_fits(100.0 + CHART_TITLE_GAP + 80.0, 100.0, 80.0));
+        assert!(!subtitle_fits(100.0 + CHART_TITLE_GAP + 79.9, 100.0, 80.0));
+        assert!(!subtitle_fits(50.0, 100.0, 0.0));
+    }
 
     fn assert_contrast(p: &Palette, name: &str, fg: Color32, bg_name: &str, bg: Color32, min: f64) {
         let ratio = contrast(fg, bg);

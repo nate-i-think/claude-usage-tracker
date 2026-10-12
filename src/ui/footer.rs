@@ -1,8 +1,7 @@
-//! The footer strip under the hero timeline: the 7-day sparkline, the
-//! 5-hour burn summary, and the extra-usage mini gauge, packed into one row
-//! that wraps when narrow.
+//! The footer strip under the charts: the 5-hour burn summary and the
+//! extra-usage mini gauge, packed into one row that wraps when narrow.
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use eframe::egui::{vec2, Align, Id, Layout, Rect, Sense, Ui};
 
 use crate::analytics::{self, BurnLine, Eta, Level};
@@ -11,7 +10,7 @@ use crate::poller::Dashboard;
 
 use super::layout::{self, GAP};
 use super::theme::Palette;
-use super::{digits, layout_job, motion, rows, sparkline, Run, Tone};
+use super::{digits, layout_job, motion, rows, Run, Tone};
 
 /// Width of the extra-usage gauge's bar.
 const GAUGE_W: f32 = 48.0;
@@ -23,17 +22,14 @@ const CAPTION_GAP: f32 = 6.0;
 /// The strip's items, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FooterItem {
-    Sparkline,
     Burn,
     Extra,
 }
 
-/// Which items show: the sparkline once there is daily history, the burn
-/// summary always, the extra gauge when analytics says the block is
-/// visible.
-pub fn footer_items(has_daily: bool, extra_visible: bool) -> Vec<FooterItem> {
+/// Which items show: the burn summary always, the extra gauge when
+/// analytics says the block is visible.
+pub fn footer_items(extra_visible: bool) -> Vec<FooterItem> {
     [
-        has_daily.then_some(FooterItem::Sparkline),
         Some(FooterItem::Burn),
         extra_visible.then_some(FooterItem::Extra),
     ]
@@ -102,8 +98,7 @@ pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     let palette = Palette::for_visuals(ui.visuals());
     let snap = &d.snapshot;
     let extra = analytics::visible_extra(snap);
-    let items = footer_items(!d.daily_history.is_empty(), extra.is_some());
-    let bars = sparkline::day_bars(&d.daily_history, &d.fable_daily);
+    let items = footer_items(extra.is_some());
     let burn = analytics::burn_line(
         &d.history,
         snap.five_hour_pct(),
@@ -121,7 +116,6 @@ pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     let gauge = extra.map(extra_gauge);
 
     // Measure every item first so the strip can pack them.
-    let spark_caption = caption("7d");
     let extra_caption = caption("extra");
     let gauge_text = gauge.as_ref().map(|g| {
         let body = eframe::egui::TextStyle::Body.resolve(ui.style());
@@ -134,13 +128,10 @@ pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
         // The burn summary wraps rather than run past a narrow row.
         burn_job.wrap.max_width = available;
         let burn_galley = painter.layout_job(burn_job);
-        let row_h = burn_galley.size().y.max(sparkline::HEIGHT);
+        let row_h = burn_galley.size().y;
         let widths: Vec<f32> = items
             .iter()
             .map(|item| match item {
-                FooterItem::Sparkline => {
-                    spark_caption.size().x + CAPTION_GAP + sparkline::width(bars.len())
-                }
                 FooterItem::Burn => burn_galley.size().x,
                 FooterItem::Extra => {
                     let text_w = gauge_text.as_ref().map_or(0.0, |(_, w)| *w);
@@ -164,18 +155,6 @@ pub fn show_footer(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = CAPTION_GAP;
                                 match item {
-                                    FooterItem::Sparkline => {
-                                        centered_galley(
-                                            ui,
-                                            spark_caption.clone(),
-                                            palette.text_muted,
-                                        );
-                                        sparkline::show_sparkline(
-                                            ui,
-                                            &bars,
-                                            Local::now().date_naive(),
-                                        );
-                                    }
                                     FooterItem::Burn => {
                                         centered_galley(ui, burn_galley.clone(), palette.text)
                                             .on_hover_text(burn_hover(burn.as_ref()));
@@ -259,10 +238,8 @@ mod tests {
     #[test]
     fn items_shown() {
         use FooterItem::*;
-        assert_eq!(footer_items(true, true), vec![Sparkline, Burn, Extra]);
-        assert_eq!(footer_items(false, true), vec![Burn, Extra]);
-        assert_eq!(footer_items(true, false), vec![Sparkline, Burn]);
-        assert_eq!(footer_items(false, false), vec![Burn]);
+        assert_eq!(footer_items(true), vec![Burn, Extra]);
+        assert_eq!(footer_items(false), vec![Burn]);
     }
 
     #[test]

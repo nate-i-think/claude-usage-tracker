@@ -1,6 +1,7 @@
 //! Layout rules shared by the dashboard sections: outer padding, gaps, the
-//! capped and centered content column, greedy row packing for things that
-//! wrap (stat chips, footer items), and the right-then-left row helper.
+//! capped and centered content column, the charts' side-by-side split,
+//! greedy row packing for things that wrap (stat chips, footer items), and
+//! the right-then-left row helper.
 
 use eframe::egui::{Align, Layout, Ui};
 
@@ -9,7 +10,13 @@ pub const OUTER_PAD: i8 = 12;
 /// Vertical gap between sections and horizontal gap between packed items.
 pub const GAP: f32 = 8.0;
 /// Content never grows wider than this; extra width becomes side margins.
-pub const MAX_CONTENT_WIDTH: f32 = 720.0;
+/// Wide enough for the two charts side by side.
+pub const MAX_CONTENT_WIDTH: f32 = 1000.0;
+/// From this content width up, the timeline and the 7-day chart sit side
+/// by side; narrower, they stack (timeline first).
+pub const CHARTS_SIDE_BY_SIDE_MIN: f32 = 640.0;
+/// The timeline's share of the row when the charts sit side by side.
+const TIMELINE_SHARE: f32 = 0.62;
 
 /// Width of the content column for `available` width.
 pub fn content_width(available: f32) -> f32 {
@@ -19,6 +26,16 @@ pub fn content_width(available: f32) -> f32 {
 /// Left margin that centers the content column in `available` width.
 pub fn centered_inset(available: f32) -> f32 {
     ((available - content_width(available)) / 2.0).max(0.0)
+}
+
+/// The widths of the timeline and the 7-day chart side by side in a row
+/// `width` wide with a [`GAP`] between them, or `None` when they stack.
+pub fn chart_widths(width: f32) -> Option<(f32, f32)> {
+    if width < CHARTS_SIDE_BY_SIDE_MIN {
+        return None;
+    }
+    let timeline = ((width - GAP) * TIMELINE_SHARE).round();
+    Some((timeline, width - GAP - timeline))
 }
 
 /// Greedy row packing: how many of the items (in order, with these widths)
@@ -72,9 +89,22 @@ mod tests {
         assert_eq!(content_width(400.0), 400.0);
         assert_eq!(centered_inset(400.0), 0.0);
         assert_eq!(content_width(MAX_CONTENT_WIDTH), MAX_CONTENT_WIDTH);
-        assert_eq!(content_width(1000.0), MAX_CONTENT_WIDTH);
-        assert_eq!(centered_inset(1000.0), 140.0);
+        assert_eq!(content_width(1400.0), MAX_CONTENT_WIDTH);
+        assert_eq!(centered_inset(1400.0), 200.0);
         assert_eq!(content_width(-5.0), 0.0);
+    }
+
+    #[test]
+    fn charts_stack_when_narrow() {
+        assert_eq!(chart_widths(396.0), None);
+        assert_eq!(chart_widths(CHARTS_SIDE_BY_SIDE_MIN - 0.5), None);
+        let (a, b) = chart_widths(CHARTS_SIDE_BY_SIDE_MIN).unwrap();
+        assert_eq!(a + GAP + b, CHARTS_SIDE_BY_SIDE_MIN);
+        // The timeline takes about 62%.
+        let (a, b) = chart_widths(1000.0).unwrap();
+        assert_eq!((a, b), (615.0, 377.0));
+        // The column cap leaves room for both.
+        assert!(chart_widths(MAX_CONTENT_WIDTH).is_some());
     }
 
     #[test]

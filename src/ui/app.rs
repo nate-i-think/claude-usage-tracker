@@ -11,7 +11,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use eframe::egui::{
     self, style::ScrollStyle, Align, CentralPanel, Frame, Margin, RichText, ScrollArea, Ui,
 };
@@ -31,7 +31,7 @@ use super::tray::{self, Tray, TrayAction};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
 
 mod tray_glue;
-use super::{chips, details, footer, motion, theme, timeline};
+use super::{chips, details, footer, motion, theme, timeline, week};
 
 /// Key eframe stores egui's memory (including the theme preference) under
 /// (private `STORAGE_EGUI_MEMORY_KEY` in eframe's native/epi_integration.rs).
@@ -511,17 +511,35 @@ fn icon_button(ui: &mut Ui, selected: bool, enabled: bool, icon: &str) -> egui::
     ui.add_enabled(enabled, button)
 }
 
-/// The dashboard body for one successful poll: hero timeline, footer
-/// strip, Details.
+/// The dashboard body for one successful poll: the charts, footer strip,
+/// Details.
 fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
     let now = Utc::now();
-    let palette = theme::Palette::for_visuals(ui.visuals());
-    theme::card(palette).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        timeline::show_timeline(ui, d, now, palette, timeline::FULL_HEIGHT);
-    });
+    charts(ui, d, now);
     footer::show_footer(ui, d, now);
     details::show_details(ui, d, settings, now);
+}
+
+/// The hero timeline and the "Last 7 days" chart, each on its titled card:
+/// side by side when the column is wide enough (see
+/// [`layout::chart_widths`]), else stacked with the timeline first. Both
+/// charts are [`timeline::FULL_HEIGHT`] tall, so the cards match.
+fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
+    let palette = theme::Palette::for_visuals(ui.visuals());
+    let height = timeline::FULL_HEIGHT;
+    let timeline_card = |ui: &mut Ui| timeline::show_timeline_card(ui, d, now, palette, height);
+    let week_card = |ui: &mut Ui| week::show_week_card(ui, d, palette, height);
+    let Some((left, right)) = layout::chart_widths(ui.available_width()) else {
+        timeline_card(ui);
+        week_card(ui);
+        return;
+    };
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        let column = egui::Layout::top_down(egui::Align::Min);
+        ui.allocate_ui_with_layout(egui::vec2(left, 0.0), column, timeline_card);
+        ui.allocate_ui_with_layout(egui::vec2(right, 0.0), column, week_card);
+    });
 }
 
 /// Lay `add` out in the content column: at most
