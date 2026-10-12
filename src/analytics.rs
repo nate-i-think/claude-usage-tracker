@@ -10,7 +10,7 @@
 //! deterministic. Outputs are structured (levels, numbers, plain strings
 //! without markup); the GUI and the CLI report render them.
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::model::{ExtraUsage, Snapshot, UsageWindow};
 
@@ -40,9 +40,6 @@ pub const BURN_WINDOW_MINUTES: i64 = 15;
 /// In-memory history length; holds 15min of samples even at 5s polls.
 pub const HISTORY_LEN: usize = 240;
 
-/// Bar-chart rows; minor ticks (25/50/75/100%) land on 4/8/12/16.
-pub const CHART_HEIGHT: usize = 16;
-
 /// Claude coral/orange (#d97757) for the Fable overlay, as RGB bytes.
 pub const FABLE_ORANGE: [u8; 3] = [0xd9, 0x77, 0x57];
 
@@ -57,13 +54,6 @@ pub const FABLE_ORANGE: [u8; 3] = [0xd9, 0x77, 0x57];
 // (during a pure-Fable burst) if your plan changes.
 /// Weekly-Fable-% to 5-hour-budget-% scale for the 5-hour chart's orange floor.
 pub const FABLE_WEEKLY_TO_5H_RATIO: f64 = 5.9;
-
-// On the 7-day chart the bars are 7-day-*all* utilization. Fable% is a % of the
-// Fable cap, which is ~50% of the 7-day-all cap, so Fable's share of a 7-day-all
-// bar is fable% × this. (Without it, Fable is drawn 2× too tall — it looked like
-// a whole bar when it should be a slice.)
-/// Fable-cap-% to 7-day-all-% scale for the 7-day chart's orange floor.
-pub const FABLE_TO_WEEKLY_ALL_RATIO: f64 = 0.5;
 
 /// Windows pinned to the dashboard even at 0%, in their row order. The
 /// remaining windows follow in snapshot order.
@@ -394,34 +384,6 @@ pub fn fable_5h_ceilings<T>(fable_buckets: &[(T, Option<f64>)], ratio: f64) -> V
         .collect()
 }
 
-/// Per-day orange ceilings (y-axis %) for the 7-day chart: each day's Fable%
-/// converted from the Fable cap to the 7-day-all cap via `ratio`. No-data
-/// days contribute 0 (no orange), so every entry is `Some`. Clipping to each
-/// bar happens downstream.
-pub fn fable_7d_ceilings<T>(fable_daily: &[(T, Option<f64>)], ratio: f64) -> Vec<Option<f64>> {
-    fable_daily
-        .iter()
-        .map(|&(_, v)| Some(ratio * v.unwrap_or(0.0)))
-        .collect()
-}
-
-/// How many bottom chart rows fall within the orange Fable floor.
-///
-/// `ceiling` is a y-axis percentage (0–100); returns the count of the lowest
-/// rows to paint orange, capped at the chart height. `None`, 0 or negative
-/// gives 0. Any positive ceiling paints at least one row, so nonzero Fable
-/// usage stays visible even when the floor would round down to zero rows.
-/// Rounds half to even, like Python's `round`.
-pub fn orange_rows(ceiling: Option<f64>, height: usize) -> usize {
-    let Some(ceiling) = ceiling.filter(|c| *c > 0.0) else {
-        return 0;
-    };
-    // Guarantee at least one visible orange block for any nonzero Fable usage,
-    // even when the floor would otherwise round down to zero rows.
-    let rows = (ceiling * height as f64 / 100.0).round_ties_even() as usize;
-    rows.min(height).max(1)
-}
-
 // --- Dashboard rows ---------------------------------------------------------
 
 /// Whether a window gets a summary row: always with `show_all`; otherwise
@@ -479,13 +441,6 @@ pub fn extra_disabled_reason(e: &ExtraUsage) -> Option<String> {
         .filter(|r| !r.is_empty())
         .unwrap_or("off");
     Some(reason.replace('_', " "))
-}
-
-// --- Bar-chart labels ---------------------------------------------------------
-
-/// 7-day chart label for a (local calendar) day: the weekday ("%a").
-pub fn day_label(d: NaiveDate) -> String {
-    d.format("%a").to_string()
 }
 
 #[cfg(test)]
@@ -558,10 +513,8 @@ mod tests {
     fn constants_match_python() {
         assert_eq!(BURN_WINDOW_MINUTES, 15);
         assert_eq!(HISTORY_LEN, 240);
-        assert_eq!(CHART_HEIGHT, 16);
         assert_eq!(FABLE_ORANGE, [217, 119, 87]); // #d97757, "217;119;87" truecolor
         assert_eq!(FABLE_WEEKLY_TO_5H_RATIO, 5.9);
-        assert_eq!(FABLE_TO_WEEKLY_ALL_RATIO, 0.5);
         assert_eq!(ALWAYS_SHOWN_LABELS, ["5-hour", "7-day all", "Fable"]);
     }
 
@@ -1072,32 +1025,6 @@ mod tests {
     // --- Orange Fable floor on charts -----------------------------------------
 
     #[test]
-    fn orange_rows_math() {
-        assert_eq!(orange_rows(Some(25.0), 16), 4); // bottom 25% of 16 rows
-        assert_eq!(orange_rows(Some(0.0), 16), 0);
-        assert_eq!(orange_rows(None, 16), 0);
-        assert_eq!(orange_rows(Some(-3.0), 16), 0);
-    }
-
-    #[test]
-    fn orange_rows_at_least_one_when_nonzero() {
-        // Any nonzero Fable usage must show at least one orange block, even if the
-        // floor would otherwise round down to zero rows (e.g. Fable 6% -> 3% floor).
-        assert_eq!(orange_rows(Some(3.0), 16), 1);
-        assert_eq!(orange_rows(Some(0.4), 16), 1);
-    }
-
-    #[test]
-    fn orange_rows_caps_at_height_and_rounds_half_even() {
-        assert_eq!(orange_rows(Some(100.0), 16), 16);
-        assert_eq!(orange_rows(Some(250.0), 16), 16);
-        assert_eq!(orange_rows(Some(50.0), 8), 4);
-        // Python round(): 2.5 -> 2, 3.5 -> 4.
-        assert_eq!(orange_rows(Some(15.625), 16), 2);
-        assert_eq!(orange_rows(Some(21.875), 16), 4);
-    }
-
-    #[test]
     fn fable_5h_ceilings_scale_change_since_window_start() {
         // Fable is a WEEKLY metric; the 5h chart should show only the rise since the
         // window start, scaled by R (weekly cap / 5h cap) to reach 5h-budget terms.
@@ -1137,22 +1064,6 @@ mod tests {
             vec![None, Some(0.0), None, Some(5.9)]
         );
     }
-
-    #[test]
-    fn fable_7d_ceilings_scale_by_weekly_cap_fraction() {
-        // fable% is a % of the Fable cap, which is only ~50% of the 7-day-all cap, so
-        // its share of the 7-day-all bar is fable% x 0.5 (None days -> 0, no orange).
-        let day = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
-        let daily = [(day, Some(10.0)), (day, None), (day, Some(4.0))];
-        assert_eq!(
-            fable_7d_ceilings(&daily, 0.5),
-            vec![Some(5.0), Some(0.0), Some(2.0)]
-        );
-        let empty: [(NaiveDate, Option<f64>); 0] = [];
-        assert!(fable_7d_ceilings(&empty, 0.5).is_empty());
-    }
-
-    // --- Window rows ----------------------------------------------------------------
 
     #[test]
     fn fable_row_pinned_even_at_zero_percent() {
@@ -1287,12 +1198,4 @@ mod tests {
     }
 
     // --- Chart labels -------------------------------------------------------------------
-
-    #[test]
-    fn day_labels_are_weekday_abbreviations() {
-        let d = |day| NaiveDate::from_ymd_opt(2026, 10, day).unwrap();
-        assert_eq!(day_label(d(11)), "Sun");
-        assert_eq!(day_label(d(12)), "Mon");
-        assert_eq!(day_label(d(17)), "Sat");
-    }
 }
