@@ -168,6 +168,32 @@ pub fn set_always_on_top(ctx: &egui::Context, settings: &mut Settings, on: bool)
     ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(on)));
 }
 
+/// The Theme row's choices, in order. egui persists the pick itself (its
+/// memory's theme preference), so it is not a [`Settings`] field.
+pub const THEME_CHOICES: [(egui::ThemePreference, &str); 3] = [
+    (egui::ThemePreference::System, "System"),
+    (egui::ThemePreference::Dark, "Dark"),
+    (egui::ThemePreference::Light, "Light"),
+];
+
+/// The Theme row: radio buttons over egui's theme preference, applied the
+/// moment one is picked.
+fn theme_row(ui: &mut Ui) {
+    let mut pref = ui.ctx().options(|o| o.theme_preference);
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Theme");
+        for (value, text) in THEME_CHOICES {
+            changed |= ui.radio_value(&mut pref, value, text).changed();
+        }
+    })
+    .response
+    .on_hover_text("Applies immediately");
+    if changed {
+        ui.ctx().set_theme(pref);
+    }
+}
+
 /// What the user did in the panel this frame.
 #[derive(Debug, PartialEq)]
 pub enum PanelAction {
@@ -234,8 +260,8 @@ impl SettingsPanel {
         }
     }
 
-    /// Draw the panel. Always-on-top edits `live` immediately (it is the
-    /// header pin's state); everything else waits for Apply.
+    /// Draw the panel. Always on top (edited in `live`) and Theme (egui's
+    /// own preference) apply immediately; everything else waits for Apply.
     pub fn show(&mut self, ui: &mut Ui, live: &mut Settings) -> PanelAction {
         let red = level_color(Level::Red, ui.visuals());
         let green = level_color(Level::Green, ui.visuals());
@@ -276,6 +302,7 @@ impl SettingsPanel {
             {
                 set_always_on_top(ui.ctx(), live, on_top);
             }
+            theme_row(ui);
             ui.add_space(4.0);
 
             field(ui, "Cookie file", |ui| {
@@ -443,6 +470,31 @@ mod tests {
         let mut c = CookieFileCheck::default();
         assert!(c.is_file(real.path().to_str().unwrap()));
         assert!(!c.is_file("definitely/not/here.json"));
+    }
+
+    #[test]
+    fn theme_choices_cover_every_preference_once() {
+        let prefs: Vec<_> = THEME_CHOICES.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            prefs,
+            [
+                egui::ThemePreference::System,
+                egui::ThemePreference::Dark,
+                egui::ThemePreference::Light
+            ]
+        );
+        let labels: Vec<_> = THEME_CHOICES.iter().map(|(_, t)| *t).collect();
+        assert_eq!(labels, ["System", "Dark", "Light"]);
+    }
+
+    #[test]
+    fn theme_row_applies_the_pick_to_the_context() {
+        // set_theme is what the row calls; the row reads the same option back.
+        let ctx = egui::Context::default();
+        for (pref, _) in THEME_CHOICES {
+            ctx.set_theme(pref);
+            assert_eq!(ctx.options(|o| o.theme_preference), pref);
+        }
     }
 
     #[test]
