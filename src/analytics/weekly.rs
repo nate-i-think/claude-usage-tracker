@@ -108,9 +108,10 @@ pub fn weekly_rate(
         Some(&(anchor_t, anchor_v)) => {
             let gap = start - anchor_t > Duration::minutes(ANCHOR_GAP_MINUTES);
             let anchored = rate(anchor_v, now - anchor_t, RateBasis::Anchored { gap });
-            // The samples inside the window, when they span the floor: a
-            // burst since the app came back outranks the long average.
-            let inside = valid.iter().find(|(t, _)| *t > start);
+            // After a gap, the samples inside the window, when they span the
+            // floor: a burst since the app came back outranks the long
+            // average. Without a gap the anchored rate already covers them.
+            let inside = valid.iter().find(|(t, _)| *t > start).filter(|_| gap);
             let recent = inside
                 .map(|&(first_t, first)| (first, last_t - first_t))
                 .filter(|(_, span)| *span >= floor)
