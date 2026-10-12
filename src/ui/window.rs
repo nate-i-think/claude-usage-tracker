@@ -45,7 +45,7 @@ pub const TITLE: &str = "Claude Usage Monitor";
 /// eframe storage key for [`Settings`].
 pub const SETTINGS_KEY: &str = "settings";
 /// Full-mode window size on first run (inner, points).
-pub const FULL_SIZE: Vec2 = Vec2::new(420.0, 680.0);
+pub const FULL_SIZE: Vec2 = Vec2::new(420.0, 760.0);
 /// Smallest full-mode window (inner, points).
 pub const FULL_MIN: Vec2 = Vec2::new(360.0, 320.0);
 /// The pill window's size (inner == outer: no decorations; points).
@@ -615,7 +615,7 @@ mod tests {
         );
         assert_eq!(
             (FULL_SIZE, FULL_MIN),
-            (Vec2::new(420.0, 680.0), Vec2::new(360.0, 320.0))
+            (Vec2::new(420.0, 760.0), Vec2::new(360.0, 320.0))
         );
     }
 

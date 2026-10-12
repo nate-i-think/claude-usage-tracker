@@ -1242,13 +1242,16 @@ fn paint_now(
         e.projection
             .map_or(from(e), |p| axes.pos(p.end_t, p.end_pct))
     };
-    // Every ✕ is a keep-out for every label.
-    let marks: Vec<Rect> = ends
+    // Every ✕ and every now dot is a keep-out for every label.
+    let mut avoid: Vec<Rect> = ends
         .iter()
         .filter(|e| matches!(e.label, Some(EndLabel::Cap(_))))
         .map(|e| Rect::from_center_size(to(e), Vec2::splat(2.0 * CAP_KEEP_OUT)))
+        .chain(
+            ends.iter()
+                .map(|e| Rect::from_center_size(from(e), Vec2::splat(2.0 * (DOT_RADIUS + 1.5)))),
+        )
         .collect();
-    let mut avoid = marks.clone();
     for e in ends {
         let (from, to) = (from(e), to(e));
         let fade = if e.projection.is_some() {
