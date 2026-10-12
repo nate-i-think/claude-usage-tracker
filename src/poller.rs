@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 
-use crate::analytics::{WindowSample, BURN_WINDOW_MINUTES, HISTORY_LEN};
+use crate::analytics::{self, WeekSample, WindowSample, BURN_WINDOW_MINUTES, HISTORY_LEN};
 use crate::config::{Settings, MIN_INTERVAL_SECS};
 use crate::crash::catch_recoverable;
 use crate::fetch::{self, FetchError};
@@ -53,6 +53,12 @@ pub struct Dashboard {
     /// Every history sample in `[window_start, window_end)`, oldest first,
     /// including this poll's.
     pub window_samples: Vec<WindowSample>,
+    /// The current weekly window (see [`analytics::week_window`]).
+    pub week_start: DateTime<Utc>,
+    pub week_end: DateTime<Utc>,
+    /// The weekly window's samples, thinned, oldest first, including this
+    /// poll's.
+    pub week_samples: Vec<WeekSample>,
     /// Saving this poll to history.jsonl failed; the data above is still
     /// fresh. Shown as a warning.
     pub persist_error: Option<String>,
@@ -229,9 +235,17 @@ fn build_dashboard(
     let window_end = snapshot
         .five_hour_resets_at()
         .unwrap_or(ws + ChronoDuration::hours(5));
-    // One history read feeds the 7-day rollups and the window samples.
-    let rollups = storage::rollups(paths, ws, window_end, DAILY_DAYS, now);
+    let (week_start, week_end) = analytics::week_window(snapshot.seven_day_resets_at(), now);
+    // One history read feeds the rollups, the window samples and the week.
+    let rollups = storage::rollups(
+        paths,
+        (ws, window_end),
+        (week_start, week_end),
+        DAILY_DAYS,
+        now,
+    );
     let window_samples = with_current_sample(rollups.window_samples, &snapshot, ws, window_end);
+    let week_samples = with_current_week_sample(rollups.week_samples, &snapshot);
     Dashboard {
         history: history.five_hour(),
         fable_history: history.fable(),
@@ -251,9 +265,26 @@ fn build_dashboard(
         window_start: ws,
         window_end,
         window_samples,
+        week_start,
+        week_end,
+        week_samples,
         persist_error: None,
         snapshot,
     }
+}
+
+/// `samples` with this poll's weekly sample at its exact fetch time in
+/// place of its persisted copy (if any), kept sorted.
+fn with_current_week_sample(mut samples: Vec<WeekSample>, snap: &Snapshot) -> Vec<WeekSample> {
+    let t = snap.fetched_at;
+    samples.retain(|s| (s.t - t).abs() >= ChronoDuration::milliseconds(1));
+    samples.push(WeekSample {
+        t,
+        seven_day: snap.seven_day_pct(),
+        fable: snap.fable_pct(),
+    });
+    samples.sort_by_key(|s| s.t);
+    samples
 }
 
 /// `samples` with this poll's value at its exact fetch time `t` in place
@@ -795,6 +826,15 @@ mod tests {
             [(d.snapshot.fetched_at, d.snapshot.seven_day_pct())]
         );
         assert_eq!(d.fable_recent, [(d.snapshot.fetched_at, None)]);
+        assert_eq!(
+            d.week_samples,
+            [WeekSample {
+                t: d.snapshot.fetched_at,
+                seven_day: d.snapshot.seven_day_pct(),
+                fable: None,
+            }]
+        );
+        assert_eq!(d.week_end - d.week_start, ChronoDuration::days(7));
         assert!(paths.history_file().exists());
         assert!(paths.latest_file().exists());
         assert_eq!(

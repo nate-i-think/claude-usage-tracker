@@ -669,6 +669,9 @@ mod tests {
             window_start: t,
             window_end: t,
             window_samples: Vec::new(),
+            week_start: t,
+            week_end: t,
+            week_samples: Vec::new(),
             persist_error: None,
         })
     }

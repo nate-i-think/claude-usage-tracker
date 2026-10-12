@@ -15,7 +15,9 @@ use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc}
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::analytics::{project_display_name, WindowSample, WEEKLY_RATE_HOURS};
+use crate::analytics::{
+    project_display_name, thin_week, WeekSample, WindowSample, WEEKLY_RATE_HOURS,
+};
 use crate::model::{ExtraUsage, Snapshot};
 use crate::paths::Paths;
 
@@ -196,6 +198,9 @@ pub struct Rollups {
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     /// Every row in `[window_start, window_end)`, oldest first.
     pub window_samples: Vec<WindowSample>,
+    /// The rows of the weekly window `[week_start, week_end]`, oldest
+    /// first, thinned by [`thin_week`].
+    pub week_samples: Vec<WeekSample>,
     /// 7-day-all utilization for the weekly projection, oldest first: the
     /// anchor (the latest row with a value before the last
     /// [`WEEKLY_RATE_HOURS`]), then every row since, up to `now`.
@@ -211,22 +216,25 @@ const ANCHOR_LOOKBACK_DAYS: i64 = 7;
 /// See [`Rollups`].
 pub fn rollups(
     paths: &Paths,
-    window_start: DateTime<Utc>,
-    window_end: DateTime<Utc>,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    week: (DateTime<Utc>, DateTime<Utc>),
     days: usize,
     now: DateTime<Utc>,
 ) -> Rollups {
+    let (window_start, window_end) = window;
     let recent_start = now - Duration::hours(WEEKLY_RATE_HOURS);
     let since = match daily_since(days, now) {
         Some(d) => d.min(window_start),
         None => window_start,
     }
-    .min(now - Duration::days(ANCHOR_LOOKBACK_DAYS));
+    .min(now - Duration::days(ANCHOR_LOOKBACK_DAYS))
+    .min(week.0);
     let rows = read_recent(paths, since);
     Rollups {
         daily: daily_max(&rows, days, now, |e| e.seven_day),
         fable_daily: daily_max(&rows, days, now, |e| e.fable_7d),
         window_samples: window_samples(&rows, window_start, window_end),
+        week_samples: week_samples(&rows, week, now),
         seven_day_recent: recent_series(&rows, recent_start, now, |e| e.seven_day),
         fable_recent: recent_series(&rows, recent_start, now, |e| e.fable_7d),
     }
@@ -253,6 +261,29 @@ fn recent_series(
         .collect();
     out.sort_by_key(|(t, _)| *t);
     out
+}
+
+/// The rows in the weekly window `[start, end]`, as samples, oldest first,
+/// thinned by [`thin_week`].
+fn week_samples(
+    rows: &[HistoryEntry],
+    (start, end): (DateTime<Utc>, DateTime<Utc>),
+    now: DateTime<Utc>,
+) -> Vec<WeekSample> {
+    let (start_ts, end_ts) = (unix_seconds(start), unix_seconds(end));
+    let mut samples: Vec<WeekSample> = rows
+        .iter()
+        .filter(|e| e.ts >= start_ts && e.ts <= end_ts)
+        .filter_map(|e| {
+            Some(WeekSample {
+                t: from_unix_seconds(e.ts)?,
+                seven_day: e.seven_day,
+                fable: e.fable_7d,
+            })
+        })
+        .collect();
+    samples.sort_by_key(|s| s.t);
+    thin_week(&samples, now)
 }
 
 /// The rows in the half-open window `[window_start, window_end)`, as
@@ -947,6 +978,7 @@ mod tests {
         let (_tmp, paths) = temp_paths();
         let now = local(2026, 10, 11, 12, 0);
         let ws = now - Duration::minutes(100);
+        let week = (now - Duration::days(2), now + Duration::days(5));
         let mut lines = Vec::new();
         // Every 20 minutes for 9 days, all fields, so each rollup's cutoff
         // and every window/day edge has neighbours on both sides.
@@ -965,13 +997,13 @@ mod tests {
         write_history(&paths, &lines);
 
         for days in [0, 1, 7] {
-            let got = rollups(&paths, ws, ws + Duration::hours(5), days, now);
+            let got = rollups(&paths, (ws, ws + Duration::hours(5)), week, days, now);
             assert_eq!(got.daily, daily_history(&paths, days, now));
             assert_eq!(got.fable_daily, fable_daily_history(&paths, days, now));
         }
         // Window older than the daily range: the window cutoff wins.
         let old_ws = now - Duration::days(8);
-        let got = rollups(&paths, old_ws, old_ws + Duration::hours(5), 7, now);
+        let got = rollups(&paths, (old_ws, old_ws + Duration::hours(5)), week, 7, now);
         assert!(got.window_samples.iter().any(|w| w.five_hour.is_some()));
         assert_eq!(got.daily, daily_history(&paths, 7, now));
         // The weekly samples: the anchor 20 minutes before the 24 h, then
@@ -995,8 +1027,15 @@ mod tests {
             .fable_recent
             .iter()
             .all(|(_, v)| v.is_some_and(|v| v < 13.0)));
+        // The weekly window: from 2 days ago to now, 20-minute rows (one
+        // per 5-minute bucket already), the last hour all kept.
+        let w = &got.week_samples;
+        assert_eq!(w.len(), 2 * 24 * 3 + 1);
+        assert!((w[0].t - week.0).num_seconds().abs() <= 1);
+        assert!(w.windows(2).all(|p| p[0].t < p[1].t));
+        assert!(w.iter().all(|s| s.seven_day.is_some() && s.fable.is_some()));
         // Even with no daily range, the 24 h and the anchor are read.
-        let got = rollups(&paths, ws, ws + Duration::hours(5), 0, now);
+        let got = rollups(&paths, (ws, ws + Duration::hours(5)), week, 0, now);
         assert_eq!(got.seven_day_recent.len(), 24 * 3 + 2);
     }
 
@@ -1020,7 +1059,7 @@ mod tests {
             ],
         );
         let before = history_reads();
-        let got = rollups(&paths, ws, ws + Duration::hours(5), 7, now);
+        let got = rollups(&paths, (ws, ws + Duration::hours(5)), (ws, now), 7, now);
         assert_eq!(history_reads() - before, 1, "rollups reads history once");
         let sample = |m: i64, five, fable| WindowSample {
             t: ws + Duration::minutes(m),

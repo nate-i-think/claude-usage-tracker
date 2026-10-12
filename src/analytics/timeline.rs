@@ -1,5 +1,6 @@
-//! Hero-timeline math: window samples, pace against an even burn, the
-//! dashed projection with its cap crossing, and the continuous Fable layer.
+//! Hero-timeline math: window samples (5-hour and weekly), pace against an
+//! even burn, the dashed projection with its cap crossing, the continuous
+//! Fable layer, and thinning a week of samples.
 //!
 //! Pure and clock-injected like the rest of [`crate::analytics`].
 
@@ -15,6 +16,54 @@ pub struct WindowSample {
     pub t: DateTime<Utc>,
     pub five_hour: Option<f64>,
     pub fable: Option<f64>,
+}
+
+/// One history row inside the current weekly window: the 7-day-all and the
+/// Fable 7-day utilization at `t`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeekSample {
+    pub t: DateTime<Utc>,
+    pub seven_day: Option<f64>,
+    pub fable: Option<f64>,
+}
+
+/// Bucket length for thinning a week of samples.
+pub const WEEK_THIN_BUCKET_MINUTES: i64 = 5;
+/// Samples this recent are all kept.
+pub const WEEK_KEEP_ALL_MINUTES: i64 = 60;
+
+/// The current weekly window: `resets_at - 7d` to `resets_at`, or the
+/// trailing 7 days ending `now` when the reset is unknown.
+pub fn week_window(
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let end = resets_at.unwrap_or(now);
+    (end - Duration::days(7), end)
+}
+
+/// A week of samples (oldest first) thinned to a bounded size: the last
+/// sample of each [`WEEK_THIN_BUCKET_MINUTES`] bucket, and every sample of
+/// the last [`WEEK_KEEP_ALL_MINUTES`] before `now`. A week at 30 s polls
+/// (about 20 000 rows) becomes about 2 100. The weekly meters only rise
+/// within a week, so the last sample of a bucket is its highest.
+pub fn thin_week(samples: &[WeekSample], now: DateTime<Utc>) -> Vec<WeekSample> {
+    let keep_all = now - Duration::minutes(WEEK_KEEP_ALL_MINUTES);
+    let bucket_s = WEEK_THIN_BUCKET_MINUTES * 60;
+    let bucket = |t: DateTime<Utc>| t.timestamp().div_euclid(bucket_s);
+    let mut out: Vec<WeekSample> = Vec::with_capacity(samples.len().min(2_200));
+    for s in samples {
+        if s.t < keep_all {
+            if let Some(last) = out.last_mut() {
+                if last.t < keep_all && bucket(last.t) == bucket(s.t) {
+                    *last = *s;
+                    continue;
+                }
+            }
+        }
+        out.push(*s);
+    }
+    out
 }
 
 /// How far `utilization` is ahead of an even burn across the window:
@@ -128,6 +177,62 @@ fn minutes_duration(minutes: f64) -> Duration {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn week(m: i64, v: f64) -> WeekSample {
+        WeekSample {
+            t: t0() + Duration::minutes(m),
+            seven_day: Some(v),
+            fable: None,
+        }
+    }
+
+    #[test]
+    fn week_window_from_the_reset_or_trailing() {
+        let reset = t0() + Duration::days(2);
+        assert_eq!(
+            week_window(Some(reset), t0()),
+            (reset - Duration::days(7), reset)
+        );
+        assert_eq!(week_window(None, t0()), (t0() - Duration::days(7), t0()));
+    }
+
+    #[test]
+    fn thin_week_keeps_the_last_per_bucket_and_the_last_hour() {
+        // t0 is on a 5-minute boundary. Minute samples for 2 hours.
+        let samples: Vec<_> = (0..120).map(|m| week(m, m as f64)).collect();
+        let now = t0() + Duration::minutes(120);
+        let thin = thin_week(&samples, now);
+        // The first hour: one per 5-minute bucket, the last of each.
+        let old: Vec<f64> = thin
+            .iter()
+            .filter(|s| s.t < now - Duration::minutes(60))
+            .map(|s| s.seven_day.unwrap())
+            .collect();
+        assert_eq!(
+            old,
+            (0..12).map(|b| f64::from(b * 5 + 4)).collect::<Vec<_>>()
+        );
+        // The last hour: every sample.
+        assert_eq!(thin.len(), 12 + 60);
+        assert_eq!(thin.last(), samples.last());
+        assert!(thin.windows(2).all(|w| w[0].t < w[1].t));
+        assert!(thin_week(&[], now).is_empty());
+    }
+
+    #[test]
+    fn thin_week_bounds_a_week_of_30s_polls() {
+        let now = t0() + Duration::days(7);
+        let samples: Vec<_> = (0..7 * 24 * 120)
+            .map(|i| WeekSample {
+                t: t0() + Duration::seconds(30 * i),
+                seven_day: Some(1.0),
+                fable: Some(2.0),
+            })
+            .collect();
+        let thin = thin_week(&samples, now);
+        assert!(thin.len() <= 7 * 24 * 12 + 120 + 1, "{}", thin.len());
+        assert!(thin.len() >= 7 * 24 * 12);
+    }
 
     fn t0() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 11, 10, 0, 0).unwrap()
