@@ -323,8 +323,46 @@ pub fn dimmed(runs: Vec<Run>) -> Vec<Run> {
         .collect()
 }
 
-/// The meters with a row: 7-day all always, Fable when the snapshot
-/// reports its window.
+/// Whether the Fable row shows: Fable's window reports a %, and not its
+/// untouched state (0% with no reset time).
+pub fn fable_row_shown(pct: Option<f64>, resets_at: Option<DateTime<Utc>>) -> bool {
+    match pct {
+        None => false,
+        Some(p) => p > 0.0 || resets_at.is_some(),
+    }
+}
+
+/// How old the snapshot behind the rows is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Freshness {
+    /// Time since the snapshot was fetched.
+    pub age: Duration,
+    /// Older than two poll intervals: the rows are muted.
+    pub stale: bool,
+}
+
+/// `o` (projected at the snapshot's fetch time) as seen `age` later: a cap
+/// "in 16h" then is that much nearer now, never below 0. Absolute times
+/// and the % at reset don't change.
+pub fn aged(o: WeeklyOutlook, age: Duration) -> WeeklyOutlook {
+    match o {
+        WeeklyOutlook::Cap {
+            rate,
+            at,
+            minutes,
+            level,
+        } => WeeklyOutlook::Cap {
+            rate,
+            at,
+            minutes: (minutes - age.as_seconds_f64().max(0.0) / 60.0).max(0.0),
+            level,
+        },
+        other => other,
+    }
+}
+
+/// The meters with a row: 7-day all always, Fable when
+/// [`fable_row_shown`].
 pub fn meters(has_fable: bool) -> Vec<Meter> {
     let mut out = vec![Meter::All];
     if has_fable {
@@ -476,7 +514,8 @@ pub fn show_week(
 
 /// The chart's card: the title with the peak as its subtitle, the chart,
 /// and one projection row per weekly limit under it (see [`meters`]). The
-/// projections are taken at the snapshot's fetch time; `stale` mutes them.
+/// projections are taken at the snapshot's fetch time, their "cap in"
+/// figures aged to now (see [`aged`]), and muted when `fresh.stale`.
 /// Returns the content's natural height (before `size.min_content`).
 pub fn show_week_card(
     ui: &mut Ui,
@@ -484,12 +523,12 @@ pub fn show_week_card(
     today: NaiveDate,
     palette: &Palette,
     size: CardSize,
-    stale: bool,
+    fresh: Freshness,
 ) -> f32 {
     let bars = day_bars(&d.daily_history, &d.fable_daily);
     let snap = &d.snapshot;
     let at = snap.fetched_at;
-    let has_fable = snap.window(crate::model::FABLE_LABEL).is_some();
+    let has_fable = fable_row_shown(snap.fable_pct(), snap.fable_resets_at());
     let rows: Vec<(Meter, WeeklyOutlook)> = meters(has_fable)
         .into_iter()
         .map(|m| {
@@ -507,7 +546,7 @@ pub fn show_week_card(
                     at,
                 ),
             };
-            (m, o)
+            (m, aged(o, fresh.age))
         })
         .collect();
     super::theme::card(palette)
@@ -518,7 +557,7 @@ pub fn show_week_card(
             ui.set_min_height(size.min_content);
             super::theme::chart_title(ui, palette, TITLE, Some(&subtitle(&bars)));
             show_week(ui, &bars, today, palette, size.chart);
-            outlook_rows(ui, &rows, stale);
+            outlook_rows(ui, &rows, fresh.stale);
             // From the cursor: min_rect includes the reserved height.
             let natural = ui.cursor().top() - top - ui.spacing().item_spacing.y;
             natural
@@ -945,6 +984,45 @@ mod tests {
         assert_eq!(meters(true), vec![Meter::All, Meter::Fable]);
         assert_eq!(Meter::All.label(), Run::new("7d all", Tone::Dim));
         assert_eq!(Meter::Fable.label(), Run::new("Fable", Tone::Fable));
+    }
+
+    #[test]
+    fn fable_row_hidden_when_untouched() {
+        let reset = Utc.with_ymd_and_hms(2026, 10, 13, 6, 0, 0).unwrap();
+        assert!(!fable_row_shown(None, Some(reset)));
+        assert!(!fable_row_shown(Some(0.0), None));
+        assert!(fable_row_shown(Some(0.0), Some(reset)));
+        assert!(fable_row_shown(Some(12.0), None));
+    }
+
+    #[test]
+    fn cap_in_is_aged_to_now() {
+        let at = Utc.with_ymd_and_hms(2026, 10, 12, 15, 0, 0).unwrap();
+        let cap = WeeklyOutlook::Cap {
+            rate: rate(51.0),
+            at,
+            minutes: 16.0 * 60.0,
+            level: Level::Red,
+        };
+        let WeeklyOutlook::Cap { minutes, at: a, .. } = aged(cap, Duration::minutes(90)) else {
+            panic!("still a cap");
+        };
+        assert_eq!(minutes, 14.5 * 60.0);
+        assert_eq!(a, at);
+        let WeeklyOutlook::Cap { minutes, .. } = aged(cap, Duration::days(2)) else {
+            panic!("still a cap");
+        };
+        assert_eq!(minutes, 0.0);
+        // Compact copy then shows the aged figure.
+        let runs = outlook_runs(&aged(cap, Duration::minutes(90)), &Utc, true);
+        assert_eq!(crate::ui::plain_text(&runs), "+51%/day · cap in 14h 30m");
+        // Other outlooks are untouched.
+        let safe = WeeklyOutlook::Safe {
+            rate: rate(6.0),
+            at_reset: 70.0,
+            reset: at,
+        };
+        assert_eq!(aged(safe, Duration::hours(3)), safe);
     }
 
     #[test]
