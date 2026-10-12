@@ -37,8 +37,8 @@ pub const HIDDEN_GAP: Duration = Duration::from_secs(2);
 pub const PULSE_PERIOD: Duration = Duration::from_millis(2_000);
 /// Pulses shown when the threshold is first crossed, before holding steady.
 pub const PULSE_COUNT: u32 = 3;
-/// Repaint cadence while pulsing (~15 fps is plenty for a 2 s breath).
-pub const PULSE_FRAME: Duration = Duration::from_millis(66);
+/// Repaint cadence while pulsing (10 fps is plenty for a 2 s breath).
+pub const PULSE_FRAME: Duration = Duration::from_millis(100);
 /// The pulse's lowest emphasis; 1.0 is the steady "near cap" emphasis.
 pub const PULSE_TROUGH: f32 = 0.25;
 

@@ -163,7 +163,7 @@ Where the branch differs from the design text above, and why. Sources: the spike
 
 - Tweens are 0.45 s ease-out and only start from poll data. A value not drawn for more than 2 s (hidden window, collapsed Details) snaps instead of gliding. Reduce motion snaps everything.
 - The projection draw-in (0.6 s) runs on the first projection, and again only when a **new poll** (keyed by `fetched_at`) moves the end by more than 5 points. The end mark and label fade in over the last 30%.
-- **Pulse: three breaths, then steady.** At ≥ 90% the 5-hour chip (and the pill dot) breathes three times over about 5 s, then holds the peak level with no extra repaints beyond the 1 s tick. It re-arms only below **88%** or in a new window. "Keep pulsing near cap" keeps it breathing at a 66 ms repaint; that measured about 9.35% of one core against about 2.5% idle, so it is opt-in.
+- **Pulse: three breaths, then steady.** At ≥ 90% the 5-hour chip (and the pill dot) breathes three times over about 5 s, then holds the peak level with no extra repaints beyond the 1 s tick. It re-arms only below **88%** or in a new window. "Keep pulsing near cap" keeps it breathing at a 100 ms repaint (`PULSE_FRAME`; it was 66 ms when it measured about 9.35% of one core against about 2.5% idle), so it is opt-in.
 - **Jitter-tolerant window identity.** The API's `resets_at` jitters from poll to poll (usually sub-second, occasionally minutes). `analytics::alerts::same_window` rounds both values to the minute and treats keys within 5 minutes as the same window. The alert state and the pulse tracker both use it.
 
 ### Pill
