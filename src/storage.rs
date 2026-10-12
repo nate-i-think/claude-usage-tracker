@@ -196,9 +196,9 @@ pub struct Rollups {
     pub fable_daily: Vec<(NaiveDate, Option<f64>)>,
     /// Every row in `[window_start, window_end)`, oldest first.
     pub window_samples: Vec<WindowSample>,
-    /// 7-day-all utilization for the weekly projection: every row in the
-    /// last [`WEEKLY_RATE_HOURS`] up to `now`, after the anchor (see
-    /// [`recent_series`]), oldest first.
+    /// 7-day-all utilization for the weekly projection, oldest first: the
+    /// anchor (the latest row with a value before the last
+    /// [`WEEKLY_RATE_HOURS`]), then every row since, up to `now`.
     pub seven_day_recent: Vec<(DateTime<Utc>, Option<f64>)>,
     /// The same for Fable's 7-day utilization.
     pub fable_recent: Vec<(DateTime<Utc>, Option<f64>)>,

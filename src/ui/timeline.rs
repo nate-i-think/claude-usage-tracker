@@ -635,11 +635,14 @@ pub fn show_timeline_card(
     super::theme::card(palette)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            let top = ui.cursor().top();
+            // Reserved from the cursor, so set before the content.
+            ui.set_min_height(size.min_content);
             super::theme::chart_title(ui, palette, TITLE, span.as_deref());
             show_timeline(ui, d, now, palette, size.chart);
             super::footer::show_burn_row(ui, d, now);
-            let natural = ui.min_rect().height();
-            ui.set_min_height(size.min_content);
+            // From the cursor: min_rect includes the reserved height.
+            let natural = ui.cursor().top() - top - ui.spacing().item_spacing.y;
             natural
         })
         .inner
