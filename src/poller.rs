@@ -943,15 +943,7 @@ mod tests {
             .iter()
             .map(|(m, v)| format!(r#"{{"ts": {}, "five_hour": {v}}}"#, ts(*m)))
             .collect();
-        fs::write(
-            paths.history_file(),
-            lines.join(
-                "
-",
-            ) + "
-",
-        )
-        .unwrap();
+        fs::write(paths.history_file(), lines.join("\n") + "\n").unwrap();
         (paths, dirs)
     }
 

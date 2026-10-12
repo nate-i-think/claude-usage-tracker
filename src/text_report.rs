@@ -76,7 +76,8 @@ pub fn render(d: &Dashboard, plan: &str, show_all: bool, now: DateTime<Utc>) -> 
     out.push(String::new());
     out.push(plain(&rows::burners_runs(&d.burners)));
     let rate = analytics::compute_rate(&d.history, now);
-    if let Some(h) = analytics::headroom(snap, rate, now) {
+    let five = d.five_hour_now(now);
+    if let Some(h) = analytics::headroom(five.pct, five.resets_at, rate, now) {
         out.push(plain(&rows::headroom_runs(&h)));
     }
 
