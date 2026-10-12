@@ -18,6 +18,7 @@ The window opens at 420x760 (minimum 360x320) in a warm dark theme. From top to 
   - Stretches with no samples (the app was closed, the laptop slept) are bridged with a faint dotted line instead of leaving a hole. A reset still breaks the line.
   - Hover for a crosshair with the time, the utilization and the Fable share; past "now" it shows the projected value.
   - **5h burn** under the chart: the 15-minute rate for all usage ("+0.21%/min") and either "cap in 1h 48m" or "safe until reset". Hover for the full burn line. The rate is available right after a restart, because it is seeded from the saved history.
+  - **After a reset** the chart starts over. Once a 5-hour window ends, the API reports 0% and no reset time until your next message starts a new window. Meanwhile the chart is empty (no times, now marker or projection) with "No active window · starts with your next message", the burn row reads "idle", and the 5-hour chip shows 0% with no pace. The same happens as soon as the reset time passes, without waiting for the next poll. The new window's chart begins at its start with only its own samples. In the rare case the API reports usage without a reset time, the chart shows the last 5 hours up to "now", from the latest reset on.
 - **7-day window** (a second timeline, titled with the weekly window's span, "Tue 2a – Tue 2a"): the current weekly window from its start to the weekly reset, drawn like the 5-hour one, because the weekly limits often run out first.
   - The 7-day utilization (all models) as a filled area in its state color, and Fable's own 7-day limit as a clay line (hidden until Fable shows usage or a reset time).
   - A tick at each local midnight, labelled with the weekday, and "reset Tue 2a" at the end. With no known reset it shows the last 7 days up to now.
@@ -49,7 +50,7 @@ Switch between them (or follow the system) with **Theme** in [Settings](#setting
 
 ![Pill mode](docs/screenshot-pill.png)
 
-A compact 300x44 always-on-top bar for parking in a screen corner: a ring and the 5-hour percentage, the time to reset ("5h · 3h55m", or "5h · 10m" under an hour), the pace, and a state dot. The dot is hollow while polls fail or before the first data, and pulses at 90% like the chip.
+A compact 300x44 always-on-top bar for parking in a screen corner: a ring and the 5-hour percentage, the time to reset ("5h · 3h55m", or "5h · 10m" under an hour; "5h · idle" between windows), the pace, and a state dot. The dot is hollow while polls fail or before the first data, and pulses at 90% like the chip.
 
 - **Enter** it with the ◱ button in the header, or the tray menu's **Pill mode**. Settings → **Start in pill mode** opens the app as the pill every time.
 - **Leave** it with a click on the pill; the full window comes back at its old place and size (maximized, if it was).
@@ -59,7 +60,7 @@ A compact 300x44 always-on-top bar for parking in a screen corner: a ring and th
 
 ## Tray icon
 
-With **Show tray icon** on (the default), the notification area shows a rounded square with the 5-hour percentage in two digits ("08", "46"), colored by state; "!!" means 100% or more and "–" means no data yet. Its tooltip reads "Claude usage · 5h 46% · resets 3:42 PM", plus "last poll failed" while polls fail. The icon keeps updating while the window is hidden.
+With **Show tray icon** on (the default), the notification area shows a rounded square with the 5-hour percentage in two digits ("08", "46"), colored by state; "!!" means 100% or more and "–" means no data yet. Its tooltip reads "Claude usage · 5h 46% · resets 3:42 PM" (no reset between windows), plus "last poll failed" while polls fail. The icon keeps updating while the window is hidden.
 
 - **Left-click** hides the window or brings it back.
 - **Right-click** opens the menu: Show / Hide, Pill mode (checked while in the pill), Refresh now, and Quit.
