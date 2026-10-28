@@ -38,6 +38,9 @@ tokio = { version = "1", features = ["rt", "macros", "time", "io-std"] }
 schemars = "1"
 # eframe's own (via image): encodes the app icon the toasts show.
 png = "0.18"
+# Already in the tree (via rustls): sha256 of CLAUDE_CONFIG_DIR for the
+# Keychain service name (profiles).
+ring = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 # Already in the tree (via clap): MessageBoxW, window placement and the pill's

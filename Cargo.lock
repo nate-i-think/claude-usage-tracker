@@ -836,6 +836,7 @@ dependencies = [
  "png",
  "raw-window-handle",
  "reqwest",
+ "ring",
  "rmcp",
  "ron",
  "rusqlite",

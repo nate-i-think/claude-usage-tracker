@@ -61,6 +61,9 @@ pub struct Settings {
     pub reduce_motion: bool,
     /// Keep the high-usage pulse going instead of settling.
     pub keep_pulsing: bool,
+    /// Claude Code profiles in display order: discovered ones merged in
+    /// (see `profiles::merge_discovered`) plus any added by hand.
+    pub profiles: Vec<ProfileSettings>,
 }
 
 impl Default for Settings {
@@ -84,6 +87,7 @@ impl Default for Settings {
             details_open: false,
             reduce_motion: false,
             keep_pulsing: false,
+            profiles: Vec::new(),
         }
     }
 }
@@ -92,6 +96,38 @@ impl Settings {
     /// Whether the close button should hide to the tray instead of quitting.
     pub fn closes_to_tray(&self) -> bool {
         self.tray_enabled && self.close_to_tray
+    }
+}
+
+/// One saved Claude Code profile. Missing fields take their [`Default`]
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileSettings {
+    /// Stable slug (`default`, `claude-secondary`); keys history and alerts.
+    pub id: String,
+    /// The Claude Code config directory (`~/.claude`, `~/.claude-secondary`).
+    pub config_dir: PathBuf,
+    /// User-chosen label; `None` derives one from the account.
+    pub label: Option<String>,
+    /// Series color index; `None` uses the profile's position.
+    pub color: Option<u8>,
+    /// `false` hides a discovered profile without forgetting it.
+    pub enabled: bool,
+    /// Keychain service override; `None` derives it from the config dir.
+    pub keychain_service: Option<String>,
+}
+
+impl Default for ProfileSettings {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            config_dir: PathBuf::new(),
+            label: None,
+            color: None,
+            enabled: true,
+            keychain_service: None,
+        }
     }
 }
 
@@ -242,6 +278,7 @@ mod tests {
         assert!(s.alerts.crossed_75 && s.alerts.crossed_90 && s.alerts.projected_cap);
         assert_eq!(s.alert_state, AlertState::default());
         assert!(!s.details_open && !s.reduce_motion && !s.keep_pulsing);
+        assert!(s.profiles.is_empty());
     }
 
     #[test]
@@ -296,6 +333,33 @@ mod tests {
         };
         let text = ron::ser::to_string(&s).unwrap();
         assert_eq!(ron::from_str::<Settings>(&text).unwrap(), s);
+    }
+
+    #[test]
+    fn settings_ron_profiles_round_trip_and_default_enabled() {
+        let s = Settings {
+            profiles: vec![
+                ProfileSettings {
+                    id: "default".into(),
+                    config_dir: PathBuf::from("/h/.claude"),
+                    ..ProfileSettings::default()
+                },
+                ProfileSettings {
+                    id: "claude-secondary".into(),
+                    config_dir: PathBuf::from("/h/.claude-secondary"),
+                    label: Some("work".into()),
+                    color: Some(3),
+                    enabled: false,
+                    keychain_service: Some("svc".into()),
+                },
+            ],
+            ..Settings::default()
+        };
+        let text = ron::ser::to_string(&s).unwrap();
+        assert_eq!(ron::from_str::<Settings>(&text).unwrap(), s);
+
+        let p: ProfileSettings = ron::from_str(r#"(id:"x",config_dir:"/d")"#).unwrap();
+        assert!(p.enabled, "enabled defaults to true");
     }
 
     #[test]

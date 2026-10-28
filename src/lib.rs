@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod model;
 pub mod paths;
 pub mod poller;
+pub mod profiles;
 pub mod storage;
 pub mod text_report;
 pub mod ui;
