@@ -351,6 +351,46 @@ fn normalize(dir: &str, home: &Path) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
 }
 
+/// A hand-typed config dir as Claude Code would be given it in
+/// `CLAUDE_CONFIG_DIR`: trimmed, a leading `~` expanded to `home`, trailing
+/// separators dropped. Not canonicalized: the Keychain service is the hash
+/// of this exact string. `Err` for a blank or relative path.
+pub fn normalize_config_dir(input: &str, home: &Path) -> Result<PathBuf, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("Enter a folder path".to_owned());
+    }
+    let trimmed = input.trim_end_matches(['/', '\\']);
+    let trimmed = if trimmed.is_empty() { input } else { trimmed };
+    let path = match trimmed.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with(['/', '\\']) => home.join(&rest[1..]),
+        _ => PathBuf::from(trimmed),
+    };
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(format!("{input} is not an absolute path"))
+    }
+}
+
+/// Whether two config dirs are the same directory: compared trimmed,
+/// `~`-expanded, and canonicalized where they exist.
+pub fn same_config_dir(a: &Path, b: &Path, home: &Path) -> bool {
+    normalize(&a.to_string_lossy(), home) == normalize(&b.to_string_lossy(), home)
+}
+
+/// A new id for a hand-added config dir: its name as a slug (as discovery
+/// would give it), never `default`, made unique against `taken`.
+pub fn manual_id(config_dir: &Path, taken: impl Fn(&str) -> bool) -> String {
+    let name = config_dir
+        .file_name()
+        .map(|n| slug(&n.to_string_lossy()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "profile".to_owned());
+    unique_id(&name, |id| id == DEFAULT_ID || taken(id))
+}
+
 /// A dir name as an id: no leading `.`, lowercase, anything outside
 /// `[a-z0-9-]` as `-`.
 fn slug(dir_name: &str) -> String {
@@ -856,5 +896,48 @@ mod tests {
         let text = serde_json::to_string(&e).unwrap();
         assert!(text.contains(r#""id":"claude-b""#), "{text}");
         assert_eq!(serde_json::from_str::<ProfileIndexEntry>(&text).unwrap(), e);
+    }
+
+    #[cfg(unix)] // "/Users/me" is not absolute on Windows
+    #[test]
+    fn normalize_config_dir_expands_and_trims_without_canonicalizing() {
+        let home = Path::new("/Users/me");
+        let n = |s: &str| normalize_config_dir(s, home);
+        assert_eq!(
+            n("~/.claude-work/"),
+            Ok(PathBuf::from("/Users/me/.claude-work"))
+        );
+        assert_eq!(n("  /opt/claude// "), Ok(PathBuf::from("/opt/claude")));
+        assert_eq!(n("~"), Ok(PathBuf::from("/Users/me")));
+        assert_eq!(n("/"), Ok(PathBuf::from("/")));
+        assert!(n("").is_err());
+        assert!(n("   ").is_err());
+        assert!(n("relative/dir").unwrap_err().contains("absolute"));
+        assert!(n("~other/x").is_err(), "~user is not expanded");
+        // The stored string is what the Keychain service is hashed from.
+        let dir = n("~/.claude-work/").unwrap();
+        assert_eq!(
+            keychain_service_for(Some(&dir.display().to_string())),
+            keychain_service_for(Some("/Users/me/.claude-work"))
+        );
+    }
+
+    #[test]
+    fn same_config_dir_ignores_tilde_and_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let dir = profile_dir(home, ".claude-b", None);
+        assert!(same_config_dir(&dir, Path::new("~/.claude-b/"), home));
+        assert!(!same_config_dir(&dir, Path::new("~/.claude-c"), home));
+    }
+
+    #[test]
+    fn manual_id_slugs_the_dir_name_and_avoids_taken_and_default() {
+        let none = |_: &str| false;
+        assert_eq!(manual_id(Path::new("/x/.claude-Work"), none), "claude-work");
+        assert_eq!(manual_id(Path::new("/x/default"), none), "default-2");
+        assert_eq!(manual_id(Path::new("/"), none), "profile");
+        let taken = |id: &str| id == "claude-b";
+        assert_eq!(manual_id(Path::new("/y/.claude-b"), taken), "claude-b-2");
     }
 }

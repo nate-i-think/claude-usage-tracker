@@ -432,10 +432,12 @@ impl App {
         let Some(panel) = self.settings_panel.as_mut() else {
             return;
         };
-        match panel.show(ui, &mut self.settings) {
+        let statuses = settings::account_statuses(&self.accounts, Utc::now());
+        match panel.show(ui, &mut self.settings, &statuses) {
             PanelAction::None => {}
             PanelAction::Cancel => self.settings_panel = None,
             PanelAction::TestNotification => self.alerts.send_test(),
+            PanelAction::Rescan => self.refresh_now(),
             PanelAction::Apply(new) => {
                 // logic() tells the poller and persists on the next pass.
                 self.settings = new;

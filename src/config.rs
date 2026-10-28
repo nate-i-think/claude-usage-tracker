@@ -103,6 +103,9 @@ pub struct ProfileSettings {
     pub enabled: bool,
     /// Keychain service override; `None` derives it from the config dir.
     pub keychain_service: Option<String>,
+    /// Added by hand in Settings rather than discovered; only these can be
+    /// forgotten (a discovered one would come straight back).
+    pub manual: bool,
 }
 
 impl Default for ProfileSettings {
@@ -114,6 +117,7 @@ impl Default for ProfileSettings {
             color: None,
             enabled: true,
             keychain_service: None,
+            manual: false,
         }
     }
 }
@@ -289,6 +293,7 @@ mod tests {
                     color: Some(3),
                     enabled: false,
                     keychain_service: Some("svc".into()),
+                    manual: true,
                 },
             ],
             ..Settings::default()
