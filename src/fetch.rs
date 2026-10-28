@@ -33,6 +33,8 @@ const STATUS_BODY_CHARS: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     NoCredentials,
+    /// The credential store couldn't be read (a locked or denied Keychain).
+    StoreUnavailable,
     TokenExpired,
     Unauthorized,
     Forbidden,
@@ -49,6 +51,11 @@ pub enum FetchError {
     /// No usable credential; the text says why (empty when simply absent).
     #[error("no Claude Code login found{}", detail(.0))]
     NoCredentials(String),
+    /// The credential store couldn't be read: a locked Keychain, access
+    /// denied to `/usr/bin/security`, an unreadable credentials file. The
+    /// text says why. Not a missing login: signing in again won't help.
+    #[error("credential store unavailable{}", detail(.0))]
+    StoreUnavailable(String),
     /// The credential's `expiresAt` has passed; no request was sent.
     #[error("token expired")]
     TokenExpired,
@@ -73,6 +80,7 @@ impl FetchError {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Self::NoCredentials(_) => ErrorKind::NoCredentials,
+            Self::StoreUnavailable(_) => ErrorKind::StoreUnavailable,
             Self::TokenExpired => ErrorKind::TokenExpired,
             Self::Unauthorized => ErrorKind::Unauthorized,
             Self::Forbidden { .. } => ErrorKind::Forbidden,
@@ -370,6 +378,7 @@ mod tests {
         let errors = [
             FetchError::NoCredentials(String::new()),
             FetchError::NoCredentials("malformed credential: no accessToken".into()),
+            FetchError::StoreUnavailable("security exited 51".into()),
             FetchError::TokenExpired,
             FetchError::Unauthorized,
             check_status(403, "denied", None).unwrap_err(),
@@ -397,6 +406,12 @@ mod tests {
             "no Claude Code login found (malformed credential: x)"
         );
         assert_eq!(FetchError::TokenExpired.to_string(), "token expired");
+        let locked = FetchError::StoreUnavailable("security exited 51".into());
+        assert_eq!(
+            locked.to_string(),
+            "credential store unavailable (security exited 51)"
+        );
+        assert_eq!(locked.kind(), ErrorKind::StoreUnavailable);
     }
 
     #[derive(Debug)]

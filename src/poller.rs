@@ -122,6 +122,15 @@ impl FetchErrorInfo {
             FetchError::NoCredentials(why) => {
                 format!("no Claude Code login found in {dir} — run `claude` and sign in ({why})")
             }
+            FetchError::StoreUnavailable(why) => format!(
+                "couldn't read the Claude Code login for {dir} — {}{}",
+                credentials::UNAVAILABLE_HINT,
+                if why.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({why})")
+                }
+            ),
             other => other.to_string(),
         };
         Self {
@@ -246,6 +255,7 @@ impl<A: UsageApi> OAuthSource<A> {
         self.cached = None;
         let cred = self.store.load(&key.0).map_err(|e| match e {
             CredError::NotFound(_) => FetchError::NoCredentials(String::new()),
+            CredError::Unavailable(why) => FetchError::StoreUnavailable(why),
             other => FetchError::NoCredentials(other.to_string()),
         })?;
         self.cached = Some((key.clone(), cred.clone()));
@@ -2332,6 +2342,16 @@ mod tests {
             "no Claude Code login found in ~/.claude — run `claude` and sign in \
              (malformed credential: no accessToken)"
         );
+        let got = info(FetchError::StoreUnavailable("security exited 51".into()));
+        assert_eq!(got.kind, ErrorKind::StoreUnavailable);
+        assert_eq!(
+            got.message,
+            format!(
+                "couldn't read the Claude Code login for ~/.claude — {} (security exited 51)",
+                credentials::UNAVAILABLE_HINT
+            )
+        );
+        assert!(!got.message.contains("sign in"));
         let got = info(FetchError::Forbidden {
             body: "denied".into(),
         });
@@ -2601,14 +2621,17 @@ mod tests {
             "no Claude Code login found (malformed credential: no accessToken)"
         );
 
+        // A locked or denied Keychain is not a missing login.
         let (mut src, _) = oauth(
             vec![Err(|| CredError::Unavailable("locked".into()))],
             vec![],
         );
-        assert!(matches!(
-            src.fetch(&test_profile()).unwrap_err(),
-            FetchError::NoCredentials(why) if why.contains("locked")
-        ));
+        let e = src.fetch(&test_profile()).unwrap_err();
+        assert!(
+            matches!(&e, FetchError::StoreUnavailable(why) if why == "locked"),
+            "{e:?}"
+        );
+        assert_eq!(e.kind(), ErrorKind::StoreUnavailable);
     }
 
     #[test]

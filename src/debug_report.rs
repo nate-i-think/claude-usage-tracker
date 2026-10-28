@@ -286,6 +286,10 @@ fn advice(d: &ProfileDiag) -> String {
         ErrorKind::NoCredentials => {
             format!("no credential — run `{cmd}` and sign in with /login")
         }
+        ErrorKind::StoreUnavailable => format!(
+            "couldn't read the credential store (not a missing login) — {}",
+            crate::credentials::UNAVAILABLE_HINT
+        ),
         ErrorKind::TokenExpired | ErrorKind::Unauthorized => format!(
             "token expired or rejected — run `{cmd}` once so Claude Code refreshes it \
              (this app never refreshes tokens)"
@@ -511,6 +515,17 @@ mod tests {
             advice(FetchError::NoCredentials(String::new()), "claude-secondary"),
             "claude-secondary: no credential — run \
              `CLAUDE_CONFIG_DIR=/Users/me/.claude-secondary claude` and sign in with /login"
+        );
+        let r = advice(
+            FetchError::StoreUnavailable("security exited 51".into()),
+            "default",
+        );
+        assert_eq!(
+            r,
+            format!(
+                "default: couldn't read the credential store (not a missing login) — {}",
+                crate::credentials::UNAVAILABLE_HINT
+            )
         );
         for e in [FetchError::TokenExpired, FetchError::Unauthorized] {
             let r = advice(e, "claude-secondary");

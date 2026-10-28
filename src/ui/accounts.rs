@@ -192,6 +192,8 @@ pub fn short_error(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::TokenExpired | ErrorKind::Unauthorized => "token expired",
         ErrorKind::NoCredentials => "not signed in",
+        ErrorKind::StoreUnavailable if cfg!(target_os = "macos") => "Keychain unavailable",
+        ErrorKind::StoreUnavailable => "credentials unreadable",
         ErrorKind::Forbidden => "access denied",
         ErrorKind::RateLimited => "rate limited",
         ErrorKind::Transport => "network error",
@@ -436,6 +438,12 @@ mod tests {
         assert_eq!(short_error(ErrorKind::TokenExpired), "token expired");
         assert_eq!(short_error(ErrorKind::Unauthorized), "token expired");
         assert_eq!(short_error(ErrorKind::NoCredentials), "not signed in");
+        let locked = short_error(ErrorKind::StoreUnavailable);
+        if cfg!(target_os = "macos") {
+            assert_eq!(locked, "Keychain unavailable");
+        } else {
+            assert_eq!(locked, "credentials unreadable");
+        }
         assert_eq!(short_error(ErrorKind::RateLimited), "rate limited");
     }
 }

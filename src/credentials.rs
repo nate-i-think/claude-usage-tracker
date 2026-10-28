@@ -83,6 +83,14 @@ pub enum CredError {
     Unavailable(String),
 }
 
+/// What to do when the credential store can't be read
+/// ([`CredError::Unavailable`]).
+pub const UNAVAILABLE_HINT: &str = if cfg!(target_os = "macos") {
+    "unlock the login keychain, or allow /usr/bin/security access when macOS asks"
+} else {
+    "check the credentials file's permissions"
+};
+
 /// A source of credentials.
 pub trait CredentialStore: Send + Sync {
     fn load(&self, loc: &CredentialLocator) -> Result<OAuthCredential, CredError>;
