@@ -45,7 +45,7 @@ pub enum Tone {
     Dim,
     /// Severity color.
     Level(Level),
-    /// The app's accent (Rich "cyan"): the "claude.ai usage" title of the
+    /// The app's accent (Rich "cyan"): the "Claude usage" title of the
     /// text report.
     Accent,
     /// Claude coral (#d97757): the FABLE burn tag.

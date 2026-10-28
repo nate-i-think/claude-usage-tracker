@@ -155,7 +155,7 @@ mod tests {
             window("Opus", Some(0.0), None),
         ]);
         let expected = "\
-claude.ai usage  ·  Max
+Claude usage  ·  Max
 
 5-hour           46.0%  resets in 1h 59m
 7-day all        20.0%  resets in 3d 1h
@@ -197,7 +197,7 @@ Projected use: 0%  ·  idle, safe to spin up agents
         }];
         let text = render(&d, "Max 5x", true, now());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "claude.ai usage  ·  Max 5x");
+        assert_eq!(lines[0], "Claude usage  ·  Max 5x");
         assert_eq!(lines[2], "5-hour           50.0%  resets in 1h 00m");
         assert_eq!(
             lines[4],

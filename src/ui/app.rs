@@ -97,8 +97,8 @@ pub struct App {
     pill_accounts: usize,
     /// eframe's stale window key has been dropped from storage (first pass).
     storage_cleaned: bool,
-    /// Every polled account and its latest results; the views show the
-    /// first one with data (see [`Accounts::primary`]).
+    /// Every polled account and its latest results; every view draws all
+    /// of them (the charts' freshness follows the first one with data).
     accounts: Accounts,
     /// The settings panel, while open.
     settings_panel: Option<SettingsPanel>,

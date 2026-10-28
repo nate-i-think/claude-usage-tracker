@@ -162,10 +162,10 @@ pub fn headroom_runs(h: &Headroom) -> Vec<Run> {
     ]
 }
 
-/// The header title: "claude.ai usage  ·  {plan}".
+/// The header title: "Claude usage  ·  {plan}".
 pub fn header_runs(plan: &str) -> Vec<Run> {
     vec![
-        Run::new("claude.ai usage", Tone::Accent),
+        Run::new("Claude usage", Tone::Accent),
         Run::new("  ·  ", Tone::Dim),
         Run::new(plan, Tone::Strong),
     ]
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn header() {
         let runs = header_runs("Max 5x");
-        assert_eq!(plain_text(&runs), "claude.ai usage  ·  Max 5x");
+        assert_eq!(plain_text(&runs), "Claude usage  ·  Max 5x");
         assert_eq!(runs[0].tone, Tone::Accent);
         assert_eq!(runs[1].tone, Tone::Dim);
         assert_eq!(runs[2], Run::new("Max 5x", Tone::Strong));

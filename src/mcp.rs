@@ -524,7 +524,7 @@ mod server {
     use super::*;
 
     const GET_USAGE_DESC: &str = "\
-Report the calling Claude Code profile's current claude.ai usage, plus
+Report the calling Claude Code profile's current Claude plan usage, plus
 other profiles, from the most recent monitor ping.
 
 Read-only and non-blocking. Use this to decide whether to slow down or keep
