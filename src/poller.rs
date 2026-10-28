@@ -267,7 +267,12 @@ fn build_dashboard(
             snapshot.fetched_at,
             snapshot.fable_pct(),
         ),
-        burners: storage::attribute_recent(&dirs.claude_code, &dirs.cowork, ws),
+        burners: storage::attribute_recent(
+            &dirs.claude_code,
+            &dirs.cowork,
+            ws,
+            &storage::CoworkFilter::All,
+        ),
         window_start: ws,
         window_end,
         window_samples,

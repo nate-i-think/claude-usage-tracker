@@ -5,6 +5,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::profiles::ProfileId;
+
 const APP_DIR_NAME: &str = "claude_usage_tui";
 
 /// The app's data directory and the files inside it.
@@ -29,6 +31,21 @@ impl Paths {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// One profile's own files: `<data>/profiles/<id>/`.
+    pub fn for_profile(&self, id: &ProfileId) -> Paths {
+        Self::with_data_dir(self.data_dir.join("profiles").join(id.as_str()))
+    }
+
+    /// Index of known profiles for out-of-process readers (CLI, MCP).
+    pub fn profiles_index_file(&self) -> PathBuf {
+        self.data_dir.join("profiles.json")
+    }
+
+    /// Present once the pre-profiles root files were copied to `default`.
+    pub fn legacy_marker_file(&self) -> PathBuf {
+        self.data_dir.join("profiles").join(".legacy-migrated")
     }
 
     /// Append-only history, one JSON object per line.
@@ -125,6 +142,25 @@ mod tests {
         assert_eq!(
             p.anonymous_id_file(),
             Path::new("base").join("anonymous_id")
+        );
+    }
+
+    #[test]
+    fn profile_files_live_under_profiles_dir() {
+        let p = Paths::with_data_dir(PathBuf::from("base"));
+        let id = ProfileId::new("claude-secondary");
+        let profile = p.for_profile(&id);
+        let dir = Path::new("base").join("profiles").join("claude-secondary");
+        assert_eq!(profile.data_dir(), dir);
+        assert_eq!(profile.history_file(), dir.join("history.jsonl"));
+        assert_eq!(profile.latest_file(), dir.join("latest.json"));
+        assert_eq!(
+            p.profiles_index_file(),
+            Path::new("base").join("profiles.json")
+        );
+        assert_eq!(
+            p.legacy_marker_file(),
+            Path::new("base").join("profiles").join(".legacy-migrated")
         );
     }
 

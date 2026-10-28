@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::analytics::{
@@ -20,6 +20,7 @@ use crate::analytics::{
 };
 use crate::model::{ExtraUsage, Snapshot, WeekBreakdown};
 use crate::paths::Paths;
+use crate::profiles::ProfileIndexEntry;
 
 /// One row of history.jsonl. Field names are the on-disk schema shared with
 /// the Python app; do not rename.
@@ -136,16 +137,23 @@ pub fn write_latest_snapshot(paths: &Paths, snap: &Snapshot) -> io::Result<()> {
         "extra": snap.extra.as_ref().map(extra_json),
         "seven_day_breakdown": snap.breakdown.as_ref().map(breakdown_json),
     });
+    write_atomic(&paths.latest_file(), payload.to_string().as_bytes())
+}
+
+/// Replace `target` with `bytes` atomically (temp + rename), so a concurrent
+/// reader never sees a half-written file. The parent directory must exist.
+fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = target.parent().unwrap_or(Path::new("."));
     // A uniquely named temp file, so the GUI and a concurrent `once` never
     // write the same temp path; persist() replaces the target (also on
     // Windows).
-    let mut tmp = tempfile::NamedTempFile::new_in(paths.data_dir())?;
-    tmp.write_all(payload.to_string().as_bytes())?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
     // Windows briefly denies a replace while another writer's replace of
     // the same target is in flight; retry a few times before giving up.
     let mut attempts = 0;
     loop {
-        match tmp.persist(paths.latest_file()) {
+        match tmp.persist(target) {
             Ok(_) => return Ok(()),
             Err(e) if e.error.kind() == io::ErrorKind::PermissionDenied && attempts < 20 => {
                 attempts += 1;
@@ -197,6 +205,103 @@ fn iso(dt: DateTime<Utc>) -> String {
     } else {
         dt.format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
     }
+}
+
+// --- Profiles: index, legacy migration, history archive -------------------
+
+/// `profiles.json`: which profiles exist and where, for the CLI and the MCP
+/// server. Never holds credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIndex {
+    pub version: u32,
+    pub profiles: Vec<ProfileIndexEntry>,
+}
+
+impl ProfileIndex {
+    pub const VERSION: u32 = 1;
+
+    pub fn new(profiles: Vec<ProfileIndexEntry>) -> Self {
+        Self {
+            version: Self::VERSION,
+            profiles,
+        }
+    }
+}
+
+/// Write `<data>/profiles.json` atomically (see [`write_latest_snapshot`]).
+pub fn write_profiles_index(root: &Paths, index: &ProfileIndex) -> io::Result<()> {
+    fs::create_dir_all(root.data_dir())?;
+    let text = serde_json::to_string_pretty(index).map_err(io::Error::other)?;
+    write_atomic(&root.profiles_index_file(), text.as_bytes())
+}
+
+/// The index written by [`write_profiles_index`], or `None` when the file
+/// is missing, unreadable, or corrupt.
+pub fn read_profiles_index(root: &Paths) -> Option<ProfileIndex> {
+    let text = fs::read_to_string(root.profiles_index_file()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Outcome of [`migrate_legacy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Migration {
+    /// At least one legacy file was copied.
+    Migrated,
+    /// The marker was already there; nothing was looked at.
+    AlreadyDone,
+    /// No legacy file needed copying.
+    NothingToDo,
+}
+
+/// One-time copy of the pre-profiles `history.jsonl` and `latest.json` from
+/// `root` into `target` (the default profile's directory). Each file is
+/// copied only when it exists and the target does not; originals stay. The
+/// marker is written either way, so later runs are a single `exists` check.
+pub fn migrate_legacy(root: &Paths, target: &Paths) -> io::Result<Migration> {
+    let marker = root.legacy_marker_file();
+    if marker.exists() {
+        return Ok(Migration::AlreadyDone);
+    }
+    let mut copied = false;
+    for (from, to) in [
+        (root.history_file(), target.history_file()),
+        (root.latest_file(), target.latest_file()),
+    ] {
+        if from.is_file() && !to.exists() {
+            fs::create_dir_all(target.data_dir())?;
+            fs::copy(&from, &to)?;
+            copied = true;
+        }
+    }
+    if let Some(dir) = marker.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&marker, "")?;
+    Ok(if copied {
+        Migration::Migrated
+    } else {
+        Migration::NothingToDo
+    })
+}
+
+/// Set a profile's history aside when its config dir now belongs to a
+/// different account: `history.jsonl` → `history.<old_uuid8>.jsonl`, adding
+/// `.1`, `.2`, … rather than replacing an earlier archive. No history is
+/// fine.
+pub fn archive_history(paths: &Paths, old_uuid8: &str) -> io::Result<()> {
+    let history = paths.history_file();
+    if !history.exists() {
+        return Ok(());
+    }
+    let mut archive = paths.data_dir().join(format!("history.{old_uuid8}.jsonl"));
+    let mut n = 0;
+    while archive.exists() {
+        n += 1;
+        archive = paths
+            .data_dir()
+            .join(format!("history.{old_uuid8}.{n}.jsonl"));
+    }
+    fs::rename(history, archive)
 }
 
 // --- Rollups for charts ----------------------------------------------------
@@ -319,10 +424,37 @@ fn window_samples(
 
 // --- Per-instance attribution from local JSONLs ----------------------------
 
+/// Which Cowork sessions [`attribute_recent`] counts, by the user-uuid
+/// folder they sit under (`<cowork>/<user-uuid>/<org-uuid>/local_*`), which
+/// is the account's `oauthAccount.accountUuid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoworkFilter {
+    /// Every session.
+    All,
+    /// Only sessions under this account uuid.
+    Account(String),
+    /// Every session except those under these account uuids (the default
+    /// profile takes what no other profile claims).
+    Unmatched(Vec<String>),
+    /// No Cowork sessions.
+    None,
+}
+
+impl CoworkFilter {
+    fn admits(&self, user_uuid: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Account(uuid) => uuid.eq_ignore_ascii_case(user_uuid),
+            Self::Unmatched(uuids) => !uuids.iter().any(|u| u.eq_ignore_ascii_case(user_uuid)),
+            Self::None => false,
+        }
+    }
+}
+
 /// Token usage since `window_start` per Claude Code project (each subdir of
 /// `claude_code_dir`) and per Cowork session (`*/*/local_*` under
-/// `cowork_dir`), sorted by tokens, highest first. Instances with no tokens
-/// are omitted.
+/// `cowork_dir`, limited by `cowork_filter`), sorted by tokens, highest
+/// first. Instances with no tokens are omitted.
 ///
 /// Files last modified before `window_start` are skipped unread: they cannot
 /// hold entries newer than their mtime.
@@ -330,6 +462,7 @@ pub fn attribute_recent(
     claude_code_dir: &Path,
     cowork_dir: &Path,
     window_start: DateTime<Utc>,
+    cowork_filter: &CoworkFilter,
 ) -> Vec<InstanceUsage> {
     let mut out = Vec::new();
 
@@ -353,6 +486,7 @@ pub fn attribute_recent(
     // Cowork groups by user-uuid/org-uuid/local_session-uuid.
     for session_dir in subdirs(cowork_dir)
         .iter()
+        .filter(|d| cowork_filter.admits(&file_name(d)))
         .flat_map(|d| subdirs(d))
         .flat_map(|d| subdirs(&d))
         .filter(|d| file_name(d).starts_with("local_"))
@@ -594,6 +728,7 @@ fn from_unix_seconds(ts: f64) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::model::{parse_breakdown, BreakdownRow, UsageWindow, WeekBreakdown};
+    use crate::profiles::{ProfileId, DEFAULT_ID};
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
@@ -921,6 +1056,158 @@ mod tests {
         assert_eq!(read_latest_snapshot(&paths), None);
     }
 
+    // --- profiles: migration, index, archive -------------------------------------
+
+    fn default_target(root: &Paths) -> Paths {
+        root.for_profile(&ProfileId::new(DEFAULT_ID))
+    }
+
+    #[test]
+    fn migrate_copies_missing_targets_and_keeps_originals() {
+        let (_tmp, root) = temp_paths();
+        write_history(&root, &[r#"{"ts": 1}"#.into()]);
+        fs::write(root.latest_file(), "{\"x\":1}").unwrap();
+        let target = default_target(&root);
+
+        assert_eq!(migrate_legacy(&root, &target).unwrap(), Migration::Migrated);
+        assert_eq!(
+            fs::read_to_string(target.history_file()).unwrap(),
+            "{\"ts\": 1}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(target.latest_file()).unwrap(),
+            "{\"x\":1}"
+        );
+        assert!(root.history_file().exists() && root.latest_file().exists());
+        assert!(root.legacy_marker_file().exists());
+
+        // A second run is a no-op, even if the copies were removed.
+        fs::remove_file(target.history_file()).unwrap();
+        assert_eq!(
+            migrate_legacy(&root, &target).unwrap(),
+            Migration::AlreadyDone
+        );
+        assert!(!target.history_file().exists());
+    }
+
+    #[test]
+    fn migrate_never_overwrites_existing_target() {
+        let (_tmp, root) = temp_paths();
+        write_history(&root, &["old".into()]);
+        fs::write(root.latest_file(), "old-latest").unwrap();
+        let target = default_target(&root);
+        write_history(&target, &["new".into()]);
+
+        // history.jsonl is kept; latest.json is still copied independently.
+        assert_eq!(migrate_legacy(&root, &target).unwrap(), Migration::Migrated);
+        assert_eq!(fs::read_to_string(target.history_file()).unwrap(), "new\n");
+        assert_eq!(
+            fs::read_to_string(target.latest_file()).unwrap(),
+            "old-latest"
+        );
+
+        // Both targets present: nothing copied, marker still written.
+        let (_tmp2, root2) = temp_paths();
+        write_history(&root2, &["old".into()]);
+        let target2 = default_target(&root2);
+        write_history(&target2, &["new".into()]);
+        assert_eq!(
+            migrate_legacy(&root2, &target2).unwrap(),
+            Migration::NothingToDo
+        );
+        assert_eq!(fs::read_to_string(target2.history_file()).unwrap(), "new\n");
+        assert!(root2.legacy_marker_file().exists());
+    }
+
+    #[test]
+    fn migrate_without_legacy_files_is_nothing_to_do() {
+        let (_tmp, root) = temp_paths();
+        let target = default_target(&root);
+        assert_eq!(
+            migrate_legacy(&root, &target).unwrap(),
+            Migration::NothingToDo
+        );
+        assert!(!target.history_file().exists() && !target.latest_file().exists());
+        assert!(root.legacy_marker_file().exists());
+        assert_eq!(
+            migrate_legacy(&root, &target).unwrap(),
+            Migration::AlreadyDone
+        );
+    }
+
+    fn index_entry(id: &str, env: Option<&str>) -> ProfileIndexEntry {
+        ProfileIndexEntry {
+            id: ProfileId::new(id),
+            label: format!("{id}-label"),
+            color: 2,
+            config_dir: PathBuf::from(format!("/home/u/.{id}")),
+            config_dir_env: env.map(str::to_owned),
+            email: Some(format!("{id}@example.com")),
+            account_uuid: Some("0123abcd-0000".into()),
+            is_default: id == DEFAULT_ID,
+        }
+    }
+
+    #[test]
+    fn profiles_index_round_trip() {
+        let (_tmp, root) = temp_paths();
+        let index = ProfileIndex::new(vec![
+            index_entry(DEFAULT_ID, None),
+            index_entry("claude-secondary", Some("/home/u/.claude-secondary")),
+        ]);
+        assert_eq!(index.version, 1);
+        write_profiles_index(&root, &index).unwrap();
+        assert_eq!(read_profiles_index(&root), Some(index.clone()));
+
+        // Overwrites in place, leaving no temp files behind.
+        let one = ProfileIndex::new(vec![index_entry(DEFAULT_ID, None)]);
+        write_profiles_index(&root, &one).unwrap();
+        assert_eq!(read_profiles_index(&root), Some(one));
+        let names: Vec<String> = fs::read_dir(root.data_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["profiles.json"]);
+    }
+
+    #[test]
+    fn profiles_index_missing_or_corrupt_is_none() {
+        let (_tmp, root) = temp_paths();
+        assert_eq!(read_profiles_index(&root), None);
+        fs::create_dir_all(root.data_dir()).unwrap();
+        fs::write(root.profiles_index_file(), "{\"version\": 1, \"prof").unwrap();
+        assert_eq!(read_profiles_index(&root), None);
+        fs::write(root.profiles_index_file(), "[]").unwrap();
+        assert_eq!(read_profiles_index(&root), None);
+    }
+
+    #[test]
+    fn archive_history_renames_without_clobbering() {
+        let (_tmp, root) = temp_paths();
+        let p = default_target(&root);
+        // No history: nothing to do.
+        archive_history(&p, "0123abcd").unwrap();
+        assert!(!p.data_dir().exists());
+
+        let dir = p.data_dir().to_path_buf();
+        for (n, archived) in [
+            "history.0123abcd.jsonl",
+            "history.0123abcd.1.jsonl",
+            "history.0123abcd.2.jsonl",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_history(&p, &[format!("run {n}")]);
+            archive_history(&p, "0123abcd").unwrap();
+            assert!(!p.history_file().exists());
+            assert_eq!(
+                fs::read_to_string(dir.join(archived)).unwrap(),
+                format!("run {n}\n")
+            );
+        }
+    }
+
     #[test]
     fn rollups_window_week_and_weekly_series() {
         let (_tmp, paths) = temp_paths();
@@ -1085,7 +1372,7 @@ mod tests {
             &[json!({"ts": cutoff_s + 1.0, "usage": {"input_tokens": 7777}})],
         );
 
-        let got = attribute_recent(&cc, &cw, cutoff);
+        let got = attribute_recent(&cc, &cw, cutoff, &CoworkFilter::All);
         assert_eq!(
             got,
             vec![
@@ -1163,7 +1450,7 @@ mod tests {
             &[used(s + 5.0, 10, None)],
         );
 
-        let got = attribute_recent(&cc, &tmp.path().join("cw"), cutoff);
+        let got = attribute_recent(&cc, &tmp.path().join("cw"), cutoff, &CoworkFilter::All);
         let names: Vec<(&str, &str)> = got
             .iter()
             .map(|i| (i.name.as_str(), i.display_name.as_str()))
@@ -1188,6 +1475,7 @@ mod tests {
             &tmp.path().join("nope"),
             &tmp.path().join("nada"),
             Utc::now(),
+            &CoworkFilter::All,
         );
         assert!(got.is_empty());
     }
@@ -1200,7 +1488,53 @@ mod tests {
         // Entry claims a recent timestamp, but the file is older than the window.
         write_lines(&f, &[json!({"ts": 4.0e9, "usage": {"input_tokens": 9}})]);
         let window_start = Utc::now() + Duration::hours(1);
-        assert!(attribute_recent(&cc, &tmp.path().join("cw"), window_start).is_empty());
+        assert!(attribute_recent(
+            &cc,
+            &tmp.path().join("cw"),
+            window_start,
+            &CoworkFilter::All
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn attribution_cowork_filter_by_user_uuid_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cc = tmp.path().join("projects");
+        let cw = tmp.path().join("sessions");
+        let cutoff = utc(2026, 10, 11, 10, 0, 0);
+        let cutoff_s = unix_seconds(cutoff);
+        for (user, session, tokens) in [
+            ("AAAA1111-uuid", "local_aaaa0001", 30),
+            ("bbbb2222-uuid", "local_bbbb0001", 20),
+            ("skills-plugin", "local_cccc0001", 10),
+        ] {
+            write_lines(
+                &cw.join(user).join("org").join(session).join("s.jsonl"),
+                &[json!({"ts": cutoff_s + 1.0, "usage": {"input_tokens": tokens}})],
+            );
+        }
+        let names = |filter: CoworkFilter| -> Vec<String> {
+            attribute_recent(&cc, &cw, cutoff, &filter)
+                .into_iter()
+                .map(|i| i.name)
+                .collect()
+        };
+
+        assert_eq!(
+            names(CoworkFilter::All),
+            ["cowork:aaaa0001", "cowork:bbbb0001", "cowork:cccc0001"]
+        );
+        // Uuids compare case-insensitively.
+        assert_eq!(
+            names(CoworkFilter::Account("aaaa1111-UUID".into())),
+            ["cowork:aaaa0001"]
+        );
+        assert_eq!(
+            names(CoworkFilter::Unmatched(vec!["bbbb2222-uuid".into()])),
+            ["cowork:aaaa0001", "cowork:cccc0001"]
+        );
+        assert!(names(CoworkFilter::None).is_empty());
     }
 
     #[test]
