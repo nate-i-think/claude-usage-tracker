@@ -131,9 +131,14 @@ impl SettingsDraft {
 
     /// Add a hand-typed config dir as a new enabled row. The path is
     /// normalized first (see [`profiles::normalize_config_dir`]); a dir
-    /// already listed is rejected.
+    /// already listed is rejected. `~/.claude` is the default profile
+    /// (`CLAUDE_CONFIG_DIR` unset, so its own Keychain service), added
+    /// only while there is none.
     pub fn add_folder(&mut self, input: &str, home: &Path) -> Result<(), String> {
         let dir = profiles::normalize_config_dir(input, home)?;
+        if profiles::is_default_dir(&dir, home) {
+            return self.add_default(home);
+        }
         if self
             .profiles
             .iter()
@@ -145,6 +150,27 @@ impl SettingsDraft {
         self.profiles
             .push(ProfileDraft::from_saved(&ProfileSettings {
                 id,
+                config_dir: dir,
+                enabled: true,
+                manual: true,
+                ..ProfileSettings::default()
+            }));
+        Ok(())
+    }
+
+    /// Add `~/.claude` as the default profile, unless it is already listed.
+    fn add_default(&mut self, home: &Path) -> Result<(), String> {
+        let dir = profiles::default_config_dir(home);
+        let listed = self.profiles.iter().any(|p| {
+            p.saved.id == profiles::DEFAULT_ID
+                || profiles::same_config_dir(&p.saved.config_dir, &dir, home)
+        });
+        if listed {
+            return Err(format!("{} is already the default profile", dir.display()));
+        }
+        self.profiles
+            .push(ProfileDraft::from_saved(&ProfileSettings {
+                id: profiles::DEFAULT_ID.to_owned(),
                 config_dir: dir,
                 enabled: true,
                 manual: true,
@@ -1082,6 +1108,33 @@ mod tests {
     }
 
     #[test]
+    fn add_folder_maps_the_home_claude_dir_to_the_default_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // ~/.claude didn't exist at discovery, so there is no default row.
+        let current = Settings {
+            profiles: vec![profile("claude-b", &home.join(".claude-b"))],
+            ..Settings::default()
+        };
+        let mut d = SettingsDraft::from_settings(&current);
+        d.add_folder(&format!("{}/.claude/", home.display()), home)
+            .unwrap();
+        let row = d.profiles.last().unwrap();
+        assert_eq!(row.saved.id, profiles::DEFAULT_ID);
+        assert_eq!(row.saved.config_dir, home.join(".claude"));
+        assert_eq!(row.effective_keychain_service(), "Claude Code-credentials");
+        // Polled as the default profile: no CLAUDE_CONFIG_DIR.
+        let built = built_profiles(&d, &current);
+        let polled = profiles::resolve(&built, &[]);
+        let default = polled.iter().find(|p| p.id.is_default()).unwrap();
+        assert_eq!(default.config_dir_env, None);
+        assert_eq!(default.keychain_service(), "Claude Code-credentials");
+        // Once is enough.
+        let err = d.add_folder("~/.claude", home).unwrap_err();
+        assert!(err.contains("already the default profile"), "{err}");
+    }
+
+    #[test]
     fn add_folder_rejects_duplicates_and_bad_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
@@ -1093,10 +1146,13 @@ mod tests {
             "~/.claude-b".to_owned(),
             "~/.claude-b/".to_owned(),
             format!("{}/.claude-b", home.display()),
-            "~/.claude".to_owned(),
         ] {
             let err = d.add_folder(&dup, home).unwrap_err();
             assert!(err.contains("already listed"), "{dup}: {err}");
+        }
+        for default in ["~/.claude", "~/.claude/"] {
+            let err = d.add_folder(default, home).unwrap_err();
+            assert!(err.contains("already the default profile"), "{err}");
         }
         assert!(d.add_folder("", home).is_err());
         assert!(d.add_folder("relative/dir", home).is_err());

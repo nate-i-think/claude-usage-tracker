@@ -399,8 +399,22 @@ pub fn find<'a>(profiles: &'a [Profile], query: &str, home: &Path) -> Option<&'a
         })
 }
 
+/// The default profile's config dir under `home`: `~/.claude`, which Claude
+/// Code uses with `CLAUDE_CONFIG_DIR` unset.
+pub fn default_config_dir(home: &Path) -> PathBuf {
+    home.join(".claude")
+}
+
+/// Whether `dir` is the default profile's config dir (see
+/// [`same_config_dir`]).
+pub fn is_default_dir(dir: &Path, home: &Path) -> bool {
+    same_config_dir(dir, &default_config_dir(home), home)
+}
+
 /// A new id for a hand-added config dir: its name as a slug (as discovery
-/// would give it), never `default`, made unique against `taken`.
+/// would give it), never `default`, made unique against `taken`. (A
+/// hand-added `~/.claude` is the default profile instead; see
+/// [`is_default_dir`].)
 pub fn manual_id(config_dir: &Path, taken: impl Fn(&str) -> bool) -> String {
     let name = config_dir
         .file_name()
@@ -948,6 +962,17 @@ mod tests {
         let dir = profile_dir(home, ".claude-b", None);
         assert!(same_config_dir(&dir, Path::new("~/.claude-b/"), home));
         assert!(!same_config_dir(&dir, Path::new("~/.claude-c"), home));
+    }
+
+    #[test]
+    fn default_dir_is_home_dot_claude_however_typed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert_eq!(default_config_dir(home), home.join(".claude"));
+        assert!(is_default_dir(&home.join(".claude"), home));
+        assert!(is_default_dir(Path::new("~/.claude/"), home));
+        assert!(!is_default_dir(&home.join(".claude-b"), home));
+        assert!(!is_default_dir(&home.join("x").join(".claude"), home));
     }
 
     #[test]
