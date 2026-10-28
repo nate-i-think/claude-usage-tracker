@@ -516,7 +516,7 @@ mod tests {
         assert!(close(e, FRAC_PI_2));
         let (s, e) = arc_angles(Some(130.0)).unwrap();
         assert!(close(e - s, TAU), "clamped to a full circle");
-        let (s, e) = arc_angles(Some(-5.0)).map_or((0.0, 0.0), |a| a);
+        let (s, e) = arc_angles(Some(-5.0)).unwrap_or((0.0, 0.0));
         assert_eq!((s, e), (0.0, 0.0), "negative → no arc");
 
         // Points: from 12 o'clock to 3 o'clock for 25 % (y down).
