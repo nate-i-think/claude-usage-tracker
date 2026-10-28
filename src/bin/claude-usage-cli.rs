@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use chrono::Utc;
@@ -6,7 +7,8 @@ use clap::{Parser, Subcommand};
 use claude_usage::config::Settings;
 use claude_usage::mcp::McpConfig;
 use claude_usage::paths::Paths;
-use claude_usage::poller::{self, BurnHistory, FetchErrorInfo, HttpSource, SessionDirs};
+use claude_usage::poller::{self, FetchErrorInfo, PollerDeps};
+use claude_usage::profiles::Profile;
 use claude_usage::text_report;
 
 #[derive(Parser)]
@@ -42,45 +44,57 @@ fn main() -> ExitCode {
     }
 }
 
-/// One poll of the default Claude Code profile through the shared poller
-/// path (appends to history.jsonl and refreshes latest.json), printed as
-/// plain text. The GUI's saved settings are not read.
+/// One poll of every enabled Claude Code profile through the shared poller
+/// path (each appends to its own history.jsonl and refreshes its
+/// latest.json), printed as plain text, one section per profile. The GUI's
+/// saved settings are not read: every discovered profile is polled.
 fn once(plan: String, show_all: bool) -> ExitCode {
-    let paths = Paths::platform_default();
     let settings = Settings {
         plan,
         show_all,
         ..Settings::default()
     };
-    let profile = poller::default_profile();
-    let dirs = SessionDirs::for_profile(&profile);
-    let mut history = BurnHistory::seeded(&paths, Utc::now());
-    let result = poller::poll_once(
-        &mut HttpSource::for_profile(&profile),
-        &paths,
-        &dirs,
-        &settings,
-        &mut history,
+    let mut runtimes = poller::prepare_runtimes(
+        PollerDeps::platform(),
+        Paths::platform_default(),
+        settings.clone(),
     );
-    match result {
-        Ok(d) => {
-            print!(
-                "{}",
-                text_report::render(&d, &settings.plan, settings.show_all, Utc::now())
-            );
-            match d.persist_error {
-                Some(e) => {
+    if runtimes.is_empty() {
+        eprintln!("error: no Claude Code profile found — run `claude` and sign in");
+        return ExitCode::FAILURE;
+    }
+    let all: Vec<Profile> = runtimes.iter().map(|rt| rt.profile.clone()).collect();
+    let mut failed = false;
+    for (i, rt) in runtimes.iter_mut().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("── {} ({}) ──", rt.profile.label, rt.profile.id);
+        let cowork = poller::cowork_filter(&rt.profile, &all);
+        match poller::poll_profile(rt, &cowork) {
+            Ok(d) => {
+                print!(
+                    "{}",
+                    text_report::render(&d, &settings.plan, settings.show_all, Utc::now())
+                );
+                if let Some(e) = d.persist_error {
                     eprintln!("error: {e}");
-                    ExitCode::FAILURE
+                    failed = true;
                 }
-                None => ExitCode::SUCCESS,
+            }
+            Err(e) => {
+                let info = FetchErrorInfo::for_profile(&e, &rt.profile);
+                // After this section's header, even when stdout is a pipe.
+                let _ = io::stdout().flush();
+                eprintln!("error: {}", info.message);
+                failed = true;
             }
         }
-        Err(e) => {
-            let info = FetchErrorInfo::for_dir(&e, dirs.config_dir());
-            eprintln!("error: {}", info.message);
-            ExitCode::FAILURE
-        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

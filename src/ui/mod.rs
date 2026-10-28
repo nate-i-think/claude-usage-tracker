@@ -5,6 +5,7 @@
 //! testable formatters in [`rows`], then turned into egui text here. Colors,
 //! fonts and spacing come from [`theme`], the one source of visual truth.
 
+pub mod accounts;
 pub mod alerts;
 pub mod app;
 pub mod banners;

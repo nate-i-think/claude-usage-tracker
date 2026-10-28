@@ -125,6 +125,8 @@ mod tests {
             week_end: now(),
             week_samples: Vec::new(),
             persist_error: None,
+            plan: None,
+            token_expires_at: None,
         }
     }
 

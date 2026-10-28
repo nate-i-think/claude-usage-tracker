@@ -18,8 +18,9 @@ use eframe::egui::{
 
 use crate::config::{Pos, Settings, UiMode};
 use crate::paths::Paths;
-use crate::poller::{Dashboard, FetchErrorInfo, PollEvent, PollMsg, Poller};
+use crate::poller::{Dashboard, PollMsg, Poller};
 
+use super::accounts::{self, Accounts};
 use super::alerts::AlertHook;
 use super::banners::{banner, BannerKind};
 use super::layout::{self, right_then_left, GAP};
@@ -41,29 +42,6 @@ const EGUI_MEMORY_KEY: &str = "egui";
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 /// Repaint cadence so "last polled" and the countdowns tick while idle.
 const TICK: Duration = Duration::from_secs(1);
-
-/// The latest poll results as the dashboard sees them.
-#[derive(Debug, Default)]
-pub struct PollState {
-    /// The last successful poll; kept across failures.
-    pub data: Option<Box<Dashboard>>,
-    /// The most recent failure, cleared by the next success.
-    pub error: Option<FetchErrorInfo>,
-}
-
-impl PollState {
-    /// Fold one poller event in: success replaces the data and clears the
-    /// error; failure keeps the last good data and records the error.
-    pub fn apply(&mut self, event: PollEvent) {
-        match event {
-            PollEvent::Ok(dashboard) => {
-                self.data = Some(dashboard);
-                self.error = None;
-            }
-            PollEvent::Err(info) => self.error = Some(info),
-        }
-    }
-}
 
 /// Whether the refresh button is usable again, given its last click.
 pub fn refresh_ready(last_click: Option<Instant>, now: Instant) -> bool {
@@ -115,7 +93,9 @@ pub struct App {
     pill: PillState,
     /// eframe's stale window key has been dropped from storage (first pass).
     storage_cleaned: bool,
-    state: PollState,
+    /// Every polled account and its latest results; the views show the
+    /// first one with data (see [`Accounts::primary`]).
+    accounts: Accounts,
     /// The settings panel, while open.
     settings_panel: Option<SettingsPanel>,
     last_refresh: Option<Instant>,
@@ -195,7 +175,7 @@ impl App {
             settle: Settle::default(),
             pill: PillState::default(),
             storage_cleaned: false,
-            state: PollState::default(),
+            accounts: Accounts::default(),
             settings_panel: None,
             last_refresh: None,
             pulse_tracker: motion::PulseTracker::default(),
@@ -213,15 +193,25 @@ impl App {
         app
     }
 
-    /// The last poll failed or the poller has stopped (the tray tooltip
-    /// and the pill's state dot say so).
+    /// An account's last poll failed or the poller has stopped (the tray
+    /// tooltip and the pill's state dot say so).
     fn poll_failing(&self) -> bool {
-        self.state.error.is_some() || !self.poller.is_alive()
+        self.accounts.any_error() || !self.poller.is_alive()
+    }
+
+    /// The shown account's latest successful poll.
+    fn data(&self) -> Option<&Dashboard> {
+        self.accounts.primary()?.poll.data.as_deref()
     }
 
     fn drain_events(&mut self) {
         while let Some(event) = self.poller.try_recv() {
-            self.state.apply(event);
+            if self.accounts.apply(event, &mut self.settings) {
+                // Newly discovered profiles, merged into the settings to
+                // persist; the poller polls them already, so this is no
+                // reason to tell it.
+                self.poller_settings.profiles = self.settings.profiles.clone();
+            }
         }
     }
 
@@ -315,8 +305,12 @@ impl App {
     /// threshold alerts for a new poll, and a clicked toast showing the
     /// window.
     fn background_hooks(&mut self, ctx: &egui::Context) {
+        let shown = self.accounts.primary().and_then(|a| {
+            let d = a.poll.data.as_deref()?;
+            Some((&a.profile.id, d))
+        });
         self.alerts
-            .after_poll(self.state.data.as_deref(), &mut self.settings, Utc::now());
+            .after_poll(shown, &mut self.settings, Utc::now());
         if self.toast_clicks.try_iter().count() > 0 {
             self.show(ctx);
         }
@@ -328,11 +322,7 @@ impl App {
     /// the window is shown, so the three pulses play where they are seen.
     fn update_motion(&mut self, ctx: &egui::Context) {
         motion::set_reduce_motion(ctx, self.settings.reduce_motion);
-        let five = self
-            .state
-            .data
-            .as_ref()
-            .map(|d| d.five_hour_now(Utc::now()));
+        let five = self.data().map(|d| d.five_hour_now(Utc::now()));
         self.pulse = self.pulse_tracker.update(
             five.and_then(|f| f.pct),
             five.and_then(|f| f.resets_at),
@@ -351,9 +341,7 @@ impl App {
     fn header(&mut self, ui: &mut Ui) {
         let now = Utc::now();
         let chips = self
-            .state
-            .data
-            .as_ref()
+            .data()
             .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now));
         let pulse = self.pulse.level;
         right_then_left(
@@ -425,9 +413,7 @@ impl App {
         let palette = theme::Palette::for_visuals(ui.visuals());
         let now = Utc::now();
         let chips = self
-            .state
-            .data
-            .as_ref()
+            .data()
             .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now))
             .unwrap_or_default();
         let failed = self.poll_failing();
@@ -468,26 +454,34 @@ impl App {
                 ui.label(RichText::new("Restart the app to resume polling.").color(palette.text));
             });
         }
-        if let Some(err) = &self.state.error {
-            let message = err.message.clone();
+        for a in self.accounts.list() {
+            if let Some(err) = &a.poll.error {
+                let heading = format!("{} — {}", a.profile.label, accounts::short_error(err.kind));
+                banner(ui, BannerKind::Error, |ui| {
+                    ui.label(title(&heading, palette.danger));
+                    ui.add(
+                        egui::Label::new(RichText::new(&err.message).color(palette.text)).wrap(),
+                    );
+                });
+            }
+            if let Some(persist) = a.poll.data.as_ref().and_then(|d| d.persist_error.as_ref()) {
+                let heading = format!("{} — history not saved", a.profile.label);
+                banner(ui, BannerKind::Warning, |ui| {
+                    ui.label(title(&heading, palette.high));
+                    ui.add(egui::Label::new(RichText::new(persist).color(palette.text)).wrap());
+                });
+            }
+        }
+        if self.accounts.known() && self.accounts.list().is_empty() {
             banner(ui, BannerKind::Error, |ui| {
-                ui.label(title("claude.ai usage — error", palette.danger));
-                ui.add(egui::Label::new(RichText::new(message).color(palette.text)).wrap());
+                ui.label(title("No Claude Code login found", palette.danger));
+                ui.label(
+                    RichText::new("Run `claude` and sign in; accounts appear here on their own.")
+                        .color(palette.text),
+                );
             });
-        }
-        if let Some(persist) = self
-            .state
-            .data
-            .as_ref()
-            .and_then(|d| d.persist_error.as_ref())
-        {
-            banner(ui, BannerKind::Warning, |ui| {
-                ui.label(title("History not saved", palette.high));
-                ui.add(egui::Label::new(RichText::new(persist).color(palette.text)).wrap());
-            });
-        }
-        // While the first poll is failing, the error banner says it all.
-        if self.state.data.is_none() && self.state.error.is_none() {
+        } else if !self.accounts.any_data() && !self.accounts.any_error() {
+            // While a first poll is failing, its error banner says it all.
             banner(ui, BannerKind::Loading, |ui| {
                 ui.label(RichText::new("Loading usage…").color(palette.text_muted));
             });
@@ -613,7 +607,8 @@ impl eframe::App for App {
                     self.header(ui);
                     self.settings_panel(ui);
                     self.banners(ui);
-                    if let Some(d) = &self.state.data {
+                    let shown = self.accounts.primary().and_then(|a| a.poll.data.as_deref());
+                    if let Some(d) = shown {
                         dashboard(ui, d, &mut self.settings);
                     }
                 });
@@ -634,44 +629,8 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Snapshot, UsageWindow};
     use chrono::DateTime;
     use eframe::Storage;
-
-    fn dashboard(pct: f64) -> Box<Dashboard> {
-        let t = DateTime::from_timestamp(1_791_000_000, 0).unwrap();
-        Box::new(Dashboard {
-            snapshot: Snapshot {
-                fetched_at: t,
-                windows: vec![UsageWindow {
-                    label: "5-hour".to_owned(),
-                    utilization: Some(pct),
-                    resets_at: None,
-                }],
-                extra: None,
-                breakdown: None,
-            },
-            history: Vec::new(),
-            fable_history: Vec::new(),
-            seven_day_recent: Vec::new(),
-            fable_recent: Vec::new(),
-            burners: Vec::new(),
-            window_start: t,
-            window_end: t,
-            window_samples: Vec::new(),
-            week_start: t,
-            week_end: t,
-            week_samples: Vec::new(),
-            persist_error: None,
-        })
-    }
-
-    fn err(message: &str) -> PollEvent {
-        PollEvent::Err(FetchErrorInfo {
-            kind: crate::fetch::ErrorKind::Status,
-            message: message.to_owned(),
-        })
-    }
 
     #[test]
     fn snapshot_stale_after_two_poll_intervals() {
@@ -684,34 +643,6 @@ mod tests {
         assert!(!snapshot_stale(t, at(0), &settings));
         assert!(!snapshot_stale(t, at(120), &settings));
         assert!(snapshot_stale(t, at(121), &settings));
-    }
-
-    #[test]
-    fn error_keeps_last_good_data_and_success_clears_error() {
-        let mut state = PollState::default();
-        state.apply(err("request failed: timed out"));
-        assert!(state.data.is_none());
-        assert_eq!(
-            state.error.as_ref().unwrap().message,
-            "request failed: timed out"
-        );
-
-        state.apply(PollEvent::Ok(dashboard(10.0)));
-        assert!(state.error.is_none());
-
-        state.apply(err("HTTP 500: oops"));
-        assert_eq!(
-            state.data.as_ref().unwrap().snapshot.five_hour_pct(),
-            Some(10.0)
-        );
-        assert!(state.error.is_some());
-
-        state.apply(PollEvent::Ok(dashboard(20.0)));
-        assert_eq!(
-            state.data.as_ref().unwrap().snapshot.five_hour_pct(),
-            Some(20.0)
-        );
-        assert!(state.error.is_none());
     }
 
     #[derive(Default)]

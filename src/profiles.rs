@@ -125,6 +125,25 @@ impl Profile {
     pub fn short_label(&self) -> &str {
         truncate_chars(&self.label, MAX_LABEL_CHARS)
     }
+
+    /// The account's `accountUuid`, when known.
+    pub fn account_uuid(&self) -> Option<&str> {
+        self.account.as_ref()?.account_uuid.as_deref()
+    }
+
+    /// This profile's `profiles.json` entry (no secrets).
+    pub fn index_entry(&self) -> ProfileIndexEntry {
+        ProfileIndexEntry {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            color: self.color,
+            config_dir: self.config_dir.clone(),
+            config_dir_env: self.config_dir_env.clone(),
+            email: self.account.as_ref().and_then(|a| a.email.clone()),
+            account_uuid: self.account_uuid().map(str::to_owned),
+            is_default: self.id.is_default(),
+        }
+    }
 }
 
 /// One profile in `profiles.json`, the index out-of-process readers (CLI,
@@ -228,19 +247,6 @@ pub fn discover(home: &Path) -> Vec<Discovered> {
     found
 }
 
-/// The default profile (`<home>/.claude`), filled in from discovery when
-/// that finds it. Used until every enabled profile is polled.
-pub fn default_profile(home: &Path) -> Profile {
-    let saved = [ProfileSettings {
-        id: DEFAULT_ID.to_owned(),
-        config_dir: home.join(".claude"),
-        ..ProfileSettings::default()
-    }];
-    resolve(&saved, &discover(home))
-        .pop()
-        .expect("an enabled saved profile resolves")
-}
-
 /// Append each discovered profile not yet saved (matched by config dir) to
 /// `saved`, keeping its order and leaving disabled entries disabled. Returns
 /// whether anything was added.
@@ -294,6 +300,14 @@ pub fn resolve(saved: &[ProfileSettings], found: &[Discovered]) -> Vec<Profile> 
             }
         })
         .collect()
+}
+
+/// The profiles to poll: `saved` with anything newly `found` merged in
+/// (see [`merge_discovered`]), resolved (see [`resolve`]).
+pub fn polled(saved: &[ProfileSettings], found: &[Discovered]) -> Vec<Profile> {
+    let mut merged = saved.to_vec();
+    merge_discovered(&mut merged, found);
+    resolve(&merged, found)
 }
 
 /// The index entry for a `CLAUDE_CONFIG_DIR` value: unset (or empty) means
@@ -734,20 +748,56 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_with_and_without_discovery() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let p = default_profile(home);
-        assert!(p.id.is_default());
-        assert_eq!(p.config_dir, home.join(".claude"));
-        assert_eq!(p.config_dir_env, None);
-        assert_eq!(p.account, None);
+    fn polled_merges_new_discoveries_and_skips_disabled() {
+        let discovered = [
+            found("default", "/h/.claude", None, Some("a@x.com")),
+            found(
+                "claude-b",
+                "/h/.claude-b",
+                Some("/h/.claude-b"),
+                Some("b@x.com"),
+            ),
+        ];
+        // Nothing saved yet: everything discovered is polled.
+        let got = polled(&[], &discovered);
+        assert_eq!(
+            got.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["default", "claude-b"]
+        );
+        // A disabled saved entry stays off; overrides apply.
+        let saved = vec![
+            ProfileSettings {
+                enabled: false,
+                ..saved("default", Path::new("/h/.claude"))
+            },
+            ProfileSettings {
+                keychain_service: Some("svc".into()),
+                ..saved("claude-b", Path::new("/h/.claude-b"))
+            },
+        ];
+        let got = polled(&saved, &discovered);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].keychain_service(), "svc");
+    }
 
-        fs::create_dir(home.join(".claude")).unwrap();
-        fs::write(home.join(".claude.json"), identity("nate@x.com", "u-1")).unwrap();
-        let p = default_profile(home);
-        assert_eq!(p.label, "nate");
-        assert_eq!(p.keychain_service(), "Claude Code-credentials");
+    #[test]
+    fn index_entry_carries_identity_without_secrets() {
+        let got = polled(
+            &[],
+            &[found(
+                "claude-b",
+                "/h/.claude-b",
+                Some("/h/.claude-b"),
+                Some("b@x.com"),
+            )],
+        );
+        let e = got[0].index_entry();
+        assert_eq!(e.id.as_str(), "claude-b");
+        assert_eq!(e.email.as_deref(), Some("b@x.com"));
+        assert_eq!(e.account_uuid.as_deref(), Some("uuid-b@x.com"));
+        assert_eq!(got[0].account_uuid(), Some("uuid-b@x.com"));
+        assert_eq!(e.config_dir_env.as_deref(), Some("/h/.claude-b"));
+        assert!(!e.is_default);
     }
 
     #[test]

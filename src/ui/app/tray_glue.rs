@@ -75,11 +75,7 @@ impl App {
         }
         // As of now: a window that rolled over since the poll reads 0%
         // with no reset.
-        let five = self
-            .state
-            .data
-            .as_ref()
-            .map(|d| d.five_hour_now(Utc::now()));
+        let five = self.data().map(|d| d.five_hour_now(Utc::now()));
         let pct = five.and_then(|f| f.pct);
         let resets_at = five.and_then(|f| f.resets_at);
         let failed = self.poll_failing();

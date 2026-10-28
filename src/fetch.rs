@@ -12,6 +12,7 @@ use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, RETRY_AFTER, USER_AGENT};
 use thiserror::Error;
 
+use crate::debug_report::redact_api_keys;
 use crate::model::{self, Snapshot};
 
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -132,8 +133,10 @@ pub fn error_chain(e: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
+/// The first `n` chars of `s` with any `sk-ant-` key redacted first (an
+/// error body must never carry a token into a message).
 fn prefix_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
+    redact_api_keys(s).chars().take(n).collect()
 }
 
 /// The request headers: `Authorization: Bearer` (marked sensitive),
@@ -321,6 +324,19 @@ mod tests {
             panic!("expected Forbidden");
         };
         assert_eq!(kept.chars().count(), 200);
+    }
+
+    #[test]
+    fn error_bodies_redact_keys() {
+        let body = format!("bad token {TOKEN} rejected");
+        for e in [
+            check_status(403, &body, None).unwrap_err(),
+            check_status(500, &body, None).unwrap_err(),
+        ] {
+            let text = format!("{e} {e:?}");
+            assert!(!text.contains("FIXTURE"), "{text}");
+            assert!(text.contains("bad token sk-ant-*** rejected"), "{text}");
+        }
     }
 
     #[test]

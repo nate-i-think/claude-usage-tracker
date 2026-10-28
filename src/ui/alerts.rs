@@ -1,9 +1,9 @@
 //! Threshold alerts glue: after each new poll, decide which alerts fire
 //! ([`crate::analytics::alerts::evaluate`]) and hand their copy to the
 //! notifier thread ([`crate::ui::notify`]). The edge state lives in
-//! [`Settings::alert_states`] (only the default profile's, for now), so the
-//! app's usual settings sync persists it and a restart does not repeat an
-//! alert.
+//! [`Settings::alert_states`], keyed by profile id (only the shown
+//! account is checked, for now), so the app's usual settings sync persists
+//! it and a restart does not repeat an alert.
 
 use std::sync::mpsc::Sender;
 
@@ -13,7 +13,7 @@ use crate::analytics::alerts::{alert_copy, evaluate, AlertCopy, AlertState, Aler
 use crate::analytics::{compute_rate, projection, Projection};
 use crate::config::Settings;
 use crate::poller::Dashboard;
-use crate::profiles::DEFAULT_ID;
+use crate::profiles::ProfileId;
 
 /// The copy of the settings panel's "Send test notification".
 pub fn test_copy() -> AlertCopy {
@@ -63,17 +63,17 @@ impl AlertHook {
         }
     }
 
-    /// Check `data` if it is a poll not seen yet: fired alerts go to the
-    /// notifier, the new edge state into `settings` (persisted by the app's
-    /// settings sync since it now differs from what was saved). Never
-    /// blocks.
+    /// Check profile `id`'s `data` if it is a poll not seen yet: fired
+    /// alerts go to the notifier, the new edge state into `settings`
+    /// (persisted by the app's settings sync since it now differs from what
+    /// was saved). Never blocks.
     pub fn after_poll(
         &mut self,
-        data: Option<&Dashboard>,
+        account: Option<(&ProfileId, &Dashboard)>,
         settings: &mut Settings,
         now: DateTime<Utc>,
     ) {
-        let Some(d) = data else { return };
+        let Some((id, d)) = account else { return };
         if self.last_poll == Some(d.snapshot.fetched_at) {
             return;
         }
@@ -81,7 +81,7 @@ impl AlertHook {
         let toggles = settings.alerts;
         let state = settings
             .alert_states
-            .entry(DEFAULT_ID.to_owned())
+            .entry(id.as_str().to_owned())
             .or_default();
         for copy in alerts_for(d, state, toggles, now) {
             // The notifier thread gone (it never exits on its own): nothing
@@ -100,6 +100,7 @@ impl AlertHook {
 mod tests {
     use super::*;
     use crate::model::{Snapshot, UsageWindow};
+    use crate::profiles::DEFAULT_ID;
     use chrono::{Duration, TimeZone};
     use std::sync::mpsc::{channel, Receiver};
 
@@ -141,6 +142,8 @@ mod tests {
             week_end: resets_at,
             week_samples: Vec::new(),
             persist_error: None,
+            plan: None,
+            token_expires_at: None,
         }
     }
 
@@ -149,7 +152,11 @@ mod tests {
     }
 
     fn run(hook: &mut AlertHook, settings: &mut Settings, d: &Dashboard) {
-        hook.after_poll(Some(d), settings, d.snapshot.fetched_at);
+        hook.after_poll(
+            Some((&ProfileId::new(DEFAULT_ID), d)),
+            settings,
+            d.snapshot.fetched_at,
+        );
     }
 
     #[test]
