@@ -87,6 +87,12 @@ pub struct Palette {
     pub track: Color32,
     /// Window, popup and card shadows.
     pub shadow: Color32,
+    /// Categorical colors that tell accounts apart in charts (≈ blue,
+    /// violet, teal, magenta, slate, olive): at least 3:1 on `bg` and
+    /// `surface`, and clearly apart (CIELAB ΔE76 ≥ 20) from the state
+    /// colors, `fable`, `accent` and each other; the first two stay apart
+    /// under deuteranopia. Pick with [`Palette::series`].
+    pub series: [Color32; 6],
 }
 
 const fn hex(rgb: u32) -> Color32 {
@@ -116,6 +122,14 @@ pub const DARK: Palette = Palette {
     grid: hex(0x464540),
     track: hex(0x4A4844),
     shadow: Color32::from_black_alpha(90),
+    series: [
+        hex(0x1197FA),
+        hex(0xDE98FF),
+        hex(0x22C3AC),
+        hex(0xE3578B),
+        hex(0xB6C4E1),
+        hex(0x968952),
+    ],
 };
 
 /// Cream.
@@ -142,6 +156,14 @@ pub const LIGHT: Palette = Palette {
     grid: hex(0xDCD8CB),
     track: hex(0xD9D5C8),
     shadow: Color32::from_black_alpha(28),
+    series: [
+        hex(0x1887D0),
+        hex(0x513B96),
+        hex(0x1A9180),
+        hex(0xA41157),
+        hex(0x444B5F),
+        hex(0x5F5527),
+    ],
 };
 
 impl Palette {
@@ -175,6 +197,11 @@ impl Palette {
             Tone::Accent => self.accent,
             Tone::Fable => self.fable,
         }
+    }
+
+    /// Series color `i` (an account's color index), wrapping past the end.
+    pub fn series(&self, i: u8) -> Color32 {
+        self.series[usize::from(i) % self.series.len()]
     }
 
     fn theme(&self) -> Theme {
@@ -419,21 +446,67 @@ fn visuals(p: &Palette) -> Visuals {
 
 /// WCAG relative luminance.
 pub fn luminance(c: Color32) -> f64 {
-    let lin = |v: u8| {
-        let v = f64::from(v) / 255.0;
-        if v <= 0.040_45 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
 }
 
 /// WCAG contrast ratio, >= 1.
 pub fn contrast(a: Color32, b: Color32) -> f64 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// sRGB channel to linear light.
+fn linear(v: u8) -> f64 {
+    let v = f64::from(v) / 255.0;
+    if v <= 0.040_45 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// CIELAB (D65) of a linear-light RGB triple.
+fn lab_of_linear([r, g, b]: [f64; 3]) -> [f64; 3] {
+    let x = 0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b;
+    let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175_0 * b;
+    let z = 0.019_333_9 * r + 0.119_192_0 * g + 0.950_304_1 * b;
+    let f = |t: f64| {
+        if t > 216.0 / 24_389.0 {
+            t.cbrt()
+        } else {
+            (24_389.0 / 27.0 * t + 16.0) / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x / 0.950_47), f(y), f(z / 1.088_83));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// CIELAB (D65) of an sRGB color.
+pub fn lab(c: Color32) -> [f64; 3] {
+    lab_of_linear([linear(c.r()), linear(c.g()), linear(c.b())])
+}
+
+/// CIE76 color difference: Euclidean distance in CIELAB.
+pub fn delta_e(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// CIELAB of `c` as seen with deuteranopia: the Machado, Oliveira & Fernandes
+/// (2009) severity-1.0 deuteranopia matrix applied in linear RGB, clamped
+/// to the gamut.
+pub fn lab_deuteranopia(c: Color32) -> [f64; 3] {
+    const M: [[f64; 3]; 3] = [
+        [0.367_322, 0.860_646, -0.227_968],
+        [0.280_085, 0.672_501, 0.047_413],
+        [-0.011_820, 0.042_940, 0.968_881],
+    ];
+    let rgb = [linear(c.r()), linear(c.g()), linear(c.b())];
+    let sim = M.map(|row| (row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2]).clamp(0.0, 1.0));
+    lab_of_linear(sim)
 }
 
 #[cfg(test)]
@@ -526,6 +599,88 @@ mod tests {
             assert!(contrast(p.surface, p.bg) > 1.05, "dark={}", p.dark);
             assert!(contrast(p.raised, p.bg) > contrast(p.surface, p.bg));
         }
+    }
+
+    /// Series colors are chart strokes and fills: graphic contrast.
+    #[test]
+    fn series_graphic_on_bg_and_surface() {
+        for p in palettes() {
+            for (i, &c) in p.series.iter().enumerate() {
+                let name = format!("series[{i}]");
+                assert_contrast(p, &name, c, "bg", p.bg, GRAPHIC);
+                assert_contrast(p, &name, c, "surface", p.surface, GRAPHIC);
+            }
+        }
+    }
+
+    /// Minimum CIE76 ΔE between series colors and from the roles they are
+    /// drawn next to.
+    const SERIES_DE: f64 = 20.0;
+
+    #[test]
+    fn series_apart_from_state_fable_accent_and_each_other() {
+        for p in palettes() {
+            let roles = [
+                ("good", p.good),
+                ("warn", p.warn),
+                ("high", p.high),
+                ("danger", p.danger),
+                ("fable", p.fable),
+                ("accent", p.accent),
+            ];
+            for (i, &c) in p.series.iter().enumerate() {
+                for (name, role) in roles {
+                    let d = delta_e(lab(c), lab(role));
+                    assert!(
+                        d >= SERIES_DE,
+                        "series[{i}] vs {name}: ΔE {d:.1} (dark={})",
+                        p.dark
+                    );
+                }
+                for (j, &other) in p.series.iter().enumerate().skip(i + 1) {
+                    let d = delta_e(lab(c), lab(other));
+                    assert!(
+                        d >= SERIES_DE,
+                        "series[{i}] vs series[{j}]: ΔE {d:.1} (dark={})",
+                        p.dark
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_two_series_apart_under_deuteranopia() {
+        for p in palettes() {
+            let d = delta_e(lab_deuteranopia(p.series[0]), lab_deuteranopia(p.series[1]));
+            assert!(d >= 15.0, "ΔE {d:.1} (dark={})", p.dark);
+        }
+    }
+
+    #[test]
+    fn series_wraps() {
+        assert_eq!(DARK.series(0), DARK.series[0]);
+        assert_eq!(DARK.series(5), DARK.series[5]);
+        assert_eq!(LIGHT.series(6), LIGHT.series[0]);
+        assert_eq!(LIGHT.series(255), LIGHT.series[255 % 6]);
+    }
+
+    #[test]
+    fn lab_and_deuteranopia_reference_values() {
+        let near = |a: [f64; 3], b: [f64; 3]| delta_e(a, b) < 0.5;
+        assert!(near(lab(Color32::WHITE), [100.0, 0.0, 0.0]));
+        assert!(near(lab(Color32::BLACK), [0.0, 0.0, 0.0]));
+        // sRGB red: L 53.24, a 80.09, b 67.20.
+        assert!(near(lab(Color32::from_rgb(255, 0, 0)), [53.24, 80.09, 67.20]));
+        // Greys are untouched by the simulation; red and green collapse.
+        let grey = Color32::from_rgb(128, 128, 128);
+        assert!(near(lab_deuteranopia(grey), lab(grey)));
+        let (red, green) = (hex(0xD03030), hex(0x30A030));
+        assert!(delta_e(lab(red), lab(green)) > 60.0);
+        assert!(
+            delta_e(lab_deuteranopia(red), lab_deuteranopia(green))
+                < delta_e(lab(red), lab(green)) / 2.0
+        );
     }
 
     #[test]

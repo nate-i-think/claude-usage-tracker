@@ -132,8 +132,7 @@ impl Accounts {
             .map(|a| AccountView {
                 id: &a.profile.id,
                 label: &a.profile.label,
-                // Until the series palette lands, every account is accent.
-                color: palette.accent,
+                color: palette.series(a.profile.color),
                 data: a.poll.data.as_deref(),
                 error: a.poll.error.as_ref(),
                 stale: a.poll.stale(),
@@ -316,6 +315,7 @@ mod tests {
         assert!(views[1].stale && views[1].data.is_some());
         assert_eq!(views[1].label, "claude-b-label");
         assert!(!views[0].stale && views[0].error.is_some());
+        assert_eq!(views[0].color, crate::ui::theme::DARK.series(0));
 
         // The same list again: settings untouched, results kept.
         let again = accounts.apply(
