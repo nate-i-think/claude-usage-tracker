@@ -565,6 +565,7 @@ mod tests {
             fetched_at: at,
             windows,
             extra: None,
+            breakdown: None,
         }
     }
 
@@ -759,6 +760,7 @@ mod tests {
             fetched_at: now,
             windows: vec![],
             extra: None,
+            breakdown: None,
         };
         assert_eq!(window_start(&no_reset, now), now - ChronoDuration::hours(5));
     }
@@ -956,6 +958,7 @@ mod tests {
                 resets_at,
             }],
             extra: None,
+            breakdown: None,
         }
     }
 

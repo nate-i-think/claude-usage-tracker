@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::analytics::{
     project_display_name, thin_week, WeekSample, WindowSample, WEEKLY_RATE_HOURS,
 };
-use crate::model::{ExtraUsage, Snapshot};
+use crate::model::{ExtraUsage, Snapshot, WeekBreakdown};
 use crate::paths::Paths;
 
 /// One row of history.jsonl. Field names are the on-disk schema shared with
@@ -134,6 +134,7 @@ pub fn write_latest_snapshot(paths: &Paths, snap: &Snapshot) -> io::Result<()> {
             "resets_at": w.resets_at.map(iso),
         })).collect::<Vec<_>>(),
         "extra": snap.extra.as_ref().map(extra_json),
+        "seven_day_breakdown": snap.breakdown.as_ref().map(breakdown_json),
     });
     // A uniquely named temp file, so the GUI and a concurrent `once` never
     // write the same temp path; persist() replaces the target (also on
@@ -171,6 +172,20 @@ fn extra_json(e: &ExtraUsage) -> Value {
         "utilization": e.utilization,
         "currency": e.currency,
         "disabled_reason": e.disabled_reason,
+    })
+}
+
+/// The API's `seven_day_breakdown` shape, so `model::parse_breakdown` reads
+/// it back.
+fn breakdown_json(b: &WeekBreakdown) -> Value {
+    json!({
+        "as_of": b.as_of.map(iso),
+        "window_started_at": b.window_started_at.map(iso),
+        "rows": b.rows.iter().map(|r| json!({
+            "key": r.key,
+            "display_name": r.display_name,
+            "percent": r.percent,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -578,7 +593,7 @@ fn from_unix_seconds(ts: f64) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::UsageWindow;
+    use crate::model::{parse_breakdown, BreakdownRow, UsageWindow, WeekBreakdown};
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
@@ -625,6 +640,22 @@ mod tests {
                 utilization: 100.0,
                 currency: "EUR".into(),
                 disabled_reason: Some("spend_limit".into()),
+            }),
+            breakdown: Some(WeekBreakdown {
+                as_of: Some(utc(2026, 10, 11, 0, 30, 0)),
+                window_started_at: None,
+                rows: vec![
+                    BreakdownRow {
+                        key: "claude_code".into(),
+                        display_name: "Claude Code".into(),
+                        percent: 72.0,
+                    },
+                    BreakdownRow {
+                        key: "chat".into(),
+                        display_name: "Chats".into(),
+                        percent: 11.5,
+                    },
+                ],
             }),
         }
     }
@@ -772,6 +803,14 @@ mod tests {
                 "extra": {"enabled": true, "monthly_limit": 75.0, "used_credits": 76.83,
                           "utilization": 100.0, "currency": "EUR",
                           "disabled_reason": "spend_limit"},
+                "seven_day_breakdown": {
+                    "as_of": "2026-10-11T00:30:00+00:00",
+                    "window_started_at": null,
+                    "rows": [
+                        {"key": "claude_code", "display_name": "Claude Code", "percent": 72.0},
+                        {"key": "chat", "display_name": "Chats", "percent": 11.5},
+                    ],
+                },
             })
         );
         assert_only_latest_json(&paths);
@@ -793,10 +832,52 @@ mod tests {
         let text = fs::read_to_string(paths.latest_file()).unwrap();
         let at = |k: &str| text.find(&format!("\"{k}\"")).unwrap();
         assert!(
-            at("fetched_at") < at("windows") && at("windows") < at("extra"),
+            at("fetched_at") < at("windows")
+                && at("windows") < at("extra")
+                && at("extra") < at("seven_day_breakdown"),
             "{text}"
         );
         assert!(at("label") < at("utilization") && at("utilization") < at("resets_at"));
+        assert!(
+            at("as_of") < at("window_started_at")
+                && at("window_started_at") < at("rows")
+                && at("key") < at("display_name")
+                && at("display_name") < at("percent"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn latest_json_breakdown_round_trips() {
+        let (_tmp, paths) = temp_paths();
+        let snap = snapshot(utc(2026, 10, 11, 1, 0, 0));
+        write_latest_snapshot(&paths, &snap).unwrap();
+        let got = read_latest_snapshot(&paths).unwrap();
+        assert_eq!(
+            parse_breakdown(got.get("seven_day_breakdown")),
+            snap.breakdown
+        );
+
+        let mut none = snap.clone();
+        none.breakdown = None;
+        write_latest_snapshot(&paths, &none).unwrap();
+        let got = read_latest_snapshot(&paths).unwrap();
+        assert_eq!(got["seven_day_breakdown"], Value::Null);
+        assert_eq!(parse_breakdown(got.get("seven_day_breakdown")), None);
+    }
+
+    #[test]
+    fn old_latest_json_without_breakdown_loads_as_none() {
+        let (_tmp, paths) = temp_paths();
+        fs::create_dir_all(paths.data_dir()).unwrap();
+        fs::write(
+            paths.latest_file(),
+            r#"{"fetched_at":"2026-10-11T01:00:00+00:00","windows":[],"extra":null}"#,
+        )
+        .unwrap();
+        let got = read_latest_snapshot(&paths).unwrap();
+        assert_eq!(got["fetched_at"], "2026-10-11T01:00:00+00:00");
+        assert_eq!(parse_breakdown(got.get("seven_day_breakdown")), None);
     }
 
     #[test]

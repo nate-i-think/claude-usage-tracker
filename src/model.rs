@@ -51,12 +51,30 @@ pub struct ExtraUsage {
     pub disabled_reason: Option<String>,
 }
 
+/// One surface's share of the week's usage (e.g. Claude Code, Chats).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakdownRow {
+    pub key: String,
+    pub display_name: String,
+    /// Percent of the week's usage on this surface.
+    pub percent: f64,
+}
+
+/// The `seven_day_breakdown`: share of the week's usage by surface.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeekBreakdown {
+    pub as_of: Option<DateTime<Utc>>,
+    pub window_started_at: Option<DateTime<Utc>>,
+    pub rows: Vec<BreakdownRow>,
+}
+
 /// One fetched usage snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub fetched_at: DateTime<Utc>,
     pub windows: Vec<UsageWindow>,
     pub extra: Option<ExtraUsage>,
+    pub breakdown: Option<WeekBreakdown>,
 }
 
 impl Snapshot {
@@ -94,7 +112,7 @@ impl Snapshot {
 ///
 /// Top-level buckets come first in [`BUCKET_LABELS`] order (kept if in
 /// [`ALWAYS_SHOW`] or utilization is non-null), then per-model limits from
-/// the `limits` array, then `extra_usage`.
+/// the `limits` array, then `extra_usage` and `seven_day_breakdown`.
 pub fn parse_usage(data: &Value, fetched_at: DateTime<Utc>) -> Snapshot {
     let mut windows: Vec<UsageWindow> = BUCKET_LABELS
         .iter()
@@ -109,7 +127,37 @@ pub fn parse_usage(data: &Value, fetched_at: DateTime<Utc>) -> Snapshot {
         fetched_at,
         windows,
         extra: parse_extra_usage(data.get("extra_usage")),
+        breakdown: parse_breakdown(data.get("seven_day_breakdown")),
     }
+}
+
+/// Parse a `seven_day_breakdown` object (from the API or latest.json).
+///
+/// Null, `{}` and non-objects are `None`. Rows missing a string `key` or
+/// `display_name`, or a numeric `percent`, are skipped; an object with no
+/// valid rows is still `Some` with empty `rows`.
+pub fn parse_breakdown(raw: Option<&Value>) -> Option<WeekBreakdown> {
+    let b = raw.and_then(Value::as_object).filter(|o| !o.is_empty())?;
+    let rows = b
+        .get("rows")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            let s = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_owned);
+            Some(BreakdownRow {
+                key: s("key")?,
+                display_name: s("display_name")?,
+                percent: r.get("percent").and_then(as_f64)?,
+            })
+        })
+        .collect();
+    Some(WeekBreakdown {
+        as_of: parse_dt(b.get("as_of")),
+        window_started_at: parse_dt(b.get("window_started_at")),
+        rows,
+    })
 }
 
 /// Extract per-model windows from the `limits` array.
@@ -329,6 +377,7 @@ mod tests {
             fetched_at: Utc::now(),
             windows: vec![],
             extra: None,
+            breakdown: None,
         };
         assert_eq!(empty.five_hour_pct(), None);
         assert_eq!(empty.five_hour_resets_at(), None);
@@ -412,6 +461,121 @@ mod tests {
         let snap = parse_usage(&data, Utc::now());
         assert_eq!(snap.five_hour_pct(), Some(14.0));
         assert_eq!(snap.window("Fable").unwrap().utilization, Some(18.0));
+    }
+
+    // --- seven_day_breakdown -------------------------------------------------
+
+    /// Live OAuth `/api/oauth/usage` response (2026-10-28); contains no secrets.
+    const OAUTH_FIXTURE: &str = r#"{"five_hour":{"utilization":0.0,"resets_at":"2026-10-28T22:20:00.634580+00:00"},"seven_day":{"utilization":7.0,"resets_at":"2026-11-03T06:00:00.634598+00:00"},"seven_day_oauth_apps":null,"seven_day_opus":null,"seven_day_sonnet":null,"seven_day_cowork":null,"seven_day_omelette":null,"tangelo":null,"iguana_necktie":{"utilization":0.0,"resets_at":"2026-11-05T07:59:00+00:00","limit_dollars":250,"used_dollars":0.0,"remaining_dollars":250.0,"locked_reason":null},"extra_usage":{"is_enabled":false,"monthly_limit":7500,"used_credits":7683.0,"utilization":100.0,"currency":"USD","decimal_places":2,"disabled_reason":"org_level_disabled_until","user_disabled":false,"spend_limit_reached":true},"limits":[{"kind":"session","group":"session","percent":0,"severity":"normal","resets_at":"2026-10-28T22:20:00.634580+00:00","scope":null,"is_active":false},{"kind":"weekly_all","group":"weekly","percent":7,"severity":"normal","resets_at":"2026-11-03T06:00:00.634598+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":0,"severity":"normal","resets_at":"2026-11-03T05:59:59.634730+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}],"seven_day_breakdown":{"as_of":"2026-10-28T17:35:00.691317+00:00","window_started_at":"2026-10-27T06:00:00.634598+00:00","rows":[{"key":"claude_code","display_name":"Claude Code","percent":72},{"key":"chat","display_name":"Chats","percent":11},{"key":"cowork","display_name":"Cowork","percent":17},{"key":"other","display_name":"Other","percent":0}]}}"#;
+
+    fn row(key: &str, display_name: &str, percent: f64) -> BreakdownRow {
+        BreakdownRow {
+            key: key.into(),
+            display_name: display_name.into(),
+            percent,
+        }
+    }
+
+    #[test]
+    fn oauth_fixture_parses_windows_extra_and_breakdown() {
+        let data: Value = serde_json::from_str(OAUTH_FIXTURE).unwrap();
+        let snap = parse_usage(&data, Utc::now());
+        let labels: Vec<&str> = snap.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, vec!["5-hour", "7-day all", "Iguana", "Fable"]);
+        assert_eq!(snap.five_hour_pct(), Some(0.0));
+        assert_eq!(snap.seven_day_pct(), Some(7.0));
+        assert_eq!(
+            snap.seven_day_resets_at()
+                .unwrap()
+                .timestamp_subsec_micros(),
+            634598
+        );
+        assert_eq!(snap.fable_pct(), Some(0.0));
+        assert_eq!(
+            snap.fable_resets_at().map(|t| t.timestamp()),
+            Some(utc(2026, 11, 3, 5, 59, 59).timestamp())
+        );
+        let extra = snap.extra.as_ref().unwrap();
+        assert!(!extra.enabled);
+        assert_eq!(extra.monthly_limit, 75.0);
+        assert_eq!(
+            extra.disabled_reason.as_deref(),
+            Some("org_level_disabled_until")
+        );
+
+        let b = snap.breakdown.unwrap();
+        assert_eq!(
+            b.as_of
+                .map(|t| (t.timestamp(), t.timestamp_subsec_micros())),
+            Some((utc(2026, 10, 28, 17, 35, 0).timestamp(), 691317))
+        );
+        assert_eq!(
+            b.window_started_at.map(|t| t.timestamp()),
+            Some(utc(2026, 10, 27, 6, 0, 0).timestamp())
+        );
+        assert_eq!(
+            b.rows,
+            vec![
+                row("claude_code", "Claude Code", 72.0),
+                row("chat", "Chats", 11.0),
+                row("cowork", "Cowork", 17.0),
+                row("other", "Other", 0.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn breakdown_null_missing_or_not_an_object_is_none() {
+        for data in [
+            json!({}),
+            json!({"seven_day_breakdown": null}),
+            json!({"seven_day_breakdown": {}}),
+            json!({"seven_day_breakdown": [1, 2]}),
+            json!({"seven_day_breakdown": "x"}),
+        ] {
+            assert_eq!(parse_usage(&data, Utc::now()).breakdown, None, "{data}");
+        }
+    }
+
+    #[test]
+    fn breakdown_skips_malformed_rows_and_tolerates_bad_fields() {
+        let data = json!({"seven_day_breakdown": {
+            "as_of": "not a date",
+            "window_started_at": null,
+            "rows": [
+                {"key": "claude_code", "display_name": "Claude Code", "percent": 72.5},
+                {"display_name": "No key", "percent": 1},
+                {"key": "nameless", "percent": 1},
+                {"key": "nopct", "display_name": "No percent"},
+                {"key": "nullpct", "display_name": "Null percent", "percent": null},
+                {"key": 7, "display_name": "Bad key", "percent": 1},
+                null,
+                "x",
+                {"key": "chat", "display_name": "Chats", "percent": 11}
+            ]
+        }});
+        let b = parse_usage(&data, Utc::now()).breakdown.unwrap();
+        assert_eq!(b.as_of, None);
+        assert_eq!(b.window_started_at, None);
+        assert_eq!(
+            b.rows,
+            vec![
+                row("claude_code", "Claude Code", 72.5),
+                row("chat", "Chats", 11.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn breakdown_with_no_valid_rows_is_some_and_empty() {
+        for rows in [json!(null), json!("x"), json!([]), json!([{"key": "a"}])] {
+            let data = json!({"seven_day_breakdown": {
+                "as_of": "2026-10-28T17:35:00Z", "rows": rows
+            }});
+            let b = parse_usage(&data, Utc::now()).breakdown.unwrap();
+            assert_eq!(b.as_of, Some(utc(2026, 10, 28, 17, 35, 0)));
+            assert!(b.rows.is_empty(), "{data}");
+        }
     }
 
     #[test]

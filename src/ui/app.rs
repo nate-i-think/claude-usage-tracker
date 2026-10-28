@@ -660,6 +660,7 @@ mod tests {
                     resets_at: None,
                 }],
                 extra: None,
+                breakdown: None,
             },
             history: Vec::new(),
             fable_history: Vec::new(),

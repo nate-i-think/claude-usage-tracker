@@ -111,6 +111,7 @@ mod tests {
                 fetched_at: now(),
                 windows,
                 extra: None,
+                breakdown: None,
             },
             history: Vec::new(),
             fable_history: Vec::new(),

@@ -482,6 +482,7 @@ mod tests {
                 Some(NOW + minutes(minutes_to_reset)),
             )],
             extra: None,
+            breakdown: None,
         }
     }
 
@@ -494,6 +495,7 @@ mod tests {
             fetched_at: NOW,
             windows,
             extra: None,
+            breakdown: None,
         }
     }
 
@@ -1145,6 +1147,7 @@ mod tests {
             fetched_at: NOW,
             windows: vec![],
             extra: None,
+            breakdown: None,
         };
         let order = ordered_windows(&empty);
         assert!(order.primary.is_empty() && order.rest.is_empty());

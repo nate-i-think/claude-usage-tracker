@@ -115,6 +115,7 @@ mod tests {
                     resets_at: Some(resets_at),
                 }],
                 extra: None,
+                breakdown: None,
             },
             history: Vec::new(),
             fable_history: Vec::new(),

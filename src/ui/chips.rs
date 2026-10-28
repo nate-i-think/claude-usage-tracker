@@ -357,6 +357,7 @@ mod tests {
             fetched_at: t(12, 0),
             windows,
             extra: None,
+            breakdown: None,
         }
     }
 

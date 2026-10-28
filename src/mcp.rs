@@ -750,6 +750,7 @@ mod tests {
                 currency: "EUR".into(),
                 disabled_reason: None,
             }),
+            breakdown: None,
         };
         storage::write_latest_snapshot(&paths, &snap).unwrap();
 
