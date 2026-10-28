@@ -61,6 +61,18 @@ tauri-winrt-notification = "=0.8.1"
 # menu-bar item with every account's % as its title (macOS). No aws-lc/nasm.
 tray-icon = "=0.26.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Already in the tree (via tray-icon/winit): whether the app is active, to
+# bring a window hidden to the menu bar back when the app is reopened
+# (Dock icon, Cmd+Tab, launching it again).
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std", "NSApplication", "NSResponder",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std", "NSRunLoop", "NSString",
+] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

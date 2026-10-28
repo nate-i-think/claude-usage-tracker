@@ -123,6 +123,10 @@ pub struct App {
     quitting: bool,
     /// When a tray toggle last acted (see [`tray::toggle_accepted`]).
     last_toggle: Option<Instant>,
+    /// Whether the app was active at the last look (macOS; see
+    /// [`tray::became_active`]).
+    #[cfg(target_os = "macos")]
+    was_active: Option<bool>,
     /// Threshold alerts, checked once per poll and sent to the notifier
     /// thread.
     alerts: AlertHook,
@@ -193,6 +197,8 @@ impl App {
             hidden: false,
             quitting: false,
             last_toggle: None,
+            #[cfg(target_os = "macos")]
+            was_active: None,
             alerts: AlertHook::new(toasts),
             toast_clicks,
         };

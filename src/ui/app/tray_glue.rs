@@ -27,7 +27,25 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Otherwise the app stays active with no window, and a click on the
+        // Dock icon would not count as reopening it.
+        #[cfg(target_os = "macos")]
+        tray::deactivate_app();
         self.hidden = true;
+    }
+
+    /// macOS: bring a window hidden to the menu bar back when the app is
+    /// reopened (Dock icon, Cmd+Tab, launched again), so it is never stuck
+    /// hidden when the menu-bar item cannot be seen (a crowded menu bar,
+    /// the notch, a menu-bar manager). winit has no reopen event, so this
+    /// watches for the app becoming active.
+    #[cfg(target_os = "macos")]
+    fn show_on_reopen(&mut self, ctx: &egui::Context) {
+        let now = tray::app_active();
+        let was = std::mem::replace(&mut self.was_active, now);
+        if self.hidden && tray::became_active(was, now) {
+            self.show(ctx);
+        }
     }
 
     /// Bring the window back from the tray (or from the taskbar).
@@ -79,6 +97,8 @@ impl App {
         while let Ok(action) = self.tray_events.try_recv() {
             self.tray_action(ctx, action);
         }
+        #[cfg(target_os = "macos")]
+        self.show_on_reopen(ctx);
         // As of now: a window that rolled over since the poll reads 0%
         // with no reset.
         let view = tray::tray_view(
@@ -123,8 +143,15 @@ impl App {
                     return;
                 }
                 self.last_toggle = Some(now);
-                let minimized = ctx.input(|i| i.viewport().minimized) == Some(true);
-                if self.hidden || minimized {
+                // macOS reads the minimized state only at startup, so there
+                // a window that is minimized to the Dock or behind other
+                // apps (not focused) is brought forward rather than hidden.
+                let backgrounded = if cfg!(target_os = "macos") {
+                    ctx.input(|i| i.viewport().focused) == Some(false)
+                } else {
+                    ctx.input(|i| i.viewport().minimized) == Some(true)
+                };
+                if self.hidden || backgrounded {
                     self.show(ctx);
                 } else {
                     self.hide(ctx);

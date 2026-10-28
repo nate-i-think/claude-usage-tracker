@@ -79,6 +79,14 @@ pub fn double_click_time() -> Duration {
     Duration::from_millis(500)
 }
 
+/// Whether the app was just brought to the front (Dock icon, Cmd+Tab,
+/// launched again): active now and inactive at the last look. `None` is a
+/// look not taken (the status-item menu is open), so whatever happens while
+/// the menu is open is never an edge.
+pub fn became_active(was: Option<bool>, now: Option<bool>) -> bool {
+    was == Some(false) && now == Some(true)
+}
+
 /// What the window close button (or Alt+F4) does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseDecision {
@@ -397,6 +405,8 @@ fn cap_utf16(text: String, max: usize) -> String {
     out
 }
 
+#[cfg(target_os = "macos")]
+pub use native::{app_active, deactivate_app};
 #[cfg(any(windows, target_os = "macos"))]
 pub use native::{install_event_handlers, Tray};
 
@@ -613,6 +623,36 @@ mod native {
             if view.tooltip != self.tooltip && self.icon.set_tooltip(Some(&view.tooltip)).is_ok() {
                 self.tooltip.clone_from(&view.tooltip);
             }
+        }
+    }
+
+    /// Whether the app is the active (frontmost) one; `None` off the main
+    /// thread or while a menu is being tracked (the status-item menu runs
+    /// AppKit's event-tracking run-loop mode, and eframe may run a pass in
+    /// it), so opening that menu never reads as the app being reopened.
+    #[cfg(target_os = "macos")]
+    pub fn app_active() -> Option<bool> {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApplication, NSEventTrackingRunLoopMode};
+        use objc2_foundation::NSRunLoop;
+
+        let mtm = MainThreadMarker::new()?;
+        let mode = NSRunLoop::currentRunLoop().currentMode();
+        // SAFETY: an AppKit constant, valid for the life of the process.
+        let tracking = unsafe { NSEventTrackingRunLoopMode };
+        if mode.is_some_and(|m| &*m == tracking) {
+            return None;
+        }
+        Some(NSApplication::sharedApplication(mtm).isActive())
+    }
+
+    /// Hand the focus to the next app, as hiding the last window does not:
+    /// a later click on the Dock icon then activates the app again, which
+    /// is how the window comes back ([`super::became_active`]).
+    #[cfg(target_os = "macos")]
+    pub fn deactivate_app() {
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            objc2_app_kit::NSApplication::sharedApplication(mtm).deactivate();
         }
     }
 
@@ -1147,6 +1187,19 @@ mod tests {
             [MENU_SHOW_HIDE, MENU_PILL, MENU_REFRESH, MENU_QUIT],
             ["show_hide", "pill", "refresh", "quit"]
         );
+    }
+
+    #[test]
+    fn became_active_only_on_an_inactive_to_active_edge() {
+        assert!(became_active(Some(false), Some(true)));
+        // Already active (the window was just closed) or still inactive.
+        assert!(!became_active(Some(true), Some(true)));
+        assert!(!became_active(Some(false), Some(false)));
+        assert!(!became_active(Some(true), Some(false)));
+        // First look, or a look skipped while the menu was open.
+        assert!(!became_active(None, Some(true)));
+        assert!(!became_active(Some(false), None));
+        assert!(!became_active(None, None));
     }
 
     #[test]
