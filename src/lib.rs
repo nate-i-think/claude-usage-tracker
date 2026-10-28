@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod config;
 pub mod cookies;
 pub mod crash;
+pub mod credentials;
 pub mod debug_report;
 pub mod fetch;
 pub mod mcp;
