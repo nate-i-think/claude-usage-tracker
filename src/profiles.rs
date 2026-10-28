@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::ProfileSettings;
+use crate::credentials::CredentialLocator;
 
 /// The id of the profile for `~/.claude` (`CLAUDE_CONFIG_DIR` unset).
 pub const DEFAULT_ID: &str = "default";
@@ -109,6 +110,15 @@ impl Profile {
         self.keychain_override
             .clone()
             .unwrap_or_else(|| keychain_service_for(self.config_dir_env.as_deref()))
+    }
+
+    /// Where this profile's OAuth credential lives: its Keychain service
+    /// and `<config_dir>/.credentials.json`.
+    pub fn locator(&self) -> CredentialLocator {
+        CredentialLocator {
+            keychain_service: Some(self.keychain_service()),
+            file: self.config_dir.join(".credentials.json"),
+        }
     }
 
     /// The label cut to [`MAX_LABEL_CHARS`] chars, for tight spots.
@@ -216,6 +226,19 @@ pub fn discover(home: &Path) -> Vec<Discovered> {
         },
     );
     found
+}
+
+/// The default profile (`<home>/.claude`), filled in from discovery when
+/// that finds it. Used until every enabled profile is polled.
+pub fn default_profile(home: &Path) -> Profile {
+    let saved = [ProfileSettings {
+        id: DEFAULT_ID.to_owned(),
+        config_dir: home.join(".claude"),
+        ..ProfileSettings::default()
+    }];
+    resolve(&saved, &discover(home))
+        .pop()
+        .expect("an enabled saved profile resolves")
 }
 
 /// Append each discovered profile not yet saved (matched by config dir) to
@@ -679,6 +702,52 @@ mod tests {
             b.keychain_service(),
             keychain_service_for(Some("/h/.claude-b"))
         );
+    }
+
+    #[test]
+    fn locator_uses_keychain_service_and_credentials_file() {
+        let list = vec![
+            saved("default", Path::new("/h/.claude")),
+            saved("claude-b", Path::new("/h/.claude-b")),
+        ];
+        let discovered = [found(
+            "claude-b",
+            "/h/.claude-b",
+            Some("/h/.claude-b"),
+            Some("b@x.com"),
+        )];
+        let got = resolve(&list, &discovered);
+        assert_eq!(
+            got[0].locator(),
+            CredentialLocator {
+                keychain_service: Some("Claude Code-credentials".into()),
+                file: PathBuf::from("/h/.claude/.credentials.json"),
+            }
+        );
+        assert_eq!(
+            got[1].locator(),
+            CredentialLocator {
+                keychain_service: Some(keychain_service_for(Some("/h/.claude-b"))),
+                file: PathBuf::from("/h/.claude-b/.credentials.json"),
+            }
+        );
+    }
+
+    #[test]
+    fn default_profile_with_and_without_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let p = default_profile(home);
+        assert!(p.id.is_default());
+        assert_eq!(p.config_dir, home.join(".claude"));
+        assert_eq!(p.config_dir_env, None);
+        assert_eq!(p.account, None);
+
+        fs::create_dir(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude.json"), identity("nate@x.com", "u-1")).unwrap();
+        let p = default_profile(home);
+        assert_eq!(p.label, "nate");
+        assert_eq!(p.keychain_service(), "Claude Code-credentials");
     }
 
     #[test]

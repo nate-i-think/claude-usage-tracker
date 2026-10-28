@@ -6,7 +6,7 @@
 //! its main loop, `record()`, and the inputs to `render()`.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
@@ -18,9 +18,11 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crate::analytics::{self, WeekSample, WindowSample, BURN_WINDOW_MINUTES, HISTORY_LEN};
 use crate::config::{Settings, MIN_INTERVAL_SECS};
 use crate::crash::catch_recoverable;
-use crate::fetch::{self, FetchError};
+use crate::credentials::{self, CredError, CredentialLocator, CredentialStore};
+use crate::fetch::{self, ErrorKind, FetchError};
 use crate::model::Snapshot;
 use crate::paths::{self, Paths};
+use crate::profiles::{self, Profile};
 use crate::storage::{self, InstanceUsage};
 
 /// One timestamped utilization sample for burn-rate math.
@@ -86,16 +88,30 @@ pub enum PollMsg {
 /// A failed poll, ready for display.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchErrorInfo {
+    pub kind: ErrorKind,
     pub message: String,
-    /// The error looks like a stale anthropic-client-sha.
-    pub stale_sha_hint: bool,
 }
 
-impl From<&FetchError> for FetchErrorInfo {
-    fn from(e: &FetchError) -> Self {
+impl FetchErrorInfo {
+    /// `e` for the profile whose Claude Code config dir is `dir`: credential
+    /// problems name the dir and the fix.
+    pub fn for_dir(e: &FetchError, dir: &Path) -> Self {
+        let dir = dir.display();
+        let message = match e {
+            FetchError::TokenExpired | FetchError::Unauthorized => {
+                format!("token expired — run Claude Code in {dir} to refresh")
+            }
+            FetchError::NoCredentials(why) if why.is_empty() => {
+                format!("no Claude Code login found in {dir} — run `claude` and sign in")
+            }
+            FetchError::NoCredentials(why) => {
+                format!("no Claude Code login found in {dir} — run `claude` and sign in ({why})")
+            }
+            other => other.to_string(),
+        };
         Self {
-            message: e.to_string(),
-            stale_sha_hint: e.stale_sha_hint(),
+            kind: e.kind(),
+            message,
         }
     }
 }
@@ -113,45 +129,77 @@ pub trait UsageSource: Send + 'static {
     fn fetch(&mut self, paths: &Paths, settings: &Settings) -> Result<Snapshot, FetchError>;
 }
 
-impl UsageSource for fetch::Client {
-    fn fetch(&mut self, paths: &Paths, settings: &Settings) -> Result<Snapshot, FetchError> {
-        self.fetch_usage(paths, settings)
+/// The HTTP client over one profile's OAuth credential. The credential is
+/// read on every fetch; an expired one fails without a request. The client
+/// is built on first use and rebuilt after a build failure, so a failure
+/// surfaces as a poll error instead of preventing the poller.
+pub struct HttpSource {
+    client: Option<fetch::Client>,
+    store: Arc<dyn CredentialStore>,
+    locator: CredentialLocator,
+}
+
+impl HttpSource {
+    /// `profile`'s credential from the platform store.
+    pub fn for_profile(profile: &Profile) -> Self {
+        Self::with_store(credentials::platform_store(), profile.locator())
+    }
+
+    pub fn with_store(store: Arc<dyn CredentialStore>, locator: CredentialLocator) -> Self {
+        Self {
+            client: None,
+            store,
+            locator,
+        }
     }
 }
 
-/// The HTTP client, built on first use and rebuilt after a build failure, so
-/// a failure surfaces as a poll error instead of preventing the poller.
-#[derive(Default)]
-pub struct HttpSource {
-    client: Option<fetch::Client>,
-}
-
 impl UsageSource for HttpSource {
-    fn fetch(&mut self, paths: &Paths, settings: &Settings) -> Result<Snapshot, FetchError> {
+    fn fetch(&mut self, _: &Paths, _: &Settings) -> Result<Snapshot, FetchError> {
+        let cred = self.store.load(&self.locator).map_err(|e| match e {
+            CredError::NotFound(_) => FetchError::NoCredentials(String::new()),
+            other => FetchError::NoCredentials(other.to_string()),
+        })?;
+        if cred.is_expired(Utc::now()) {
+            return Err(FetchError::TokenExpired);
+        }
         if self.client.is_none() {
             self.client = Some(fetch::Client::new()?);
         }
         self.client
-            .as_mut()
+            .as_ref()
             .expect("client just built")
-            .fetch(paths, settings)
+            .fetch_usage(cred.bearer())
     }
 }
 
 /// Local session directories scanned for per-instance token attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDirs {
+    /// A profile's Claude Code projects dir (`<config_dir>/projects`).
     pub claude_code: PathBuf,
     pub cowork: PathBuf,
 }
 
-impl Default for SessionDirs {
-    fn default() -> Self {
+impl SessionDirs {
+    /// `profile`'s projects and the Cowork sessions.
+    pub fn for_profile(profile: &Profile) -> Self {
         Self {
-            claude_code: paths::claude_code_dir(),
+            claude_code: profile.projects_dir(),
             cowork: paths::cowork_dir(),
         }
     }
+
+    /// The Claude Code config dir holding [`Self::claude_code`].
+    pub fn config_dir(&self) -> &Path {
+        self.claude_code.parent().unwrap_or(&self.claude_code)
+    }
+}
+
+/// The default Claude Code profile (`~/.claude`), the only one polled for
+/// now.
+pub fn default_profile() -> Profile {
+    profiles::default_profile(&paths::home_dir())
 }
 
 /// In-memory burn histories (5-hour and Fable), capped at [`HISTORY_LEN`].
@@ -366,13 +414,15 @@ pub struct Poller {
 }
 
 impl Poller {
-    /// Poll claude.ai over HTTP in the background. `notify` runs after each
-    /// event is sent (the GUI requests a repaint; the CLI can pass a no-op).
+    /// Poll the default profile's usage over HTTP in the background.
+    /// `notify` runs after each event is sent (the GUI requests a repaint;
+    /// the CLI can pass a no-op).
     pub fn spawn(paths: Paths, settings: Settings, notify: impl Fn() + Send + 'static) -> Self {
+        let profile = default_profile();
         Self::spawn_with(
-            HttpSource::default(),
+            HttpSource::for_profile(&profile),
             paths,
-            SessionDirs::default(),
+            SessionDirs::for_profile(&profile),
             settings,
             notify,
         )
@@ -497,10 +547,10 @@ fn poll_event(
     let result = catch_recoverable(|| poll_once(source, &ctx.paths, &ctx.dirs, settings, history));
     match result {
         Ok(Ok(dashboard)) => PollEvent::Ok(Box::new(dashboard)),
-        Ok(Err(e)) => PollEvent::Err(FetchErrorInfo::from(&e)),
+        Ok(Err(e)) => PollEvent::Err(FetchErrorInfo::for_dir(&e, ctx.dirs.config_dir())),
         Err(panic) => PollEvent::Err(FetchErrorInfo {
+            kind: ErrorKind::Internal,
             message: format!("internal error during poll: {}", panic_message(&*panic)),
-            stale_sha_hint: false,
         }),
     }
 }
@@ -686,7 +736,7 @@ mod tests {
         match rig.next() {
             PollEvent::Err(info) => {
                 assert_eq!(info.message, "HTTP 500: boom");
-                assert!(!info.stale_sha_hint);
+                assert_eq!(info.kind, ErrorKind::Status);
             }
             PollEvent::Ok(_) => panic!("expected error"),
         }
@@ -1058,13 +1108,132 @@ mod tests {
     }
 
     #[test]
-    fn fetch_error_info_carries_stale_sha_hint() {
-        let e = FetchError::Forbidden {
-            body: r#"{"error":{"type":"permission_error"}}"#.into(),
+    fn fetch_error_info_names_the_profile_dir() {
+        let dir = Path::new("/h/.claude");
+        let info = |e: FetchError| FetchErrorInfo::for_dir(&e, dir);
+        for e in [FetchError::TokenExpired, FetchError::Unauthorized] {
+            let kind = e.kind();
+            assert_eq!(
+                info(e),
+                FetchErrorInfo {
+                    kind,
+                    message: "token expired — run Claude Code in /h/.claude to refresh".into(),
+                }
+            );
+        }
+        let got = info(FetchError::NoCredentials(String::new()));
+        assert_eq!(got.kind, ErrorKind::NoCredentials);
+        assert_eq!(
+            got.message,
+            "no Claude Code login found in /h/.claude — run `claude` and sign in"
+        );
+        assert_eq!(
+            info(FetchError::NoCredentials(
+                "malformed credential: no accessToken".into()
+            ))
+            .message,
+            "no Claude Code login found in /h/.claude — run `claude` and sign in \
+             (malformed credential: no accessToken)"
+        );
+        let got = info(FetchError::Forbidden {
+            body: "denied".into(),
+        });
+        assert_eq!(got.kind, ErrorKind::Forbidden);
+        assert_eq!(got.message, "403 — forbidden: denied");
+    }
+
+    const TOKEN: &str = "sk-ant-oat01-FIXTURE-SECRET";
+
+    /// Returns a fixed credential result and counts loads.
+    struct FakeStore {
+        result: fn() -> Result<credentials::OAuthCredential, CredError>,
+        loads: Mutex<u32>,
+    }
+
+    impl CredentialStore for FakeStore {
+        fn load(&self, _: &CredentialLocator) -> Result<credentials::OAuthCredential, CredError> {
+            *self.loads.lock().unwrap() += 1;
+            (self.result)()
+        }
+    }
+
+    fn http_source(
+        result: fn() -> Result<credentials::OAuthCredential, CredError>,
+    ) -> (HttpSource, Arc<FakeStore>) {
+        let store = Arc::new(FakeStore {
+            result,
+            loads: Mutex::new(0),
+        });
+        let locator = CredentialLocator {
+            keychain_service: None,
+            file: PathBuf::from("/nowhere/.credentials.json"),
         };
-        let info = FetchErrorInfo::from(&e);
-        assert!(info.stale_sha_hint);
-        assert!(info.message.starts_with("403 — auth or Cloudflare: "));
+        (HttpSource::with_store(store.clone(), locator), store)
+    }
+
+    fn fetch_err(source: &mut HttpSource) -> FetchError {
+        let paths = Paths::with_data_dir(PathBuf::from("/unused"));
+        source.fetch(&paths, &Settings::default()).unwrap_err()
+    }
+
+    #[test]
+    fn http_source_maps_credential_errors() {
+        let (mut src, store) = http_source(|| Err(CredError::NotFound("no item".into())));
+        let e = fetch_err(&mut src);
+        assert!(
+            matches!(&e, FetchError::NoCredentials(why) if why.is_empty()),
+            "{e:?}"
+        );
+        assert_eq!(*store.loads.lock().unwrap(), 1);
+        assert!(src.client.is_none(), "no client without a credential");
+
+        let (mut src, _) = http_source(|| Err(CredError::Malformed("no accessToken".into())));
+        let e = fetch_err(&mut src);
+        assert_eq!(
+            e.to_string(),
+            "no Claude Code login found (malformed credential: no accessToken)"
+        );
+
+        let (mut src, _) = http_source(|| Err(CredError::Unavailable("locked".into())));
+        assert!(
+            matches!(fetch_err(&mut src), FetchError::NoCredentials(why) if why.contains("locked"))
+        );
+    }
+
+    #[test]
+    fn http_source_expired_token_fails_without_a_request() {
+        let (mut src, store) = http_source(|| {
+            credentials::parse_credentials_json(
+                &serde_json::json!({"claudeAiOauth": {
+                    "accessToken": TOKEN,
+                    "expiresAt": 1_000_i64,
+                }})
+                .to_string(),
+            )
+        });
+        let e = fetch_err(&mut src);
+        assert!(matches!(e, FetchError::TokenExpired), "{e:?}");
+        assert_eq!(e.kind(), ErrorKind::TokenExpired);
+        // Never got as far as building the HTTP client.
+        assert!(src.client.is_none());
+        // Re-read on every fetch (no caching yet).
+        fetch_err(&mut src);
+        assert_eq!(*store.loads.lock().unwrap(), 2);
+        let info = FetchErrorInfo::for_dir(&e, Path::new("/h/.claude"));
+        assert!(!info.message.contains("FIXTURE") && !format!("{e:?}").contains("FIXTURE"));
+    }
+
+    #[test]
+    fn session_dirs_for_profile_and_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = profiles::default_profile(tmp.path());
+        let dirs = SessionDirs::for_profile(&p);
+        assert_eq!(
+            dirs.claude_code,
+            tmp.path().join(".claude").join("projects")
+        );
+        assert_eq!(dirs.config_dir(), tmp.path().join(".claude"));
+        assert_eq!(dirs.cowork, paths::cowork_dir());
     }
 
     #[test]

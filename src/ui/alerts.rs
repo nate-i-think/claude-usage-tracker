@@ -1,8 +1,9 @@
 //! Threshold alerts glue: after each new poll, decide which alerts fire
 //! ([`crate::analytics::alerts::evaluate`]) and hand their copy to the
 //! notifier thread ([`crate::ui::notify`]). The edge state lives in
-//! [`Settings::alert_state`], so the app's usual settings sync persists it
-//! and a restart does not repeat an alert.
+//! [`Settings::alert_states`] (only the default profile's, for now), so the
+//! app's usual settings sync persists it and a restart does not repeat an
+//! alert.
 
 use std::sync::mpsc::Sender;
 
@@ -12,6 +13,7 @@ use crate::analytics::alerts::{alert_copy, evaluate, AlertCopy, AlertState, Aler
 use crate::analytics::{compute_rate, projection, Projection};
 use crate::config::Settings;
 use crate::poller::Dashboard;
+use crate::profiles::DEFAULT_ID;
 
 /// The copy of the settings panel's "Send test notification".
 pub fn test_copy() -> AlertCopy {
@@ -76,7 +78,12 @@ impl AlertHook {
             return;
         }
         self.last_poll = Some(d.snapshot.fetched_at);
-        for copy in alerts_for(d, &mut settings.alert_state, settings.alerts, now) {
+        let toggles = settings.alerts;
+        let state = settings
+            .alert_states
+            .entry(DEFAULT_ID.to_owned())
+            .or_default();
+        for copy in alerts_for(d, state, toggles, now) {
             // The notifier thread gone (it never exits on its own): nothing
             // to deliver to.
             let _ = self.toasts.send(copy);
@@ -95,6 +102,11 @@ mod tests {
     use crate::model::{Snapshot, UsageWindow};
     use chrono::{Duration, TimeZone};
     use std::sync::mpsc::{channel, Receiver};
+
+    /// The default profile's alert state; absent reads as fresh.
+    fn default_state(s: &Settings) -> AlertState {
+        s.alert_states.get(DEFAULT_ID).cloned().unwrap_or_default()
+    }
 
     fn t0() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap()
@@ -153,7 +165,7 @@ mod tests {
         assert_eq!(titles(&rx), ["5-hour usage at 91%"]);
         run(&mut hook, &mut settings, &poll(3, 93.0, 2_000));
         assert!(titles(&rx).is_empty(), "each edge fires once");
-        assert_ne!(settings.alert_state, AlertState::default());
+        assert_ne!(default_state(&settings), AlertState::default());
     }
 
     #[test]
@@ -165,7 +177,7 @@ mod tests {
         run(&mut hook, &mut settings, &d);
         // Later passes before the next poll: no re-check (the state would
         // stop it anyway; this keeps logic() cheap).
-        settings.alert_state = AlertState::default();
+        settings.alert_states.clear();
         run(&mut hook, &mut settings, &d);
         assert_eq!(titles(&rx), ["5-hour usage at 80%"]);
         hook.after_poll(None, &mut settings, t0());
@@ -233,7 +245,7 @@ mod tests {
         let mut settings = Settings::default();
         run(&mut hook, &mut settings, &poll(1, 91.0, 0));
         assert_eq!(titles(&rx), ["5-hour usage at 91%"]);
-        let consumed = settings.alert_state.clone();
+        let consumed = default_state(&settings);
         // 15:00 reset: idle polls report 0% with no reset (a null key).
         for m in [190, 200, 230] {
             let mut idle = poll(m, 0.0, 0);
@@ -244,7 +256,8 @@ mod tests {
         }
         assert!(titles(&rx).is_empty(), "nothing fires while idle");
         assert_eq!(
-            settings.alert_state, consumed,
+            default_state(&settings),
+            consumed,
             "the null window keys nothing"
         );
         // The next window (resetting 20:00) crosses 75%: a fresh window.
@@ -263,7 +276,7 @@ mod tests {
         d.snapshot.windows[0].resets_at = None;
         run(&mut hook, &mut settings, &d);
         assert!(titles(&rx).is_empty());
-        assert_eq!(settings.alert_state, AlertState::default());
+        assert_eq!(default_state(&settings), AlertState::default());
     }
 
     #[test]

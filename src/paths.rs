@@ -1,8 +1,7 @@
-//! Platform-aware locations for app data, Claude Code, and Cowork sessions.
+//! Platform-aware locations for app data and Cowork sessions.
 //!
 //! Ported from the Python paths.py (removed; see git history).
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::profiles::ProfileId;
@@ -62,32 +61,6 @@ impl Paths {
     pub fn crash_log_file(&self) -> PathBuf {
         self.data_dir.join("crash.log")
     }
-
-    pub fn anonymous_id_file(&self) -> PathBuf {
-        self.data_dir.join("anonymous_id")
-    }
-
-    /// Per-install anonymous id (`claudeai.v1.<uuid4>`), created on first use.
-    ///
-    /// An unreadable or empty file is replaced. A failed write is ignored so
-    /// the caller still gets a usable id for this run.
-    pub fn get_or_create_anonymous_id(&self) -> String {
-        let file = self.anonymous_id_file();
-        if let Ok(existing) = fs::read_to_string(&file) {
-            let existing = existing.trim();
-            if !existing.is_empty() {
-                return existing.to_owned();
-            }
-        }
-        let value = format!("claudeai.v1.{}", uuid::Uuid::new_v4());
-        let _ = fs::create_dir_all(&self.data_dir).and_then(|()| fs::write(&file, &value));
-        value
-    }
-}
-
-/// Claude Code project session JSONLs: `~/.claude/projects`.
-pub fn claude_code_dir() -> PathBuf {
-    home_dir().join(".claude").join("projects")
 }
 
 /// Where the Cowork desktop app stores local agent session JSONLs.
@@ -139,10 +112,6 @@ mod tests {
         assert_eq!(p.data_dir(), Path::new("base"));
         assert_eq!(p.history_file(), Path::new("base").join("history.jsonl"));
         assert_eq!(p.latest_file(), Path::new("base").join("latest.json"));
-        assert_eq!(
-            p.anonymous_id_file(),
-            Path::new("base").join("anonymous_id")
-        );
     }
 
     #[test]
@@ -170,40 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn session_dirs_have_expected_suffixes() {
-        assert!(claude_code_dir().ends_with(Path::new(".claude").join("projects")));
+    fn cowork_dir_has_expected_suffix() {
         assert!(cowork_dir().ends_with(Path::new("Claude").join("local-agent-mode-sessions")));
-    }
-
-    #[test]
-    fn anonymous_id_created_in_missing_dir_then_reused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = Paths::with_data_dir(tmp.path().join("nested").join("dir"));
-
-        let id = p.get_or_create_anonymous_id();
-        let uuid_part = id.strip_prefix("claudeai.v1.").expect("prefix");
-        let parsed = uuid::Uuid::parse_str(uuid_part).expect("uuid");
-        assert_eq!(parsed.get_version_num(), 4);
-        assert_eq!(fs::read_to_string(p.anonymous_id_file()).unwrap(), id);
-
-        assert_eq!(p.get_or_create_anonymous_id(), id);
-    }
-
-    #[test]
-    fn anonymous_id_existing_value_is_trimmed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = Paths::with_data_dir(tmp.path().to_path_buf());
-        fs::write(p.anonymous_id_file(), "  claudeai.v1.existing\n").unwrap();
-        assert_eq!(p.get_or_create_anonymous_id(), "claudeai.v1.existing");
-    }
-
-    #[test]
-    fn anonymous_id_empty_file_is_replaced() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = Paths::with_data_dir(tmp.path().to_path_buf());
-        fs::write(p.anonymous_id_file(), "  \n").unwrap();
-        let id = p.get_or_create_anonymous_id();
-        assert!(id.starts_with("claudeai.v1."));
-        assert_eq!(fs::read_to_string(p.anonymous_id_file()).unwrap(), id);
     }
 }

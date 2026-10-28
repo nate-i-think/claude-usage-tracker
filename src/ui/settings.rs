@@ -5,16 +5,11 @@
 //! deciding what the poller must hear) is plain functions; [`SettingsPanel`]
 //! only draws them.
 
-use std::path::{Path, PathBuf};
-
-use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit, Ui};
+use eframe::egui::{self, Color32, RichText, TextEdit, Ui};
 
 use crate::analytics::alerts::AlertToggles;
 use crate::analytics::Level;
-use crate::config::{
-    parse_interval, resolve_client_sha_with_source, ClientShaSource, Settings, CLIENT_SHA_ENV,
-    CLIENT_SHA_FILE, MIN_CLIENT_SHA_LEN, MIN_INTERVAL_SECS,
-};
+use crate::config::{parse_interval, Settings, MIN_INTERVAL_SECS};
 use crate::poller::PollMsg;
 
 use super::{level_color, theme};
@@ -25,8 +20,6 @@ pub struct SettingsDraft {
     pub plan: String,
     pub interval: String,
     pub show_all: bool,
-    pub cookie_file: String,
-    pub client_sha: String,
     pub tray_enabled: bool,
     pub close_to_tray: bool,
     pub start_in_pill: bool,
@@ -41,12 +34,6 @@ impl SettingsDraft {
             plan: s.plan.clone(),
             interval: format_interval(s.interval_secs),
             show_all: s.show_all,
-            cookie_file: s
-                .cookie_file
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            client_sha: s.client_sha.clone().unwrap_or_default(),
             tray_enabled: s.tray_enabled,
             close_to_tray: s.close_to_tray,
             start_in_pill: s.start_in_pill,
@@ -114,8 +101,6 @@ pub fn build_settings(draft: &SettingsDraft, current: &Settings) -> Result<Setti
         plan: non_blank(&draft.plan).unwrap_or_else(|| Settings::default().plan),
         interval_secs,
         show_all: draft.show_all,
-        cookie_file: non_blank(&draft.cookie_file).map(PathBuf::from),
-        client_sha: non_blank(&draft.client_sha),
         tray_enabled: draft.tray_enabled,
         close_to_tray: draft.close_to_tray,
         start_in_pill: draft.start_in_pill,
@@ -126,31 +111,12 @@ pub fn build_settings(draft: &SettingsDraft, current: &Settings) -> Result<Setti
     })
 }
 
-/// The message the poller needs after `old` becomes `new`: the interval,
-/// cookie file, and client SHA are the settings it uses. The poller applies
+/// The message the poller needs after `old` becomes `new`: the interval and
+/// the profiles are the settings it uses. The poller applies
 /// [`PollMsg::UpdateSettings`] at once and polls immediately.
 pub fn poller_update(old: &Settings, new: &Settings) -> Option<PollMsg> {
-    let changed = old.interval_secs != new.interval_secs
-        || old.cookie_file != new.cookie_file
-        || old.client_sha != new.client_sha;
+    let changed = old.interval_secs != new.interval_secs || old.profiles != new.profiles;
     changed.then(|| PollMsg::UpdateSettings(new.clone()))
-}
-
-/// "In use: …" text for the client SHA resolution result, and whether a
-/// SHA was found at all. Never includes the SHA itself.
-pub fn describe_sha_source(resolved: &anyhow::Result<(String, ClientShaSource)>) -> (String, bool) {
-    match resolved {
-        Ok((_, ClientShaSource::Env)) => (
-            format!("In use: environment variable {CLIENT_SHA_ENV} (overrides this field)"),
-            true,
-        ),
-        Ok((_, ClientShaSource::Settings)) => ("In use: the value saved here".to_owned(), true),
-        Ok((_, ClientShaSource::File(path))) => (format!("In use: file {}", path.display()), true),
-        Err(_) => (
-            format!("In use: none found; enter one here or restore {CLIENT_SHA_FILE}"),
-            false,
-        ),
-    }
 }
 
 /// Window level for the always-on-top flag.
@@ -206,57 +172,15 @@ pub enum PanelAction {
     TestNotification,
 }
 
-/// Adapted from the README section "Refreshing client_sha.txt".
-const HELP_SHA: &str = "Anthropic rotates the web client's build hash every couple of \
-weeks; when it goes stale, polls fail with permission_error even with a valid session. \
-To get the current one: open claude.ai/settings/usage in your browser, open DevTools \
-(F12) \u{2192} Network \u{2192} filter Fetch/XHR, reload the page, select the request to \
-/api/organizations/\u{2026}/usage, and in its Headers copy the anthropic-client-sha \
-request header. Leave this field blank to use client_sha.txt.";
-
-/// The open settings panel: the draft plus the client SHA source as of
-/// opening.
+/// The open settings panel: the draft being edited.
 pub struct SettingsPanel {
     draft: SettingsDraft,
-    sha_source: (String, bool),
-    cookie_check: CookieFileCheck,
-}
-
-/// Whether the cookie path is an existing file, cached per path text so the
-/// open panel does not stat the disk every frame.
-#[derive(Debug, Default)]
-struct CookieFileCheck {
-    /// The path text last checked, and its result.
-    last: Option<(String, bool)>,
-}
-
-impl CookieFileCheck {
-    fn is_file(&mut self, path: &str) -> bool {
-        self.is_file_with(path, |p| Path::new(p).is_file())
-    }
-
-    /// Like [`Self::is_file`] with an injectable check (for tests); `check`
-    /// runs only when `path` differs from the last one.
-    fn is_file_with(&mut self, path: &str, check: impl FnOnce(&str) -> bool) -> bool {
-        match &self.last {
-            Some((p, found)) if p == path => *found,
-            _ => {
-                let found = check(path);
-                self.last = Some((path.to_owned(), found));
-                found
-            }
-        }
-    }
 }
 
 impl SettingsPanel {
     pub fn new(current: &Settings) -> Self {
         Self {
             draft: SettingsDraft::from_settings(current),
-            sha_source: describe_sha_source(&resolve_client_sha_with_source(
-                current.client_sha.as_deref(),
-            )),
-            cookie_check: CookieFileCheck::default(),
         }
     }
 
@@ -264,7 +188,6 @@ impl SettingsPanel {
     /// own preference) apply immediately; everything else waits for Apply.
     pub fn show(&mut self, ui: &mut Ui, live: &mut Settings) -> PanelAction {
         let red = level_color(Level::Red, ui.visuals());
-        let green = level_color(Level::Green, ui.visuals());
         let orange = level_color(Level::Orange, ui.visuals());
         let mut action = PanelAction::None;
         let palette = theme::Palette::for_visuals(ui.visuals());
@@ -304,59 +227,6 @@ impl SettingsPanel {
             }
             theme_row(ui);
             ui.add_space(4.0);
-
-            field(ui, "Cookie file", |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Clear").clicked() {
-                            self.draft.cookie_file.clear();
-                        }
-                        ui.add(
-                            TextEdit::singleline(&mut self.draft.cookie_file)
-                                .hint_text("auto-detect")
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
-                });
-                let path = self.draft.cookie_file.trim();
-                if path.is_empty() {
-                    ui.weak("Blank: the browser profile is detected automatically");
-                } else if self.cookie_check.is_file(path) {
-                    note(ui, green, "File exists");
-                } else {
-                    note(ui, red, "File not found");
-                }
-            });
-
-            field(ui, "Client SHA", |ui| {
-                ui.add(
-                    TextEdit::singleline(&mut self.draft.client_sha)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text(format!("blank: use {CLIENT_SHA_FILE}"))
-                        .desired_width(f32::INFINITY),
-                );
-                let len = self.draft.client_sha.trim().len();
-                if (1..MIN_CLIENT_SHA_LEN).contains(&len) {
-                    note(
-                        ui,
-                        orange,
-                        &format!(
-                            "Shorter than {MIN_CLIENT_SHA_LEN} characters; it will be ignored"
-                        ),
-                    );
-                }
-                let (text, found) = &self.sha_source;
-                if *found {
-                    ui.add(egui::Label::new(RichText::new(text).weak()).wrap());
-                } else {
-                    note(ui, red, text);
-                }
-                egui::CollapsingHeader::new("How to get it")
-                    .id_salt("client_sha_help")
-                    .show(ui, |ui| {
-                        ui.add(egui::Label::new(HELP_SHA).wrap());
-                    });
-            });
 
             group_heading(ui, "Window");
             let d = &mut self.draft;
@@ -433,46 +303,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sha_source_descriptions() {
-        let ok = |src| Ok(("abcdef123".to_owned(), src));
-        let (text, found) = describe_sha_source(&ok(ClientShaSource::Env));
-        assert!(found && text.contains(CLIENT_SHA_ENV), "{text}");
-        let (text, found) = describe_sha_source(&ok(ClientShaSource::Settings));
-        assert!(found && text.contains("saved here"), "{text}");
-        let path = PathBuf::from("C:/app/client_sha.txt");
-        let (text, found) = describe_sha_source(&ok(ClientShaSource::File(path.clone())));
-        assert!(
-            found && text.contains(&path.display().to_string()),
-            "{text}"
-        );
-        let (text, found) = describe_sha_source(&Err(anyhow::anyhow!("missing")));
-        assert!(!found && text.contains(CLIENT_SHA_FILE), "{text}");
-        assert!(!text.contains("abcdef123"));
-    }
-
-    #[test]
-    fn cookie_file_check_stats_only_when_the_text_changes() {
-        let mut c = CookieFileCheck::default();
-        let mut calls = 0;
-        let mut check = |path: &str, result: bool| {
-            c.is_file_with(path, |_| {
-                calls += 1;
-                result
-            })
-        };
-        assert!(check("a.json", true));
-        assert!(check("a.json", false)); // cached: the check is not rerun
-        assert!(!check("b.json", false));
-        assert!(check("a.json", true));
-        assert_eq!(calls, 3);
-
-        let real = tempfile::NamedTempFile::new().unwrap();
-        let mut c = CookieFileCheck::default();
-        assert!(c.is_file(real.path().to_str().unwrap()));
-        assert!(!c.is_file("definitely/not/here.json"));
-    }
-
-    #[test]
     fn theme_choices_cover_every_preference_once() {
         let prefs: Vec<_> = THEME_CHOICES.iter().map(|(p, _)| *p).collect();
         assert_eq!(
@@ -514,8 +344,6 @@ mod tests {
             interval_secs: 120,
             show_all: true,
             always_on_top: true,
-            cookie_file: Some(PathBuf::from("C:/x/cookies.sqlite")),
-            client_sha: Some("abcdef123".into()),
             tray_enabled: false,
             start_in_pill: true,
             reduce_motion: true,
@@ -527,8 +355,6 @@ mod tests {
                 plan: "Max 5x".into(),
                 interval: "2m".into(),
                 show_all: true,
-                cookie_file: "C:/x/cookies.sqlite".into(),
-                client_sha: "abcdef123".into(),
                 tray_enabled: false,
                 close_to_tray: true,
                 start_in_pill: true,
@@ -539,8 +365,6 @@ mod tests {
         );
         let d = draft();
         assert_eq!(d.interval, "1m");
-        assert_eq!(d.cookie_file, "");
-        assert_eq!(d.client_sha, "");
     }
 
     #[test]
@@ -590,8 +414,7 @@ mod tests {
     fn build_unchanged_draft_is_identity() {
         let current = Settings {
             always_on_top: true,
-            cookie_file: Some(PathBuf::from("c.sqlite")),
-            client_sha: Some("abcdef123".into()),
+            alert_states: [("default".to_owned(), Default::default())].into(),
             ..Settings::default()
         };
         let d = SettingsDraft::from_settings(&current);
@@ -608,8 +431,6 @@ mod tests {
             plan: "  Pro ".into(),
             interval: "2s".into(),
             show_all: true,
-            cookie_file: " C:/p/cookies.sqlite ".into(),
-            client_sha: " abcdef123\n".into(),
             ..draft()
         };
         assert_eq!(
@@ -619,8 +440,6 @@ mod tests {
                 interval_secs: MIN_INTERVAL_SECS,
                 show_all: true,
                 always_on_top: true,
-                cookie_file: Some(PathBuf::from("C:/p/cookies.sqlite")),
-                client_sha: Some("abcdef123".into()),
                 ..Settings::default()
             }
         );
@@ -694,21 +513,8 @@ mod tests {
     }
 
     #[test]
-    fn build_blank_optionals_become_none() {
-        let current = Settings {
-            cookie_file: Some(PathBuf::from("c.sqlite")),
-            client_sha: Some("abcdef123".into()),
-            ..Settings::default()
-        };
-        let d = SettingsDraft {
-            cookie_file: "   ".into(),
-            client_sha: "".into(),
-            ..SettingsDraft::from_settings(&current)
-        };
-        let s = build_settings(&d, &current).unwrap();
-        assert_eq!(s.cookie_file, None);
-        assert_eq!(s.client_sha, None);
-
+    fn build_blank_plan_becomes_default() {
+        let current = Settings::default();
         let blank_plan = SettingsDraft {
             plan: "  ".into(),
             ..draft()
@@ -748,11 +554,10 @@ mod tests {
                 ..old.clone()
             },
             Settings {
-                cookie_file: Some(PathBuf::from("c.sqlite")),
-                ..old.clone()
-            },
-            Settings {
-                client_sha: Some("abcdef123".into()),
+                profiles: vec![crate::config::ProfileSettings {
+                    id: "default".into(),
+                    ..Default::default()
+                }],
                 ..old.clone()
             },
         ] {

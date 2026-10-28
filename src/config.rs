@@ -1,7 +1,7 @@
-//! User settings, poll-interval parsing, and client SHA resolution.
+//! User settings and poll-interval parsing.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,17 +11,10 @@ use crate::analytics::alerts::{AlertState, AlertToggles};
 /// Smallest poll interval the app accepts, in seconds.
 pub const MIN_INTERVAL_SECS: u64 = 5;
 
-/// Environment variable that overrides every other client SHA source.
-pub const CLIENT_SHA_ENV: &str = "CLAUDE_USAGE_TUI_CLIENT_SHA";
-
-/// File holding the anthropic-client-sha value.
-pub const CLIENT_SHA_FILE: &str = "client_sha.txt";
-
-/// Shortest string accepted as a client SHA from settings or file.
-pub const MIN_CLIENT_SHA_LEN: usize = 8;
-
 /// Persisted user settings. Missing fields take their [`Default`] values,
-/// so an `app.ron` written by an older build still loads.
+/// so an `app.ron` written by an older build still loads; fields it has
+/// that were since removed (`cookie_file`, `client_sha`, `alert_state`) are
+/// ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -30,10 +23,6 @@ pub struct Settings {
     pub interval_secs: u64,
     pub show_all: bool,
     pub always_on_top: bool,
-    /// Explicit cookie database; `None` auto-detects the browser profile.
-    pub cookie_file: Option<PathBuf>,
-    /// anthropic-client-sha override entered in the app.
-    pub client_sha: Option<String>,
     /// The window mode to open in.
     pub ui_mode: UiMode,
     /// Last normal (not maximized) full-mode window rect. Units: see
@@ -52,9 +41,9 @@ pub struct Settings {
     pub start_in_pill: bool,
     /// Which threshold alerts to deliver.
     pub alerts: AlertToggles,
-    /// Alerts already delivered in the current 5-hour window, persisted so a
-    /// restart does not repeat them.
-    pub alert_state: AlertState,
+    /// Alerts already delivered in the current 5-hour window, per profile id,
+    /// persisted so a restart does not repeat them.
+    pub alert_states: BTreeMap<String, AlertState>,
     /// The Details section is expanded.
     pub details_open: bool,
     /// Skip animations.
@@ -73,8 +62,6 @@ impl Default for Settings {
             interval_secs: 60,
             show_all: false,
             always_on_top: false,
-            cookie_file: None,
-            client_sha: None,
             ui_mode: UiMode::Full,
             full_rect: None,
             full_maximized: false,
@@ -83,7 +70,7 @@ impl Default for Settings {
             close_to_tray: true,
             start_in_pill: false,
             alerts: AlertToggles::default(),
-            alert_state: AlertState::default(),
+            alert_states: BTreeMap::new(),
             details_open: false,
             reduce_motion: false,
             keep_pulsing: false,
@@ -175,86 +162,6 @@ pub fn parse_interval(s: &str) -> Result<u64> {
         .with_context(|| format!("interval {s:?} is too large"))
 }
 
-/// Where the effective client SHA came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientShaSource {
-    /// The [`CLIENT_SHA_ENV`] environment variable.
-    Env,
-    /// The value saved in [`Settings::client_sha`].
-    Settings,
-    /// A `client_sha.txt` file at this path.
-    File(PathBuf),
-}
-
-/// Resolve the anthropic-client-sha header value.
-///
-/// Order: env `CLAUDE_USAGE_TUI_CLIENT_SHA` (non-empty) > `settings_value`
-/// (trimmed, at least 8 chars) > `client_sha.txt` next to the executable >
-/// `client_sha.txt` in the current directory > error.
-pub fn resolve_client_sha(settings_value: Option<&str>) -> Result<String> {
-    resolve_client_sha_with_source(settings_value).map(|(sha, _)| sha)
-}
-
-/// [`resolve_client_sha`], also reporting which source won.
-pub fn resolve_client_sha_with_source(
-    settings_value: Option<&str>,
-) -> Result<(String, ClientShaSource)> {
-    let env = std::env::var(CLIENT_SHA_ENV).ok();
-    let mut candidates = Vec::new();
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(Path::to_path_buf))
-    {
-        candidates.push(dir.join(CLIENT_SHA_FILE));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let p = cwd.join(CLIENT_SHA_FILE);
-        if !candidates.contains(&p) {
-            candidates.push(p);
-        }
-    }
-    resolve_client_sha_from(env.as_deref(), settings_value, &candidates)
-}
-
-/// [`resolve_client_sha`] with the environment value and file candidates
-/// supplied by the caller.
-fn resolve_client_sha_from(
-    env_value: Option<&str>,
-    settings_value: Option<&str>,
-    candidates: &[PathBuf],
-) -> Result<(String, ClientShaSource)> {
-    if let Some(v) = env_value.map(str::trim).filter(|v| !v.is_empty()) {
-        return Ok((v.to_owned(), ClientShaSource::Env));
-    }
-    let valid = |v: &str| {
-        let v = v.trim();
-        (v.len() >= MIN_CLIENT_SHA_LEN).then(|| v.to_owned())
-    };
-    if let Some(v) = settings_value.and_then(valid) {
-        return Ok((v, ClientShaSource::Settings));
-    }
-    for path in candidates {
-        if let Some(v) = fs::read_to_string(path).ok().as_deref().and_then(valid) {
-            return Ok((v, ClientShaSource::File(path.clone())));
-        }
-    }
-    let tried = if candidates.is_empty() {
-        "  (no candidate paths)".to_owned()
-    } else {
-        candidates
-            .iter()
-            .map(|p| format!("  {}", p.display()))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    bail!(
-        "{CLIENT_SHA_FILE} is missing, empty, or unreadable. Tried:\n{tried}\n\
-         Restore the file with a current anthropic-client-sha value, set the \
-         {CLIENT_SHA_ENV} environment variable, or enter the client SHA in the \
-         app's Settings. See README.md."
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,8 +173,6 @@ mod tests {
         assert_eq!(s.interval_secs, 60);
         assert!(!s.show_all);
         assert!(!s.always_on_top);
-        assert_eq!(s.cookie_file, None);
-        assert_eq!(s.client_sha, None);
         assert_eq!(s.ui_mode, UiMode::Full);
         assert_eq!(s.full_rect, None);
         assert!(!s.full_maximized);
@@ -276,7 +181,7 @@ mod tests {
         assert!(!s.start_in_pill);
         assert_eq!(s.alerts, AlertToggles::default());
         assert!(s.alerts.crossed_75 && s.alerts.crossed_90 && s.alerts.projected_cap);
-        assert_eq!(s.alert_state, AlertState::default());
+        assert!(s.alert_states.is_empty());
         assert!(!s.details_open && !s.reduce_motion && !s.keep_pulsing);
         assert!(s.profiles.is_empty());
     }
@@ -291,7 +196,8 @@ mod tests {
     }
 
     /// The exact RON eframe stored for the pre-redesign Settings (as
-    /// `eframe::set_value` writes it) still loads, new fields defaulted.
+    /// `eframe::set_value` writes it) still loads; the removed cookie and
+    /// SHA fields are ignored and new fields defaulted.
     #[test]
     fn settings_old_app_ron_value_loads_with_defaults() {
         let old = r#"(plan:"Max 5x",interval_secs:120,show_all:true,always_on_top:true,cookie_file:Some("C:/x/cookies.sqlite"),client_sha:None)"#;
@@ -303,10 +209,42 @@ mod tests {
                 interval_secs: 120,
                 show_all: true,
                 always_on_top: true,
-                cookie_file: Some(PathBuf::from("C:/x/cookies.sqlite")),
                 ..Settings::default()
             }
         );
+    }
+
+    /// The full Settings RON of the last cookie-era build (e9dff54), with
+    /// `cookie_file`, `client_sha` and a populated `alert_state`, loads; the
+    /// kept fields survive and the removed ones are dropped.
+    #[test]
+    fn settings_cookie_era_app_ron_loads() {
+        let old = r#"(plan:"Max",interval_secs:90,show_all:false,always_on_top:false,cookie_file:Some("/Users/x/Library/Application Support/Firefox/Profiles/a.default/cookies.sqlite"),client_sha:Some("abcdef1234567890"),ui_mode:Pill,full_rect:Some((pos:(x:-1200,y:40),w:430.0,h:470.25)),full_maximized:true,pill_pos:Some((x:10,y:20)),tray_enabled:true,close_to_tray:false,start_in_pill:false,alerts:(crossed_75:true,crossed_90:false,projected_cap:true),alert_state:(window:Some("2026-10-01T10:00:00Z"),crossed_75:true,crossed_90:false,projected_cap:false),details_open:true,reduce_motion:false,keep_pulsing:true)"#;
+        let s: Settings = ron::from_str(old).unwrap();
+        assert_eq!(
+            s,
+            Settings {
+                plan: "Max".into(),
+                interval_secs: 90,
+                ui_mode: UiMode::Pill,
+                full_rect: Some(SavedRect {
+                    pos: Pos { x: -1200, y: 40 },
+                    w: 430.0,
+                    h: 470.25,
+                }),
+                full_maximized: true,
+                pill_pos: Some(Pos { x: 10, y: 20 }),
+                close_to_tray: false,
+                alerts: AlertToggles {
+                    crossed_90: false,
+                    ..AlertToggles::default()
+                },
+                details_open: true,
+                keep_pulsing: true,
+                ..Settings::default()
+            }
+        );
+        assert!(s.alert_states.is_empty());
     }
 
     #[test]
@@ -371,13 +309,12 @@ mod tests {
     #[test]
     fn settings_deserialize_partial_keeps_other_defaults() {
         let s: Settings =
-            serde_json::from_str(r#"{"interval_secs": 30, "cookie_file": "c.sqlite", "extra": 1}"#)
+            serde_json::from_str(r#"{"interval_secs": 30, "cookie_file": "c.sqlite", "client_sha": "abcdef123", "alert_state": {"window": null}, "extra": 1}"#)
                 .unwrap();
         assert_eq!(
             s,
             Settings {
                 interval_secs: 30,
-                cookie_file: Some(PathBuf::from("c.sqlite")),
                 ..Settings::default()
             }
         );
@@ -387,7 +324,7 @@ mod tests {
     fn settings_round_trip() {
         let s = Settings {
             plan: "Max 5x".into(),
-            client_sha: Some("abcdef123".into()),
+            alert_states: BTreeMap::from([("default".to_owned(), AlertState::default())]),
             ..Settings::default()
         };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
@@ -420,82 +357,5 @@ mod tests {
         ] {
             assert!(parse_interval(bad).is_err(), "{bad:?} should fail");
         }
-    }
-
-    fn sha_file(dir: &Path, contents: &str) -> PathBuf {
-        let p = dir.join(CLIENT_SHA_FILE);
-        fs::write(&p, contents).unwrap();
-        p
-    }
-
-    #[test]
-    fn client_sha_env_wins() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file = sha_file(tmp.path(), "filesha1234");
-        let (got, _) =
-            resolve_client_sha_from(Some("envsha"), Some("settingssha"), &[file]).unwrap();
-        assert_eq!(got, "envsha");
-    }
-
-    #[test]
-    fn client_sha_empty_env_falls_through_to_settings() {
-        let (got, _) = resolve_client_sha_from(Some(""), Some("  settingssha  "), &[]).unwrap();
-        assert_eq!(got, "settingssha");
-    }
-
-    #[test]
-    fn client_sha_short_settings_falls_through_to_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file = sha_file(tmp.path(), "  filesha1234\n");
-        let (got, _) = resolve_client_sha_from(None, Some("short"), &[file]).unwrap();
-        assert_eq!(got, "filesha1234");
-    }
-
-    #[test]
-    fn client_sha_files_tried_in_order() {
-        let exe_dir = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        let missing = exe_dir.path().join("nope").join(CLIENT_SHA_FILE);
-        let short = sha_file(exe_dir.path(), "tiny");
-        let good = sha_file(cwd.path(), "cwdsha12345");
-        let (got, _) =
-            resolve_client_sha_from(None, None, &[missing, short.clone(), good.clone()]).unwrap();
-        assert_eq!(got, "cwdsha12345");
-
-        fs::write(&short, "exesha12345").unwrap();
-        let (got, _) = resolve_client_sha_from(None, None, &[short, good]).unwrap();
-        assert_eq!(got, "exesha12345");
-    }
-
-    #[test]
-    fn client_sha_source_reported() {
-        let tmp = tempfile::tempdir().unwrap();
-        let file = sha_file(tmp.path(), "filesha1234");
-        let files = [file.clone()];
-        let src = |env, set| resolve_client_sha_from(env, set, &files).unwrap().1;
-        assert_eq!(
-            src(Some("envsha"), Some("settingssha")),
-            ClientShaSource::Env
-        );
-        assert_eq!(src(None, Some("settingssha")), ClientShaSource::Settings);
-        assert_eq!(src(None, Some("short")), ClientShaSource::File(file));
-    }
-
-    #[test]
-    fn client_sha_error_lists_paths_and_remedies() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a").join(CLIENT_SHA_FILE);
-        let b = sha_file(tmp.path(), "   ");
-        let msg = resolve_client_sha_from(None, None, &[a.clone(), b.clone()])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains("client_sha.txt is missing, empty, or unreadable"),
-            "{msg}"
-        );
-        assert!(msg.contains(&a.display().to_string()), "{msg}");
-        assert!(msg.contains(&b.display().to_string()), "{msg}");
-        assert!(msg.contains(CLIENT_SHA_ENV), "{msg}");
-        assert!(msg.contains("Settings"), "{msg}");
     }
 }

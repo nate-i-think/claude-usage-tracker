@@ -469,22 +469,11 @@ impl App {
             });
         }
         if let Some(err) = &self.state.error {
-            let hint = err.stale_sha_hint;
             let message = err.message.clone();
-            let mut open_settings = false;
             banner(ui, BannerKind::Error, |ui| {
                 ui.label(title("claude.ai usage — error", palette.danger));
                 ui.add(egui::Label::new(RichText::new(message).color(palette.text)).wrap());
-                if hint {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Your client SHA may be stale — update it in Settings");
-                        open_settings = ui.button("Open Settings").clicked();
-                    });
-                }
             });
-            if open_settings && self.settings_panel.is_none() {
-                self.toggle_settings();
-            }
         }
         if let Some(persist) = self
             .state
@@ -679,8 +668,8 @@ mod tests {
 
     fn err(message: &str) -> PollEvent {
         PollEvent::Err(FetchErrorInfo {
+            kind: crate::fetch::ErrorKind::Status,
             message: message.to_owned(),
-            stale_sha_hint: false,
         })
     }
 
