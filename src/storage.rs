@@ -655,6 +655,18 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
+/// When the newest session `*.jsonl` anywhere below `projects_dir` was last
+/// modified; `None` when there is none.
+pub fn newest_jsonl(projects_dir: &Path) -> Option<DateTime<Utc>> {
+    let mut files = Vec::new();
+    collect_jsonls(projects_dir, &mut files);
+    files
+        .iter()
+        .filter_map(|f| fs::metadata(f).and_then(|m| m.modified()).ok())
+        .max()
+        .map(DateTime::<Utc>::from)
+}
+
 // --- Filesystem helpers ----------------------------------------------------
 
 fn read_dir_paths(dir: &Path) -> Vec<PathBuf> {
@@ -1569,5 +1581,33 @@ mod tests {
             extract_tokens(&json!({"usage": {"input_tokens": "abc"}})),
             0
         );
+    }
+
+    #[test]
+    fn newest_jsonl_is_the_latest_session_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        assert_eq!(newest_jsonl(&projects), None);
+        let old = projects.join("a").join("old.jsonl");
+        let new = projects.join("b").join("new.jsonl");
+        for f in [&old, &new] {
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, "{}\n").unwrap();
+        }
+        fs::write(projects.join("b").join("notes.txt"), "").unwrap();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(t - std::time::Duration::from_secs(3600))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&new)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        assert_eq!(newest_jsonl(&projects), Some(DateTime::<Utc>::from(t)));
     }
 }

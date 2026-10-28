@@ -90,7 +90,8 @@ fn user_data_root() -> PathBuf {
     home_dir().join(".local").join("share")
 }
 
-pub(crate) fn home_dir() -> PathBuf {
+/// The user's home directory; empty when unknown.
+pub fn home_dir() -> PathBuf {
     std::env::home_dir().unwrap_or_default()
 }
 

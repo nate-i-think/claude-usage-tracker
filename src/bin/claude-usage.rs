@@ -12,7 +12,7 @@ fn main() -> eframe::Result {
     // persistence is off (see ui::window).
     // Toasts show under our own name and icon (per-user AUMID key).
     let toast_app = notify::register(&Paths::platform_default());
-    let settings = window::load_settings_early();
+    let settings = claude_usage::config::load_saved_settings();
     let viewport = window::viewport_builder(&settings, window::PlaceBy::for_platform());
     let ours = viewport.clone();
     let options = eframe::NativeOptions {

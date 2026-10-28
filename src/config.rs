@@ -1,12 +1,18 @@
 //! User settings and poll-interval parsing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::alerts::{AlertState, AlertToggles};
+
+/// eframe app id: names the storage directory (where `app.ron` lives) and
+/// the window class.
+pub const APP_ID: &str = "claude-usage";
+/// eframe storage key for [`Settings`].
+pub const SETTINGS_KEY: &str = "settings";
 
 /// Smallest poll interval the app accepts, in seconds.
 pub const MIN_INTERVAL_SECS: u64 = 5;
@@ -145,6 +151,27 @@ pub struct SavedRect {
     pub pos: Pos,
     pub w: f32,
     pub h: f32,
+}
+
+/// The persisted [`Settings`] in the text of eframe's `app.ron` (a RON map
+/// of storage key to RON value); defaults if anything is missing or broken.
+pub fn settings_from_app_ron(text: &str) -> Settings {
+    ron::from_str::<HashMap<String, String>>(text)
+        .ok()
+        .and_then(|map| map.get(SETTINGS_KEY).cloned())
+        .and_then(|value| ron::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+/// The GUI's persisted [`Settings`], read from eframe's storage: by the GUI
+/// before `run_native` (so the first window already has the saved
+/// geometry) and by the CLI (so disabled profiles, labels and Keychain
+/// overrides apply there too). Defaults if absent or unreadable.
+pub fn load_saved_settings() -> Settings {
+    eframe::storage_dir(APP_ID)
+        .and_then(|dir| std::fs::read_to_string(dir.join("app.ron")).ok())
+        .map(|text| settings_from_app_ron(&text))
+        .unwrap_or_default()
 }
 
 /// Parse `"30"`, `"30s"`, `"2m"`, `"1h"` into seconds.

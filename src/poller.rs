@@ -140,7 +140,7 @@ impl FetchErrorInfo {
 }
 
 /// `dir` with a leading `home` written as `~`.
-fn tilde(dir: &Path, home: &Path) -> String {
+pub fn tilde(dir: &Path, home: &Path) -> String {
     if home.as_os_str().is_empty() {
         return dir.display().to_string();
     }
@@ -580,15 +580,32 @@ pub fn poll_interval(settings: &Settings) -> Duration {
     Duration::from_secs(settings.interval_secs.max(MIN_INTERVAL_SECS))
 }
 
+/// What a one-shot setup does when a config dir is now signed in to a
+/// different account than `profiles.json` last recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountChange {
+    /// Set the old account's history aside, as the poller thread does.
+    Archive,
+    /// Leave the history and `profiles.json` alone, so the GUI's poller
+    /// still notices the change and archives it itself (the CLI).
+    Leave,
+}
+
 /// One-shot setup for polling outside the poller thread (the CLI `once`
-/// command), the same as the poller's start: migrate the legacy history,
-/// discover and resolve the profiles, set aside the history of a dir now
-/// signed in to another account, refresh `profiles.json`. Returns a ready
+/// and `debug` commands), the same as the poller's start: migrate the
+/// legacy history, discover and resolve the profiles, handle an account
+/// change per `on_change`, refresh `profiles.json`. Returns a ready
 /// runtime per polled profile, in display order.
-pub fn prepare_runtimes(deps: PollerDeps, root: Paths, settings: Settings) -> Vec<ProfileRuntime> {
+pub fn prepare_runtimes(
+    deps: PollerDeps,
+    root: Paths,
+    settings: Settings,
+    on_change: AccountChange,
+) -> Vec<ProfileRuntime> {
     // Nothing fetches on a thread here; results have nowhere to go.
     let (fetched, _) = mpsc::channel();
     let mut engine = Engine::new(deps, root, settings, fetched);
+    engine.on_change = on_change;
     engine.reconcile(Instant::now());
     engine.runtimes
 }
@@ -833,6 +850,10 @@ struct Engine {
     next_generation: u64,
     /// Where fetch threads send their results.
     fetched: Sender<Inbox>,
+    on_change: AccountChange,
+    /// An account change was left alone ([`AccountChange::Leave`]):
+    /// `profiles.json` must keep the old account so the GUI notices it.
+    change_left: bool,
 }
 
 impl Engine {
@@ -860,6 +881,8 @@ impl Engine {
             discovered_at: None,
             next_generation: 0,
             fetched,
+            on_change: AccountChange::Archive,
+            change_left: false,
         }
     }
 
@@ -906,7 +929,7 @@ impl Engine {
         // any, are discarded on arrival.
 
         let entries: Vec<ProfileIndexEntry> = profiles.iter().map(Profile::index_entry).collect();
-        if entries != self.indexed {
+        if entries != self.indexed && !self.change_left {
             // Best effort: the index only helps the CLI and MCP readers.
             let _ = storage::write_profiles_index(&self.root, &ProfileIndex::new(entries.clone()));
             self.indexed = entries;
@@ -927,6 +950,10 @@ impl Engine {
         let id = rt.profile.id.clone();
         if let Some(old) = self.accounts.get(&id) {
             if !old.eq_ignore_ascii_case(uuid) {
+                if self.on_change == AccountChange::Leave {
+                    self.change_left = true;
+                    return;
+                }
                 let old8: String = old.chars().take(8).collect();
                 // Best effort: if the rename fails the new account's samples
                 // follow the old ones, as before profiles existed.
@@ -1650,6 +1677,55 @@ mod tests {
         let index = storage::read_profiles_index(&rig.root).unwrap();
         assert_eq!(
             index.profiles[0].account_uuid.as_deref(),
+            Some("uuid-default")
+        );
+    }
+
+    #[test]
+    fn one_shot_setup_can_leave_an_account_change_to_the_gui() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = Paths::with_data_dir(tmp.path().join("data"));
+        let default = root.for_profile(&ProfileId::new(DEFAULT_ID));
+        fs::create_dir_all(default.data_dir()).unwrap();
+        fs::write(default.history_file(), "{\"ts\": 1, \"five_hour\": 99.0}\n").unwrap();
+        let mut entry = profile(&home, DEFAULT_ID).index_entry();
+        entry.account_uuid = Some("0ldacc0u-nt".into());
+        let index = ProfileIndex::new(vec![entry]);
+        storage::write_profiles_index(&root, &index).unwrap();
+        let deps = |home: PathBuf, cowork: PathBuf| PollerDeps {
+            source_for: Box::new(|_: &Profile| {
+                Box::new(FakeSource::default()) as Box<dyn UsageSource>
+            }),
+            discover: Box::new(move || vec![discovered(&home, DEFAULT_ID)]),
+            cowork_dir: cowork,
+        };
+
+        let cowork = tmp.path().join("cowork");
+        let rts = prepare_runtimes(
+            deps(home.clone(), cowork.clone()),
+            root.clone(),
+            Settings::default(),
+            AccountChange::Leave,
+        );
+        assert_eq!(rts.len(), 1);
+        assert!(!default.data_dir().join("history.0ldacc0u.jsonl").exists());
+        assert!(fs::read_to_string(default.history_file())
+            .unwrap()
+            .contains("99.0"));
+        assert_eq!(storage::read_profiles_index(&root).unwrap(), index);
+
+        prepare_runtimes(
+            deps(home, cowork),
+            root.clone(),
+            Settings::default(),
+            AccountChange::Archive,
+        );
+        assert!(default.data_dir().join("history.0ldacc0u.jsonl").exists());
+        assert_eq!(
+            storage::read_profiles_index(&root).unwrap().profiles[0]
+                .account_uuid
+                .as_deref(),
             Some("uuid-default")
         );
     }

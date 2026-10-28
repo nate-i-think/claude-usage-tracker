@@ -31,20 +31,15 @@
 //! always on top) when the app opens in pill mode, so the first frame is
 //! already the pill: no flash.
 
-use std::collections::HashMap;
-
 use eframe::egui::{self, Pos2, Vec2, ViewportBuilder, ViewportInfo};
 
+pub use crate::config::{settings_from_app_ron, APP_ID, SETTINGS_KEY};
 use crate::config::{Pos, SavedRect, Settings, UiMode};
 
 use super::pill;
 use super::settings::window_level;
 
-/// eframe app id: names the storage directory and the window class.
-pub const APP_ID: &str = "claude-usage";
 pub const TITLE: &str = "Claude Usage Monitor";
-/// eframe storage key for [`Settings`].
-pub const SETTINGS_KEY: &str = "settings";
 /// Full-mode window size on first run (inner, points).
 pub const FULL_SIZE: Vec2 = Vec2::new(420.0, 760.0);
 /// Smallest full-mode window (inner, points).
@@ -87,25 +82,6 @@ pub const SANE_POS: i32 = 16_384;
 /// How much of a restored window must stay on a monitor's work area, so it
 /// can always be grabbed by its title bar (points).
 pub const MIN_VISIBLE: Vec2 = Vec2::new(120.0, 48.0);
-
-/// The persisted [`Settings`] in the text of eframe's `app.ron` (a RON map
-/// of storage key to RON value); defaults if anything is missing or broken.
-pub fn settings_from_app_ron(text: &str) -> Settings {
-    ron::from_str::<HashMap<String, String>>(text)
-        .ok()
-        .and_then(|map| map.get(SETTINGS_KEY).cloned())
-        .and_then(|value| ron::from_str(&value).ok())
-        .unwrap_or_default()
-}
-
-/// The persisted [`Settings`], read from eframe's storage before
-/// `run_native` so the first window already has the saved geometry.
-pub fn load_settings_early() -> Settings {
-    eframe::storage_dir(APP_ID)
-        .and_then(|dir| std::fs::read_to_string(dir.join("app.ron")).ok())
-        .map(|text| settings_from_app_ron(&text))
-        .unwrap_or_default()
-}
 
 /// The mode the window opens in.
 pub fn startup_mode(settings: &Settings) -> UiMode {
@@ -608,6 +584,7 @@ mod win32 {
 mod tests {
     use super::*;
     use eframe::egui::{self, Rect};
+    use std::collections::HashMap;
 
     fn saved(x: i32, y: i32, w: f32, h: f32) -> SavedRect {
         SavedRect {

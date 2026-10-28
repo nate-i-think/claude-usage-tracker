@@ -380,6 +380,25 @@ pub fn same_config_dir(a: &Path, b: &Path, home: &Path) -> bool {
     normalize(&a.to_string_lossy(), home) == normalize(&b.to_string_lossy(), home)
 }
 
+/// The profile `query` names: its id, else its label (any case), else its
+/// config dir (`~` expands to `home`; trailing separators ignored).
+pub fn find<'a>(profiles: &'a [Profile], query: &str, home: &Path) -> Option<&'a Profile> {
+    let query = query.trim();
+    profiles
+        .iter()
+        .find(|p| p.id.as_str() == query)
+        .or_else(|| {
+            profiles
+                .iter()
+                .find(|p| p.label.to_lowercase() == query.to_lowercase())
+        })
+        .or_else(|| {
+            profiles
+                .iter()
+                .find(|p| same_config_dir(Path::new(query), &p.config_dir, home))
+        })
+}
+
 /// A new id for a hand-added config dir: its name as a slug (as discovery
 /// would give it), never `default`, made unique against `taken`.
 pub fn manual_id(config_dir: &Path, taken: impl Fn(&str) -> bool) -> String {
@@ -939,5 +958,33 @@ mod tests {
         assert_eq!(manual_id(Path::new("/"), none), "profile");
         let taken = |id: &str| id == "claude-b";
         assert_eq!(manual_id(Path::new("/y/.claude-b"), taken), "claude-b-2");
+    }
+
+    #[test]
+    fn find_by_id_label_or_dir() {
+        let home = Path::new("/nonexistent-home");
+        let found = [
+            Discovered {
+                id: ProfileId::new(DEFAULT_ID),
+                config_dir: home.join(".claude"),
+                config_dir_env: None,
+                account: None,
+            },
+            Discovered {
+                id: ProfileId::new("claude-secondary"),
+                config_dir: home.join(".claude-secondary"),
+                config_dir_env: Some(home.join(".claude-secondary").display().to_string()),
+                account: None,
+            },
+        ];
+        let all = polled(&[], &found);
+        let id = |q: &str| find(&all, q, home).map(|p| p.id.as_str());
+        assert_eq!(id("default"), Some("default"));
+        assert_eq!(id("claude-secondary"), Some("claude-secondary"));
+        // Labels fall back to the dir name: ".claude-secondary".
+        assert_eq!(id(".CLAUDE-Secondary"), Some("claude-secondary"));
+        assert_eq!(id("~/.claude-secondary/"), Some("claude-secondary"));
+        assert_eq!(id("/nonexistent-home/.claude"), Some("default"));
+        assert_eq!(id("nope"), None);
     }
 }
