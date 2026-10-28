@@ -1,27 +1,35 @@
-//! Stdio MCP server exposing the latest usage snapshot to a Claude agent.
+//! Stdio MCP server exposing the latest usage snapshots to a Claude agent.
 //!
 //! Ported from the Python mcp_server.py (removed; see git history). The
-//! monitor writes latest.json every poll; this server reads it on demand
-//! and offers `get_usage`, `wait` and `wait_test`.
+//! monitor writes each profile's latest.json every poll; this server reads
+//! them on demand and offers `get_usage`, `wait` and `wait_test`. The
+//! calling Claude Code profile is the one whose config dir matches the
+//! server's `CLAUDE_CONFIG_DIR` (unset: the default profile); `get_usage`
+//! leads with it and lists the others, and `wait` follows its 5-hour window.
 //! It does no network or auth of its own. The JSON logic lives in plain
 //! functions taking `&Paths` and `now`, so it is testable without the MCP
 //! runtime; the tokio runtime exists only inside [`run_stdio`].
 
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
-use crate::paths::Paths;
+use crate::paths::{self, Paths};
+use crate::profiles::{self, Discovered, Profile, ProfileId, ProfileIndexEntry};
 use crate::storage;
 
 pub const STALE_AFTER_ENV: &str = "CLAUDE_USAGE_MCP_STALE_AFTER";
 pub const MAX_BLOCK_ENV: &str = "CLAUDE_USAGE_MCP_MAX_BLOCK";
 pub const TEST_MAX_BLOCK_ENV: &str = "CLAUDE_USAGE_MCP_TEST_MAX_BLOCK";
+/// Set by Claude Code for every profile but the default (`~/.claude`).
+pub const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
 /// Default `wait_test` duration: just over `wait`'s 50s cap.
 pub const DEFAULT_TEST_SECONDS: i64 = 90;
 
-/// Tunables read once from the environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Tunables and the calling profile, read once from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfig {
     /// Snapshot older than this (seconds) is flagged stale.
     pub stale_after: i64,
@@ -29,6 +37,11 @@ pub struct McpConfig {
     pub max_block: i64,
     /// Hard ceiling for `wait_test` (at least 1).
     pub test_max_block: i64,
+    /// The calling Claude Code's `CLAUDE_CONFIG_DIR`; `None` when unset or
+    /// empty (the default profile).
+    pub config_dir: Option<String>,
+    /// Where profiles are discovered when `profiles.json` is unreadable.
+    pub home: PathBuf,
 }
 
 impl Default for McpConfig {
@@ -37,6 +50,8 @@ impl Default for McpConfig {
             stale_after: 180,
             max_block: 50,
             test_max_block: 600,
+            config_dir: None,
+            home: paths::home_dir(),
         }
     }
 }
@@ -61,6 +76,8 @@ impl McpConfig {
             stale_after: int(STALE_AFTER_ENV, d.stale_after),
             max_block: int(MAX_BLOCK_ENV, d.max_block).max(1),
             test_max_block: int(TEST_MAX_BLOCK_ENV, d.test_max_block).max(1),
+            config_dir: lookup(CONFIG_DIR_ENV).filter(|v| !v.is_empty()),
+            home: d.home,
         }
     }
 }
@@ -157,8 +174,125 @@ pub fn advise(windows: &[Value], stale: bool) -> (String, String) {
     (rec, summary)
 }
 
-/// The structured "most recent ping" view built from latest.json.
-pub fn current_usage(paths: &Paths, cfg: &McpConfig, now: DateTime<Utc>) -> Value {
+// --- Profiles ---------------------------------------------------------------
+
+/// The calling profile and the rest, in index order.
+struct Calling {
+    own: ProfileIndexEntry,
+    others: Vec<ProfileIndexEntry>,
+    /// Why `own` is the default profile despite `CLAUDE_CONFIG_DIR`.
+    note: Option<String>,
+}
+
+/// The known profiles: `profiles.json`, or (missing, corrupt or empty)
+/// discovery under `home`, whose ids match what the monitor writes under.
+fn profile_index(root: &Paths, home: &Path) -> Vec<ProfileIndexEntry> {
+    match storage::read_profiles_index(root) {
+        Some(index) if !index.profiles.is_empty() => index.profiles,
+        _ => profiles::polled(&[], &profiles::discover(home))
+            .iter()
+            .map(Profile::index_entry)
+            .collect(),
+    }
+}
+
+/// A stand-in default profile for when none is known (fresh install, or
+/// an older build that wrote only the root latest.json).
+fn synthetic_default(home: &Path) -> ProfileIndexEntry {
+    let found = Discovered {
+        id: ProfileId::new(profiles::DEFAULT_ID),
+        config_dir: home.join(".claude"),
+        config_dir_env: None,
+        account: None,
+    };
+    profiles::polled(&[], &[found])[0].index_entry()
+}
+
+/// Split the known profiles into the caller's (by `cfg.config_dir`, else
+/// the default) and the others.
+fn calling_profile(root: &Paths, cfg: &McpConfig) -> Calling {
+    let mut index = profile_index(root, &cfg.home);
+    let env = cfg.config_dir.as_deref();
+    let matched =
+        profiles::match_env(&index, env).and_then(|m| index.iter().position(|e| e.id == m.id));
+    let (pos, note) = match matched {
+        Some(i) => (Some(i), None),
+        None => (
+            index.iter().position(|e| e.is_default),
+            env.map(|dir| {
+                format!(
+                    "{CONFIG_DIR_ENV}={dir:?} matches no known profile, so this \
+                     reports the default profile. Open the claude-usage app so it \
+                     discovers the profile."
+                )
+            }),
+        ),
+    };
+    let own = match pos {
+        Some(i) => index.remove(i),
+        None => synthetic_default(&cfg.home),
+    };
+    Calling {
+        own,
+        others: index,
+        note,
+    }
+}
+
+/// Where a profile's latest.json lives. The default profile falls back to
+/// the root one an older build wrote, until the monitor writes its own.
+fn snapshot_paths(root: &Paths, entry: &ProfileIndexEntry) -> Paths {
+    let own = root.for_profile(&entry.id);
+    if (entry.is_default || entry.id.is_default()) && !own.latest_file().exists() {
+        root.clone()
+    } else {
+        own
+    }
+}
+
+fn profile_json(entry: &ProfileIndexEntry) -> Value {
+    json!({
+        "id": entry.id.as_str(),
+        "label": entry.label,
+        "email": entry.email,
+        "config_dir": entry.config_dir.display().to_string(),
+    })
+}
+
+/// `{"profile": ...}` followed by that profile's usage fields.
+fn with_profile(entry: &ProfileIndexEntry, usage: Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("profile".into(), profile_json(entry));
+    if let Value::Object(fields) = usage {
+        m.extend(fields);
+    }
+    m
+}
+
+// --- Usage -------------------------------------------------------------------
+
+/// The structured "most recent ping" view of the calling profile (the
+/// top-level fields), plus `profile`, an optional `profile_note`, and the
+/// same view of every other profile under `other_profiles`. `root` is the
+/// app's data dir, holding profiles.json.
+pub fn current_usage(root: &Paths, cfg: &McpConfig, now: DateTime<Utc>) -> Value {
+    let calling = calling_profile(root, cfg);
+    let usage = |e: &ProfileIndexEntry| profile_usage(&snapshot_paths(root, e), cfg, now);
+    let mut result = with_profile(&calling.own, usage(&calling.own));
+    if let Some(note) = calling.note {
+        result.insert("profile_note".into(), note.into());
+    }
+    let others: Vec<Value> = calling
+        .others
+        .iter()
+        .map(|e| Value::Object(with_profile(e, usage(e))))
+        .collect();
+    result.insert("other_profiles".into(), others.into());
+    Value::Object(result)
+}
+
+/// One profile's view, built from the latest.json under `paths`.
+fn profile_usage(paths: &Paths, cfg: &McpConfig, now: DateTime<Utc>) -> Value {
     let data = storage::read_latest_snapshot(paths).and_then(|v| match v {
         Value::Object(m) if !m.is_empty() => Some(m),
         _ => None,
@@ -172,6 +306,7 @@ pub fn current_usage(paths: &Paths, cfg: &McpConfig, now: DateTime<Utc>) -> Valu
             "windows": [],
             "five_hour": null,
             "extra": null,
+            "seven_day_breakdown": null,
             "recommendation": "No data yet — the monitor has not written a snapshot.",
             "summary": "No usage data available.",
         });
@@ -221,6 +356,12 @@ pub fn current_usage(paths: &Paths, cfg: &McpConfig, now: DateTime<Utc>) -> Valu
         "extra".into(),
         data.get("extra").cloned().unwrap_or(Value::Null),
     );
+    result.insert(
+        "seven_day_breakdown".into(),
+        data.get("seven_day_breakdown")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
     result.insert("recommendation".into(), recommendation.into());
     result.insert("summary".into(), summary.into());
     if stale {
@@ -254,9 +395,10 @@ pub enum WaitPlan {
     Sleep { block_seconds: i64 },
 }
 
-/// `seconds` of `None` means the tool's default, `cfg.max_block`.
+/// `seconds` of `None` means the tool's default, `cfg.max_block`. Follows
+/// the calling profile's 5-hour window (see [`current_usage`]).
 pub fn wait_begin(
-    paths: &Paths,
+    root: &Paths,
     cfg: &McpConfig,
     seconds: Option<i64>,
     confirm: bool,
@@ -274,7 +416,7 @@ pub fn wait_begin(
         };
     }
 
-    let usage = current_usage(paths, cfg, now);
+    let usage = current_usage(root, cfg, now);
     let reset_in = five_hour_field(&usage, "resets_in_seconds").as_i64();
     let reset_at = five_hour_field(&usage, "resets_at");
     let cycles = reset_in
@@ -296,6 +438,7 @@ pub fn wait_begin(
     WaitPlan::Preview(json!({
         "blocked": false,
         "preview": true,
+        "profile": usage["profile"]["id"],
         "would_block_seconds": block,
         "requested_seconds": seconds,
         "max_block_seconds": cfg.max_block,
@@ -307,13 +450,8 @@ pub fn wait_begin(
 }
 
 /// Second half of a confirmed `wait`: report after sleeping `slept_seconds`.
-pub fn wait_finish(
-    paths: &Paths,
-    cfg: &McpConfig,
-    slept_seconds: f64,
-    now: DateTime<Utc>,
-) -> Value {
-    let after = current_usage(paths, cfg, now);
+pub fn wait_finish(root: &Paths, cfg: &McpConfig, slept_seconds: f64, now: DateTime<Utc>) -> Value {
+    let after = current_usage(root, cfg, now);
     let remaining = five_hour_field(&after, "resets_in_seconds").as_i64();
     let done = remaining.is_some_and(|r| r <= 0);
 
@@ -330,6 +468,7 @@ pub fn wait_finish(
 
     json!({
         "blocked": true,
+        "profile": after["profile"]["id"],
         "slept_seconds": round1(slept_seconds),
         "five_hour_reset_at": five_hour_field(&after, "resets_at"),
         "five_hour_resets_in_seconds": remaining,
@@ -385,19 +524,25 @@ mod server {
     use super::*;
 
     const GET_USAGE_DESC: &str = "\
-Report Claude's current claude.ai usage from the most recent monitor ping.
+Report the calling Claude Code profile's current claude.ai usage, plus
+other profiles, from the most recent monitor ping.
 
 Read-only and non-blocking. Use this to decide whether to slow down or keep
-going. Returns, for each usage window (5-hour, 7-day, Fable, ...):
-utilization percent, when it resets, and a human-readable time-to-reset —
-plus the data's age, a `stale` flag (true if the monitor isn't updating),
-the extra-usage block, and a `recommendation`/`summary` you can act on.
+going. The top-level fields describe YOUR profile (the account this Claude
+Code session runs under, identified by `profile`): for each usage window
+(5-hour, 7-day, Fable, ...) utilization percent, when it resets, and a
+human-readable time-to-reset — plus the data's age, a `stale` flag (true if
+the monitor isn't updating), the extra-usage block, the 7-day per-model
+breakdown, and a `recommendation`/`summary` you can act on.
+`other_profiles` lists the same view for every other signed-in account.
 
 Data is whatever the running claude-usage monitor app last fetched; if
 the monitor isn't running the result is marked stale.";
 
     const WAIT_DESC: &str = "\
 Throttle yourself by sleeping in short, bounded cycles near a usage cap.
+Follows the calling Claude Code profile's 5-hour window (other profiles'
+usage is in get_usage()).
 
 BLOCKS the call while it sleeps, but only up to ~50s per call (MAX_BLOCK_SEC)
 — deliberately short so no MCP client times out and you can never get
@@ -566,8 +711,13 @@ mod tests {
         })
     }
 
+    /// Defaults, with a home that holds no profiles so discovery never
+    /// sees the real ones.
     fn cfg() -> McpConfig {
-        McpConfig::default()
+        McpConfig {
+            home: PathBuf::from("/nonexistent/claude-usage-mcp-test-home"),
+            ..McpConfig::default()
+        }
     }
 
     // --- config ---------------------------------------------------------
@@ -587,11 +737,22 @@ mod tests {
             McpConfig {
                 stale_after: 30,
                 max_block: 1,
-                test_max_block: 1
+                test_max_block: 1,
+                config_dir: Some("-5".into()),
+                ..McpConfig::default()
             }
         );
-        let bad = McpConfig::from_lookup(|_| Some("abc".into()));
+        let bad = McpConfig::from_lookup(|k| (k != CONFIG_DIR_ENV).then(|| "abc".into()));
         assert_eq!(bad, McpConfig::default());
+    }
+
+    #[test]
+    fn config_reads_claude_config_dir() {
+        let dir = "/Users/me/.claude-secondary";
+        let c = McpConfig::from_lookup(|k| (k == CONFIG_DIR_ENV).then(|| dir.into()));
+        assert_eq!(c.config_dir.as_deref(), Some(dir));
+        let empty = McpConfig::from_lookup(|k| (k == CONFIG_DIR_ENV).then(String::new));
+        assert_eq!(empty.config_dir, None);
     }
 
     // --- humanize -------------------------------------------------------
@@ -674,6 +835,12 @@ mod tests {
         assert_eq!(
             u,
             json!({
+                "profile": {
+                    "id": "default",
+                    "label": ".claude",
+                    "email": null,
+                    "config_dir": "/nonexistent/claude-usage-mcp-test-home/.claude",
+                },
                 "available": false,
                 "stale": true,
                 "note": "No usage snapshot found. Start the monitor to produce one: \
@@ -681,8 +848,10 @@ mod tests {
                 "windows": [],
                 "five_hour": null,
                 "extra": null,
+                "seven_day_breakdown": null,
                 "recommendation": "No data yet — the monitor has not written a snapshot.",
                 "summary": "No usage data available.",
+                "other_profiles": [],
             })
         );
         write_latest(&paths, &json!({}));
@@ -794,6 +963,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "profile",
                 "available",
                 "as_of",
                 "age_seconds",
@@ -801,8 +971,10 @@ mod tests {
                 "windows",
                 "five_hour",
                 "extra",
+                "seven_day_breakdown",
                 "recommendation",
-                "summary"
+                "summary",
+                "other_profiles"
             ]
         );
     }
@@ -863,6 +1035,189 @@ mod tests {
         assert_eq!(u["windows"][0]["utilization_pct"], 5);
     }
 
+    // --- profiles -------------------------------------------------------
+
+    /// A data root and home with two profiles in profiles.json: `default`
+    /// (5-hour at 20%) and `claude-secondary` (5-hour at 70%), each with
+    /// its own latest.json. Returns the secondary's `CLAUDE_CONFIG_DIR`.
+    fn two_profiles() -> (tempfile::TempDir, Paths, McpConfig, String) {
+        use crate::storage::ProfileIndex;
+        let (tmp, root) = temp_paths();
+        let home = tmp.path().join("home");
+        let secondary = home.join(".claude-secondary");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(&secondary).unwrap();
+        let env = secondary.display().to_string();
+        let entry = |id: &str, dir: PathBuf, env: Option<String>, label: &str| ProfileIndexEntry {
+            id: ProfileId::new(id),
+            label: label.into(),
+            color: 0,
+            config_dir: dir,
+            config_dir_env: env,
+            email: Some(format!("{label}@example.com")),
+            account_uuid: None,
+            is_default: id == profiles::DEFAULT_ID,
+        };
+        let index = ProfileIndex::new(vec![
+            entry("default", home.join(".claude"), None, "main"),
+            entry("claude-secondary", secondary, Some(env.clone()), "second"),
+        ]);
+        storage::write_profiles_index(&root, &index).unwrap();
+        for (id, pct) in [("default", 20.0), ("claude-secondary", 70.0)] {
+            write_latest(
+                &root.for_profile(&ProfileId::new(id)),
+                &snapshot(10, pct, 600),
+            );
+        }
+        let cfg = McpConfig { home, ..cfg() };
+        (tmp, root, cfg, env)
+    }
+
+    #[test]
+    fn calling_secondary_leads_and_lists_default() {
+        let (_tmp, root, cfg, env) = two_profiles();
+        let cfg = McpConfig {
+            config_dir: Some(env.clone()),
+            ..cfg
+        };
+        let u = current_usage(&root, &cfg, now());
+        assert_eq!(
+            u["profile"],
+            json!({
+                "id": "claude-secondary",
+                "label": "second",
+                "email": "second@example.com",
+                "config_dir": env,
+            })
+        );
+        assert_eq!(u["five_hour"]["utilization_pct"], 70.0);
+        assert_eq!(u["summary"], "5-hour 70% · resets in 10m 00s");
+        assert!(u.get("profile_note").is_none());
+        let others = u["other_profiles"].as_array().unwrap();
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0]["profile"]["id"], "default");
+        assert_eq!(others[0]["five_hour"]["utilization_pct"], 20.0);
+        assert_eq!(others[0]["stale"], false);
+        assert!(others[0]["recommendation"]
+            .as_str()
+            .unwrap()
+            .contains("20%"));
+        let keys: Vec<&str> = others[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys[0], "profile");
+        assert!(!keys.contains(&"other_profiles"));
+
+        // A trailing slash still matches.
+        let slash = McpConfig {
+            config_dir: Some(format!("{env}/")),
+            ..cfg.clone()
+        };
+        assert_eq!(
+            current_usage(&root, &slash, now())["profile"]["id"],
+            "claude-secondary"
+        );
+
+        // wait follows the caller's 5-hour window.
+        let WaitPlan::Preview(p) = wait_begin(&root, &cfg, Some(50), false, now()) else {
+            panic!("expected a preview");
+        };
+        assert_eq!(p["profile"], "claude-secondary");
+        assert_eq!(p["five_hour_resets_in_seconds"], 600);
+        let r = wait_finish(&root, &cfg, 50.0, now());
+        assert_eq!(r["profile"], "claude-secondary");
+        assert_eq!(r["five_hour_utilization_pct"], 70.0);
+    }
+
+    #[test]
+    fn env_unset_is_the_default_profile() {
+        let (_tmp, root, cfg, _env) = two_profiles();
+        let u = current_usage(&root, &cfg, now());
+        assert_eq!(u["profile"]["id"], "default");
+        assert_eq!(u["profile"]["email"], "main@example.com");
+        assert_eq!(u["five_hour"]["utilization_pct"], 20.0);
+        assert!(u.get("profile_note").is_none());
+        assert_eq!(u["other_profiles"][0]["profile"]["id"], "claude-secondary");
+        assert_eq!(u["other_profiles"][0]["five_hour"]["utilization_pct"], 70.0);
+    }
+
+    #[test]
+    fn unknown_env_falls_back_to_default_with_note() {
+        let (_tmp, root, cfg, _env) = two_profiles();
+        let cfg = McpConfig {
+            config_dir: Some("/somewhere/.claude-other".into()),
+            ..cfg
+        };
+        let u = current_usage(&root, &cfg, now());
+        assert_eq!(u["profile"]["id"], "default");
+        assert_eq!(
+            u["profile_note"],
+            "CLAUDE_CONFIG_DIR=\"/somewhere/.claude-other\" matches no known profile, so \
+             this reports the default profile. Open the claude-usage app so it discovers \
+             the profile."
+        );
+        assert_eq!(u["other_profiles"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_without_own_snapshot_reads_the_root_one() {
+        let (_tmp, root, cfg, _env) = two_profiles();
+        fs::remove_file(root.for_profile(&ProfileId::new("default")).latest_file()).unwrap();
+        write_latest(&root, &snapshot(10, 33.0, 600));
+        let u = current_usage(&root, &cfg, now());
+        assert_eq!(u["profile"]["id"], "default");
+        assert_eq!(u["five_hour"]["utilization_pct"], 33.0);
+        // A non-default profile never borrows the root snapshot.
+        fs::remove_file(
+            root.for_profile(&ProfileId::new("claude-secondary"))
+                .latest_file(),
+        )
+        .unwrap();
+        assert_eq!(u["other_profiles"][0]["available"], true);
+        let u = current_usage(&root, &cfg, now());
+        assert_eq!(u["other_profiles"][0]["available"], false);
+    }
+
+    #[test]
+    fn missing_index_falls_back_to_discovery() {
+        let (_tmp, root, cfg, env) = two_profiles();
+        fs::write(root.profiles_index_file(), "{ not json").unwrap();
+        // Discovery needs a signed-in .claude.json in each extra dir.
+        fs::write(
+            cfg.home.join(".claude-secondary").join(".claude.json"),
+            json!({"oauthAccount": {"emailAddress": "second@example.com",
+                                    "accountUuid": "u-2"}})
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = McpConfig {
+            config_dir: Some(env),
+            ..cfg
+        };
+        let u = current_usage(&root, &cfg, now());
+        assert_eq!(u["profile"]["id"], "claude-secondary");
+        assert_eq!(u["profile"]["email"], "second@example.com");
+        assert_eq!(u["five_hour"]["utilization_pct"], 70.0);
+        assert_eq!(u["other_profiles"][0]["profile"]["id"], "default");
+        assert_eq!(u["other_profiles"][0]["five_hour"]["utilization_pct"], 20.0);
+    }
+
+    #[test]
+    fn seven_day_breakdown_passes_through() {
+        let (_tmp, root, cfg, _env) = two_profiles();
+        let mut snap = snapshot(10, 20.0, 600);
+        let breakdown = json!({"as_of": null, "window_started_at": null,
+                               "rows": [{"key": "opus", "display_name": "Opus", "percent": 12.5}]});
+        snap["seven_day_breakdown"] = breakdown.clone();
+        write_latest(&root.for_profile(&ProfileId::new("default")), &snap);
+        let u = current_usage(&root, &cfg, now());
+        assert_eq!(u["seven_day_breakdown"], breakdown);
+        assert_eq!(u["other_profiles"][0]["seven_day_breakdown"], Value::Null);
+    }
+
     // --- wait -----------------------------------------------------------
 
     fn preview(paths: &Paths, seconds: Option<i64>) -> Value {
@@ -882,6 +1237,7 @@ mod tests {
             json!({
                 "blocked": false,
                 "preview": true,
+                "profile": "default",
                 "would_block_seconds": 50,
                 "requested_seconds": 50,
                 "max_block_seconds": 50,
@@ -1024,10 +1380,17 @@ mod tests {
         use rmcp::model::CallToolRequestParams;
         use rmcp::ServiceExt;
 
-        let (_tmp, paths) = temp_paths();
-        write_latest(&paths, &snapshot(0, 12.0, 3600));
+        let (_tmp, paths, cfg, env) = two_profiles();
+        write_latest(
+            &paths.for_profile(&ProfileId::new("claude-secondary")),
+            &snapshot(0, 12.0, 3600),
+        );
+        let cfg = McpConfig {
+            config_dir: Some(env),
+            ..cfg
+        };
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-        let server = UsageServer::new(paths, cfg());
+        let server = UsageServer::new(paths, cfg);
         let handle = tokio::spawn(async move {
             server.serve(server_io).await?.waiting().await?;
             anyhow::Ok(())
@@ -1053,7 +1416,9 @@ mod tests {
             .unwrap();
         let structured = usage.structured_content.clone().unwrap();
         assert_eq!(structured["available"], true);
+        assert_eq!(structured["profile"]["id"], "claude-secondary");
         assert_eq!(structured["five_hour"]["utilization_pct"], 12.0);
+        assert_eq!(structured["other_profiles"][0]["profile"]["id"], "default");
         let text = usage.content[0].as_text().unwrap().text.clone();
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), structured);
 
@@ -1064,6 +1429,7 @@ mod tests {
             .unwrap();
         let p = preview.structured_content.unwrap();
         assert_eq!(p["preview"], true);
+        assert_eq!(p["profile"], "claude-secondary");
         assert_eq!(p["would_block_seconds"], 50);
 
         // A zero-second probe returns immediately.
