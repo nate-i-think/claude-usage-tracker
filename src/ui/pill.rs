@@ -2,6 +2,11 @@
 //! 5-hour window at a glance — mini ring, big %, "5h · 1h59m" countdown,
 //! pace delta, and a state dot that pulses near the cap.
 //!
+//! With two or more accounts it widens (see `window::pill_size`) to one
+//! compact segment per account — ring in the account's color, % in its
+//! state color, countdown — split by hairlines, no pace; the ring of the
+//! account the pulse follows breathes, a stale account's segment is dimmed.
+//!
 //! Interaction: drag anywhere moves the window, a click expands to the full
 //! dashboard, right-click swaps the content for a row of actions (a popup
 //! menu would not fit in a 44-point window), hover shows the full stats.
@@ -24,6 +29,7 @@ use super::chips::{self, Chip};
 use super::digits;
 use super::motion;
 use super::theme::{self, Palette};
+use super::timeline;
 
 /// Inner padding at the pill's left and right ends.
 pub const PAD_X: f32 = 12.0;
@@ -38,6 +44,11 @@ pub const DOT_R: f32 = 4.5;
 pub const PCT_SIZE: f32 = 20.0;
 pub const COUNTDOWN_SIZE: f32 = 13.0;
 pub const PACE_SIZE: f32 = 12.0;
+/// One account's segment in a multi-account pill: ring, %, countdown at
+/// their widest (see `widest_text_fits_the_pill`).
+pub const SEGMENT_W: f32 = 172.0;
+/// Between two segments: a gap, the hairline, a gap.
+pub const DIVIDER_SPAN: f32 = 2.0 * GAP;
 
 /// What the pill shows.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +94,14 @@ pub struct PillSegment {
     pub idle: bool,
     /// The weekly windows for the tooltip: ("7-day all", %), ("Fable", %).
     pub weekly: Vec<(&'static str, Option<f64>)>,
+    /// The account has polled successfully (else everything above is
+    /// empty and the segment shows "—").
+    pub polled: bool,
+    /// Its data is from before a failed poll: dimmed.
+    pub stale: bool,
+    /// The account the near-cap pulse follows (`accounts::hottest`): its
+    /// ring breathes in a multi-account pill.
+    pub hot: bool,
 }
 
 impl PillSegment {
@@ -99,12 +118,40 @@ impl PillSegment {
             pace: five.pace.filter(|_| five.pct.is_some()),
             idle: five.idle,
             weekly: chips[1..].iter().map(|c| (c.label, c.pct)).collect(),
+            polled: true,
+            stale: false,
+            hot: false,
         })
+    }
+
+    /// An account with no successful poll yet.
+    pub fn waiting(color: Color32, label: &str) -> PillSegment {
+        PillSegment {
+            color,
+            label: label.to_owned(),
+            pct: None,
+            level: analytics::color_for(None),
+            resets_at: None,
+            pace: None,
+            idle: false,
+            weekly: Vec::new(),
+            polled: false,
+            stale: false,
+            hot: false,
+        }
+    }
+
+    /// The segment's countdown text (the idle text without a window).
+    fn countdown(&self, now: DateTime<Utc>) -> String {
+        if self.idle {
+            IDLE_COUNTDOWN.to_owned()
+        } else {
+            countdown_text(self.resets_at, now)
+        }
     }
 }
 
-/// The pill's model: the first segment's 5-hour window (one account is
-/// drawn, for now).
+/// The one-account pill's model: the first segment's 5-hour window.
 pub fn model(segments: &[PillSegment]) -> PillModel {
     segments
         .first()
@@ -131,25 +178,33 @@ pub fn countdown_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> S
     format!("5h · {short}")
 }
 
-/// The hover text, two lines (the tooltip has to fit the 44-point window):
-/// the 5-hour line with pace and reset, then the weekly windows (or the
-/// last poll's failure).
+/// The hover text, at most two lines (the tooltip has to fit the 44-point
+/// window). One account: the 5-hour line with pace and reset, then the
+/// weekly windows (or the last poll's failure). Several: one line per
+/// account with its 5-hour % and reset — no room for the weekly windows
+/// (the dashboard has them); a stale account's line says its poll failed.
 pub fn tooltip_lines_in<Tz: TimeZone>(
     segments: &[PillSegment],
     failed: bool,
     now: DateTime<Utc>,
     tz: &Tz,
-) -> [String; 2]
+) -> Vec<String>
 where
     Tz::Offset: Display,
 {
-    let Some(five) = segments.first() else {
+    if segments.len() > 1 {
+        return segments
+            .iter()
+            .map(|s| account_line_in(s, now, tz))
+            .collect();
+    }
+    let Some(five) = segments.first().filter(|s| s.polled) else {
         let second = if failed {
             "Last poll failed · click to see why"
         } else {
             "Waiting for the first poll"
         };
-        return ["5-hour —".to_owned(), second.to_owned()];
+        return vec!["5-hour —".to_owned(), second.to_owned()];
     };
     let mut first = format!("5-hour {}", chips::pct_text(five.pct));
     if let Some(p) = five.pace.filter(|_| five.pct.is_some()) {
@@ -170,7 +225,28 @@ where
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    [first, second]
+    vec![first, second]
+}
+
+/// "work · 5-hour 46% · resets 14:05 · in 1h 59m": one account's tooltip
+/// line in a multi-account pill.
+fn account_line_in<Tz: TimeZone>(s: &PillSegment, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    let mut line = format!("{} · 5-hour {}", s.label, chips::pct_text(s.pct));
+    if let Some(r) = s.resets_at {
+        line.push_str(&format!(" · {}", chips::reset_tip_in(r, now, tz)));
+    }
+    if s.idle {
+        line.push_str(" · no active window");
+    }
+    if s.stale {
+        line.push_str(" · last poll failed");
+    } else if !s.polled {
+        line.push_str(" · waiting for the first poll");
+    }
+    line
 }
 
 /// The ring's arc for `pct`: (start, end) angles in radians, screen
@@ -240,6 +316,46 @@ pub fn slots(width: f32, w: &Widths) -> Slots {
     }
 }
 
+/// Where one account's pieces go in a multi-account pill (x from the
+/// pill's left edge).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentSlots {
+    pub ring_center: f32,
+    pub pct: f32,
+    /// Dropped when it does not fit the segment.
+    pub countdown: Option<f32>,
+    /// The hairline after this segment (none after the last).
+    pub divider: Option<f32>,
+}
+
+/// The multi-account layout: a segment per entry of `widths` (their `pace`
+/// is ignored), equal shares of `width` after the padding, the dividers
+/// and the state dot at the right end. At [`super::window::pill_size`]
+/// each share is [`SEGMENT_W`]; in a narrower window (a resize still on its
+/// way) the countdowns that do not fit are dropped.
+pub fn multi_slots(width: f32, widths: &[Widths]) -> (Vec<SegmentSlots>, f32) {
+    let n = widths.len().max(1) as f32;
+    let dot_center = width - PAD_X - DOT_R;
+    let room = dot_center - DOT_R - GAP - PAD_X - (n - 1.0) * DIVIDER_SPAN;
+    let share = (room / n).max(0.0);
+    let segments = widths
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let x0 = PAD_X + i as f32 * (share + DIVIDER_SPAN);
+            let pct = x0 + 2.0 * RING_R + GAP;
+            let countdown_x = pct + w.pct + GAP;
+            SegmentSlots {
+                ring_center: x0 + RING_R,
+                pct,
+                countdown: (countdown_x + w.countdown <= x0 + share).then_some(countdown_x),
+                divider: (i + 1 < widths.len()).then_some(x0 + share + DIVIDER_SPAN / 2.0),
+            }
+        })
+        .collect();
+    (segments, dot_center)
+}
+
 /// What the user asked the pill for this frame. Moving the window is done
 /// in place ([`ViewportCommand::StartDrag`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,10 +378,10 @@ pub struct PillState {
 // --- Painting -----------------------------------------------------------------
 
 /// Draw the pill into the whole of `ui` and handle its input. `segments`
-/// are the accounts' 5-hour windows (empty before the first poll; only the
-/// first is drawn, for now), `failed` whether
-/// the last poll failed, `pulse` the near-cap pulse level, `refresh_ready`
-/// whether a manual refresh is allowed now.
+/// are the accounts' 5-hour windows (empty before the poller reports its
+/// accounts; one → the classic pill, more → a segment each), `failed`
+/// whether the last poll failed, `pulse` the near-cap pulse level,
+/// `refresh_ready` whether a manual refresh is allowed now.
 pub fn show_pill(
     ui: &mut Ui,
     state: &mut PillState,
@@ -312,11 +428,14 @@ pub fn show_pill(
         return action;
     }
 
-    let model = model(segments);
-    paint_stats(ui, rect, &model, failed, pulse, palette, now);
+    if segments.len() > 1 {
+        paint_segments(ui, rect, segments, failed, pulse, palette, now);
+    } else {
+        paint_stats(ui, rect, &model(segments), failed, pulse, palette, now);
+    }
     if !response.dragged() {
         let lines = tooltip_lines_in(segments, failed, now, &Local);
-        response.on_hover_ui(|ui| {
+        response.on_hover_ui(move |ui| {
             for line in lines {
                 ui.label(RichText::new(line).small());
             }
@@ -425,6 +544,124 @@ fn paint_stats(
     );
 }
 
+/// The multi-account pill: a segment per account, hairlines between, the
+/// state dot (in the pulse-followed account's state color) at the right.
+fn paint_segments(
+    ui: &Ui,
+    rect: Rect,
+    segments: &[PillSegment],
+    failed: bool,
+    pulse: f32,
+    palette: &Palette,
+    now: DateTime<Utc>,
+) {
+    let ctx = ui.ctx();
+    let painter = ui.painter();
+    let cy = rect.center().y;
+    let at = |x: f32| rect.left() + x;
+    let dim = |c: Color32, stale: bool| {
+        if stale {
+            c.gamma_multiply(timeline::DIM_ALPHA)
+        } else {
+            c
+        }
+    };
+
+    struct Laid {
+        pct: Option<f64>,
+        level: Color32,
+        pct_galley: Arc<Galley>,
+        countdown: Arc<Galley>,
+    }
+    let laid: Vec<Laid> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let level = dim(
+                motion::eased(ctx, Id::new(("pill-color", i)), palette.level(s.level)),
+                s.stale,
+            );
+            let pct = s
+                .pct
+                .map(|p| motion::eased(ctx, Id::new(("pill-pct", i)), p));
+            let (pct_galley, _) = digits::number_galley(
+                painter,
+                &chips::pct_text(pct),
+                theme::semibold(PCT_SIZE),
+                level,
+            );
+            let countdown = painter.layout_no_wrap(
+                if s.polled {
+                    s.countdown(now)
+                } else {
+                    String::new()
+                },
+                FontId::proportional(COUNTDOWN_SIZE),
+                dim(palette.text_muted, s.stale),
+            );
+            Laid {
+                pct,
+                level,
+                pct_galley,
+                countdown,
+            }
+        })
+        .collect();
+    let widths: Vec<Widths> = laid
+        .iter()
+        .map(|l| Widths {
+            pct: l.pct_galley.size().x,
+            countdown: l.countdown.size().x,
+            pace: None,
+        })
+        .collect();
+    let (slots, dot_x) = multi_slots(rect.width(), &widths);
+
+    let left_mid = |x: f32, g: &Arc<Galley>| pos2(at(x), cy - g.size().y / 2.0);
+    for ((s, l), slot) in segments.iter().zip(laid).zip(slots) {
+        let center = pos2(at(slot.ring_center), cy);
+        let color = dim(s.color, s.stale);
+        if s.hot && pulse > 0.0 {
+            paint_halo(painter, center, RING_R, color, pulse);
+        }
+        let r = RING_R - RING_W / 2.0;
+        painter.circle_stroke(center, r, Stroke::new(RING_W, dim(palette.track, s.stale)));
+        if let Some(angles) = arc_angles(l.pct) {
+            painter.line(arc_points(center, r, angles), Stroke::new(RING_W, color));
+        }
+        painter.galley(left_mid(slot.pct, &l.pct_galley), l.pct_galley, l.level);
+        if let Some(x) = slot.countdown {
+            painter.galley(left_mid(x, &l.countdown), l.countdown, palette.text_muted);
+        }
+        if let Some(x) = slot.divider {
+            let x = at(x);
+            painter.vline(
+                x,
+                (cy - RING_R)..=(cy + RING_R),
+                Stroke::new(1.0, palette.text_muted.gamma_multiply(0.35)),
+            );
+        }
+    }
+
+    // The dot follows the pulse's account; the ring breathes instead of it.
+    let hot = segments.iter().find(|s| s.hot);
+    let level = hot.map_or(Level::Dim, |s| s.level);
+    let color = motion::eased(ctx, Id::new("pill-color"), palette.level(level));
+    paint_dot(painter, pos2(at(dot_x), cy), color, level, failed, 0.0);
+}
+
+/// A breathing halo of `radius` around `center` at the pulse level.
+fn paint_halo(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32, pulse: f32) {
+    let halo = Shadow {
+        offset: [0, 0],
+        blur: 10,
+        spread: 1,
+        color: color.gamma_multiply(0.6 * pulse.min(1.0)),
+    };
+    let r = Rect::from_center_size(center, vec2(2.0 * radius, 2.0 * radius));
+    painter.add(halo.as_shape(r, radius as u8));
+}
+
 /// The state dot: filled in the state color, a hollow ring after a failed
 /// poll, with a breathing halo while `pulse` (near the cap) is up.
 fn paint_dot(
@@ -436,14 +673,7 @@ fn paint_dot(
     pulse: f32,
 ) {
     if pulse > 0.0 {
-        let halo = Shadow {
-            offset: [0, 0],
-            blur: 10,
-            spread: 1,
-            color: color.gamma_multiply(0.6 * pulse.min(1.0)),
-        };
-        let r = Rect::from_center_size(center, vec2(2.0 * DOT_R, 2.0 * DOT_R));
-        painter.add(halo.as_shape(r, DOT_R as u8));
+        paint_halo(painter, center, DOT_R, color, pulse);
     }
     if failed || level == Level::Dim {
         painter.circle_stroke(center, DOT_R - 0.75, Stroke::new(1.5, color));
@@ -527,8 +757,8 @@ mod tests {
         assert!(m.idle);
         assert_eq!((m.pct, m.pace, m.resets_at), (Some(0.0), None, None));
         let utc = FixedOffset::east_opt(0).unwrap();
-        let [a, _] = tooltip_lines_in(&seg(&[idle]), false, t(0), &utc);
-        assert_eq!(a, "5-hour 0% · no active window");
+        let lines = tooltip_lines_in(&seg(&[idle]), false, t(0), &utc);
+        assert_eq!(lines[0], "5-hour 0% · no active window");
     }
 
     #[test]
@@ -551,17 +781,60 @@ mod tests {
             chip("Fable", Some(0.0), None),
         ];
         let segs = seg(&chips);
-        let [a, b] = tooltip_lines_in(&segs, false, t(0), &utc);
+        let [a, b] = two(tooltip_lines_in(&segs, false, t(0), &utc));
         assert!(a.starts_with("5-hour 46% · ▲+6 · resets "), "{a}");
         assert!(a.ends_with("· in 1h 59m"), "{a}");
         assert_eq!(b, "7-day all 13% · Fable 0%");
-        let [_, b] = tooltip_lines_in(&segs, true, t(0), &utc);
+        let [_, b] = two(tooltip_lines_in(&segs, true, t(0), &utc));
         assert_eq!(b, "Last poll failed · click to see why");
-        let [a, b] = tooltip_lines_in(&[], false, t(0), &utc);
+        let waiting = ["5-hour —", "Waiting for the first poll"];
+        assert_eq!(tooltip_lines_in(&[], false, t(0), &utc), waiting);
+        // One account that has not polled yet: the same.
+        let one = [PillSegment::waiting(Color32::WHITE, "me")];
+        assert_eq!(tooltip_lines_in(&one, false, t(0), &utc), waiting);
+    }
+
+    fn two(lines: Vec<String>) -> [String; 2] {
+        lines.try_into().expect("two lines")
+    }
+
+    /// Two accounts: "work" with data, "home" stale, and a third waiting.
+    fn accounts() -> Vec<PillSegment> {
+        let work = PillSegment::from_chips(
+            &[
+                chip("5-hour", Some(46.0), Some(6.0)),
+                chip("7-day all", Some(13.0), None),
+            ],
+            Color32::RED,
+            "work",
+        )
+        .unwrap();
+        let home = PillSegment {
+            stale: true,
+            ..PillSegment::from_chips(&[chip("5-hour", Some(80.0), None)], Color32::BLUE, "home")
+                .unwrap()
+        };
+        vec![work, home]
+    }
+
+    #[test]
+    fn tooltip_has_a_line_per_account_and_no_weekly() {
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let [a, b] = two(tooltip_lines_in(&accounts(), false, t(0), &utc));
+        assert!(a.starts_with("work · 5-hour 46% · resets "), "{a}");
+        assert!(a.ends_with("· in 1h 59m"), "{a}");
+        assert!(!a.contains("▲") && !a.contains("7-day"), "{a}");
+        assert!(b.starts_with("home · 5-hour 80% · resets "), "{b}");
+        assert!(b.ends_with("· last poll failed"), "{b}");
+        // Same lines when the poll failed: the stale line says which.
         assert_eq!(
-            (a.as_str(), b.as_str()),
-            ("5-hour —", "Waiting for the first poll")
+            tooltip_lines_in(&accounts(), true, t(0), &utc),
+            tooltip_lines_in(&accounts(), false, t(0), &utc)
         );
+        let mut segs = accounts();
+        segs[1] = PillSegment::waiting(Color32::BLUE, "home");
+        let lines = tooltip_lines_in(&segs, false, t(0), &utc);
+        assert_eq!(lines[1], "home · 5-hour — · waiting for the first poll");
     }
 
     fn close(a: f32, b: f32) -> bool {
@@ -618,13 +891,40 @@ mod tests {
         assert_eq!(s.pace, None);
     }
 
-    /// The widest real strings at the real fonts fit the 300-point pill
-    /// with every piece shown.
     #[test]
-    fn widest_text_fits_the_pill() {
+    fn multi_slots_split_the_pill_into_equal_segments() {
+        let w = Widths {
+            pct: 46.0,
+            countdown: 60.0,
+            pace: Some(28.0),
+        };
+        let width = 2.0 * PAD_X + GAP + 2.0 * DOT_R + 2.0 * SEGMENT_W + DIVIDER_SPAN;
+        let (segs, dot) = multi_slots(width, &[w, w]);
+        assert_eq!(dot, width - PAD_X - DOT_R);
+        let [a, b] = [segs[0], segs[1]];
+        assert_eq!(a.ring_center, PAD_X + RING_R);
+        assert_eq!(a.pct, PAD_X + 2.0 * RING_R + GAP);
+        assert_eq!(a.countdown, Some(a.pct + 46.0 + GAP));
+        assert_eq!(a.divider, Some(PAD_X + SEGMENT_W + GAP));
+        let b0 = PAD_X + SEGMENT_W + DIVIDER_SPAN;
+        assert_eq!(b.ring_center, b0 + RING_R);
+        assert_eq!(b.countdown, Some(b.pct + 46.0 + GAP));
+        assert_eq!(b.divider, None);
+        // The last segment ends a gap before the dot.
+        assert_eq!(b0 + SEGMENT_W, dot - DOT_R - GAP);
+
+        // Still at the one-account width (the resize is on its way): the
+        // countdowns that don't fit are dropped, the rings and % stay.
+        let (segs, _) = multi_slots(300.0, &[w, w]);
+        assert!(segs.iter().all(|s| s.countdown.is_none()), "{segs:?}");
+        assert!(segs[1].pct + 46.0 < 300.0 - PAD_X);
+    }
+
+    /// The widest real strings at the real fonts: (pct, countdown, pace).
+    fn widest() -> (f32, f32, f32) {
         let ctx = egui::Context::default();
         theme::install(&ctx);
-        let mut fitted = None;
+        let mut widths = None;
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let p = ui.painter();
             let (_, pct) =
@@ -634,15 +934,35 @@ mod tests {
                     .size()
                     .x
             };
-            let w = Widths {
-                pct,
-                countdown: width("5h · 4h59m", COUNTDOWN_SIZE),
-                pace: Some(width("▲+100", PACE_SIZE)),
-            };
-            fitted = Some(slots(super::super::window::PILL_SIZE.x, &w));
+            let countdown = ["5h · 4h59m", "5h · 59m", IDLE_COUNTDOWN, "5h · now"]
+                .map(|t| width(t, COUNTDOWN_SIZE))
+                .into_iter()
+                .fold(0.0, f32::max);
+            widths = Some((pct, countdown, width("▲+100", PACE_SIZE)));
         });
         out.textures_delta.clear();
-        let s = fitted.unwrap();
+        widths.unwrap()
+    }
+
+    /// The widest real strings fit the one-account pill with every piece
+    /// shown, and each segment of the two-account pill with its countdown.
+    #[test]
+    fn widest_text_fits_the_pill() {
+        use super::super::window::pill_size;
+        let (pct, countdown, pace) = widest();
+        let w = Widths {
+            pct,
+            countdown,
+            pace: Some(pace),
+        };
+        let s = slots(pill_size(1).x, &w);
         assert!(s.countdown.is_some() && s.pace.is_some(), "{s:?}");
+        for n in [2, 3] {
+            let (segs, _) = multi_slots(pill_size(n).x, &vec![w; n]);
+            assert!(segs.iter().all(|s| s.countdown.is_some()), "{n}: {segs:?}");
+        }
+        // Not much slack either: within 16 points of the widest segment.
+        let needed = 2.0 * RING_R + GAP + pct + GAP + countdown;
+        assert!(SEGMENT_W - needed < 16.0, "{needed}");
     }
 }

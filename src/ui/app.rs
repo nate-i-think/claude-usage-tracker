@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use eframe::egui::{
     self, style::ScrollStyle, Align, CentralPanel, Frame, Margin, RichText, ScrollArea, Ui,
+    ViewportCommand,
 };
 
 use crate::config::{Pos, Settings, UiMode};
@@ -91,6 +92,9 @@ pub struct App {
     /// Passes since the last full/pill switch (see [`mode::Settle`]).
     settle: Settle,
     pill: PillState,
+    /// How many accounts the pill window is sized for (see
+    /// [`window::pill_size`]).
+    pill_accounts: usize,
     /// eframe's stale window key has been dropped from storage (first pass).
     storage_cleaned: bool,
     /// Every polled account and its latest results; the views show the
@@ -165,6 +169,7 @@ impl App {
                 click_ctx.request_repaint();
             }),
         );
+        let pill_accounts = window::startup_pill_segments(&settings);
         let mut app = Self {
             poller,
             poller_settings: settings.clone(),
@@ -174,6 +179,7 @@ impl App {
             pill_seen: None,
             settle: Settle::default(),
             pill: PillState::default(),
+            pill_accounts,
             storage_cleaned: false,
             accounts: Accounts::default(),
             settings_panel: None,
@@ -242,16 +248,19 @@ impl App {
     /// geometry of the mode being left. The header button, the pill and the
     /// tray menu all come through here.
     pub fn set_mode(&mut self, ctx: &egui::Context, to: UiMode) {
+        let accounts = self.pill_accounts_now();
         let cmds = mode::switch(
             &mut self.settings,
             to,
             &self.tracked,
             self.pill_seen,
             ctx.pixels_per_point(),
+            window::pill_size(accounts),
         );
         if cmds.is_empty() {
             return;
         }
+        self.pill_accounts = accounts;
         for cmd in cmds {
             ctx.send_viewport_cmd(cmd);
         }
@@ -261,6 +270,29 @@ impl App {
             // The pill can't show the panel; don't leave a draft behind it.
             self.settings_panel = None;
         }
+        ctx.request_repaint();
+    }
+
+    /// How many accounts the pill shows: the polled ones once the poller
+    /// has said (at least one), else what the window is sized for.
+    fn pill_accounts_now(&self) -> usize {
+        if self.accounts.known() {
+            self.accounts.list().len().max(1)
+        } else {
+            self.pill_accounts
+        }
+    }
+
+    /// Resize the pill when its account count changed (the window is kept
+    /// on a monitor afterwards, as after a switch).
+    fn fit_pill(&mut self, ctx: &egui::Context) {
+        let accounts = self.pill_accounts_now();
+        if self.settings.ui_mode != UiMode::Pill || accounts == self.pill_accounts {
+            return;
+        }
+        self.pill_accounts = accounts;
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(window::pill_size(accounts)));
+        self.settle.start();
         ctx.request_repaint();
     }
 
@@ -505,15 +537,23 @@ fn icon_button(ui: &mut Ui, selected: bool, enabled: bool, icon: &str) -> egui::
     ui.add_enabled(enabled, button)
 }
 
-/// The pill's segments: one per account with data, in order (the pill
-/// draws the first, for now).
+/// The pill's segments: one per account, in order; the pulse's account
+/// ([`accounts::hottest`]) marked hot.
 fn pill_segments(views: &[AccountView], now: DateTime<Utc>) -> Vec<PillSegment> {
+    let hot = accounts::hottest(views, now);
     views
         .iter()
-        .filter_map(|v| {
-            let d = v.data?;
-            let chips = chips::chips(&d.snapshot, d.window_start, d.window_end, now);
-            PillSegment::from_chips(&chips, v.color, v.label)
+        .enumerate()
+        .map(|(i, v)| {
+            let segment = v.data.and_then(|d| {
+                let chips = chips::chips(&d.snapshot, d.window_start, d.window_end, now);
+                PillSegment::from_chips(&chips, v.color, v.label)
+            });
+            PillSegment {
+                stale: v.stale,
+                hot: hot == Some(i),
+                ..segment.unwrap_or_else(|| PillSegment::waiting(v.color, v.label))
+            }
         })
         .collect()
 }
@@ -606,6 +646,7 @@ impl eframe::App for App {
         self.track_window(ctx, frame);
         self.handle_close_request(ctx);
         self.drain_events();
+        self.fit_pill(ctx);
         self.sync_tray(ctx);
         self.background_hooks(ctx);
         self.sync_settings(frame);

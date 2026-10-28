@@ -27,7 +27,7 @@
 //!   current pixels-per-point, which egui-winit multiplies back by the same
 //!   scale, so it is exact on any monitor.
 //!
-//! The pill window is built here too (borderless, fixed [`PILL_SIZE`],
+//! The pill window is built here too (borderless, fixed [`pill_size`],
 //! always on top) when the app opens in pill mode, so the first frame is
 //! already the pill: no flash.
 
@@ -37,6 +37,7 @@ use eframe::egui::{self, Pos2, Vec2, ViewportBuilder, ViewportInfo};
 
 use crate::config::{Pos, SavedRect, Settings, UiMode};
 
+use super::pill;
 use super::settings::window_level;
 
 /// eframe app id: names the storage directory and the window class.
@@ -48,8 +49,36 @@ pub const SETTINGS_KEY: &str = "settings";
 pub const FULL_SIZE: Vec2 = Vec2::new(420.0, 760.0);
 /// Smallest full-mode window (inner, points).
 pub const FULL_MIN: Vec2 = Vec2::new(360.0, 320.0);
-/// The pill window's size (inner == outer: no decorations; points).
-pub const PILL_SIZE: Vec2 = Vec2::new(300.0, 44.0);
+/// The one-account pill window's size (inner == outer: no decorations;
+/// points).
+const SINGLE_PILL: Vec2 = Vec2::new(300.0, 44.0);
+
+/// The pill window's size for `segments` accounts (inner == outer: no
+/// decorations; points): the one-account pill below two, else one
+/// [`pill::SEGMENT_W`] per account, hairline gaps between them and the
+/// state dot at the right end (see [`pill::multi_slots`]).
+pub fn pill_size(segments: usize) -> Vec2 {
+    if segments < 2 {
+        return SINGLE_PILL;
+    }
+    let n = segments as f32;
+    let fixed = 2.0 * pill::PAD_X + pill::GAP + 2.0 * pill::DOT_R;
+    Vec2::new(
+        fixed + n * pill::SEGMENT_W + (n - 1.0) * pill::DIVIDER_SPAN,
+        SINGLE_PILL.y,
+    )
+}
+
+/// How many segments the pill opens with: the enabled profiles (at least
+/// one); the app resizes it once the poller reports the real list.
+pub fn startup_pill_segments(settings: &Settings) -> usize {
+    settings
+        .profiles
+        .iter()
+        .filter(|p| p.enabled)
+        .count()
+        .max(1)
+}
 /// A saved position farther than this from the desktop origin (pixels,
 /// either axis) is junk and dropped. Generous enough for three 4K monitors
 /// side by side; on Windows the window is also kept on a real monitor's
@@ -104,7 +133,11 @@ pub fn startup_placement(settings: &Settings, px_per_point: f32) -> Placement {
             maximized: settings.full_maximized,
         },
         UiMode::Pill => Placement {
-            pos: pill_start_pos(settings, px_per_point),
+            pos: pill_start_pos(
+                settings,
+                px_per_point,
+                pill_size(startup_pill_segments(settings)),
+            ),
             maximized: false,
         },
     }
@@ -117,20 +150,20 @@ pub fn sane_pos(p: Pos) -> Option<Pos> {
 }
 
 /// Where the pill goes: its saved position if sane, else
-/// [`default_pill_pos`] for the saved full rect, else `None` (the OS
-/// places it).
-pub fn pill_start_pos(settings: &Settings, px_per_point: f32) -> Option<Pos> {
+/// [`default_pill_pos`] for the saved full rect and a pill of `size`, else
+/// `None` (the OS places it).
+pub fn pill_start_pos(settings: &Settings, px_per_point: f32, size: Vec2) -> Option<Pos> {
     settings
         .pill_pos
         .and_then(sane_pos)
-        .or_else(|| default_pill_pos(settings.full_rect, px_per_point))
+        .or_else(|| default_pill_pos(settings.full_rect, px_per_point, size))
 }
 
-/// A pill with no saved position sits in the bottom-right corner of the
-/// full window (`full`: position in pixels, size in points, at
+/// A pill of `size` with no saved position sits in the bottom-right corner
+/// of the full window (`full`: position in pixels, size in points, at
 /// `px_per_point`), where the eye already is. `None` without a sane full
 /// rect.
-pub fn default_pill_pos(full: Option<SavedRect>, px_per_point: f32) -> Option<Pos> {
+pub fn default_pill_pos(full: Option<SavedRect>, px_per_point: f32, size: Vec2) -> Option<Pos> {
     let full = full?;
     let pos = sane_pos(full.pos)?;
     let inset = |free: f32| {
@@ -142,8 +175,8 @@ pub fn default_pill_pos(full: Option<SavedRect>, px_per_point: f32) -> Option<Po
         }
     };
     Some(Pos {
-        x: pos.x + inset(full.w - PILL_SIZE.x),
-        y: pos.y + inset(full.h - PILL_SIZE.y),
+        x: pos.x + inset(full.w - size.x),
+        y: pos.y + inset(full.h - size.y),
     })
 }
 
@@ -180,7 +213,7 @@ pub fn viewport_builder(settings: &Settings, place_by: PlaceBy) -> ViewportBuild
             .with_window_level(window_level(settings.always_on_top)),
         // No min size: the runtime switch to full sets one.
         UiMode::Pill => base
-            .with_inner_size(PILL_SIZE)
+            .with_inner_size(pill_size(startup_pill_segments(settings)))
             .with_decorations(false)
             .with_resizable(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop),
@@ -664,7 +697,7 @@ mod tests {
             }
         );
         let b = viewport_builder(&pill, PlaceBy::Native);
-        assert_eq!(b.inner_size, Some(PILL_SIZE));
+        assert_eq!(b.inner_size, Some(pill_size(1)));
         assert_eq!(b.min_inner_size, None);
         assert_eq!(b.decorations, Some(false));
         assert_eq!(b.resizable, Some(false));
@@ -701,6 +734,49 @@ mod tests {
     }
 
     #[test]
+    fn pill_widens_per_account() {
+        assert_eq!(pill_size(0), Vec2::new(300.0, 44.0));
+        assert_eq!(pill_size(1), Vec2::new(300.0, 44.0));
+        let (two, three) = (pill_size(2), pill_size(3));
+        assert_eq!((two.y, three.y), (44.0, 44.0));
+        // Measured: each segment fits ring, "100%" and "5h · 4h59m".
+        assert_eq!(two.x, 401.0);
+        // Each further account adds the same width.
+        assert_eq!(three.x - two.x, pill::SEGMENT_W + pill::DIVIDER_SPAN);
+    }
+
+    #[test]
+    fn pill_opens_sized_for_the_enabled_profiles() {
+        let profile = |id: &str, enabled: bool| crate::config::ProfileSettings {
+            id: id.to_owned(),
+            enabled,
+            ..Default::default()
+        };
+        let mut s = Settings {
+            ui_mode: UiMode::Pill,
+            ..Settings::default()
+        };
+        assert_eq!(startup_pill_segments(&s), 1);
+        s.profiles = vec![profile("a", true), profile("b", false)];
+        assert_eq!(startup_pill_segments(&s), 1);
+        s.profiles.push(profile("c", true));
+        assert_eq!(startup_pill_segments(&s), 2);
+        let b = viewport_builder(&s, PlaceBy::Native);
+        assert_eq!(b.inner_size, Some(pill_size(2)));
+        // With no pill position, the wider pill still sits flush in the full
+        // window's bottom-right corner.
+        s.full_rect = Some(saved(0, 0, 600.0, 400.0));
+        let size = pill_size(2);
+        assert_eq!(
+            startup_placement(&s, 1.0).pos,
+            Some(Pos {
+                x: (600.0 - size.x) as i32,
+                y: 400 - 44
+            })
+        );
+    }
+
+    #[test]
     fn pill_start_pos_drops_wild_positions() {
         let s = |pill: Option<Pos>, full: Option<SavedRect>| Settings {
             pill_pos: pill,
@@ -714,7 +790,10 @@ mod tests {
             Pos { x: 0, y: 0 },
             Pos { x: 11_000, y: 4000 },
         ] {
-            assert_eq!(pill_start_pos(&s(Some(p), Some(full)), 1.0), Some(p));
+            assert_eq!(
+                pill_start_pos(&s(Some(p), Some(full)), 1.0, pill_size(1)),
+                Some(p)
+            );
         }
         // Wild: fall back to the full rect's bottom right (1x: 120, 416 in).
         let fallback = Some(Pos { x: 1120, y: 916 });
@@ -726,24 +805,39 @@ mod tests {
                 y: i32::MAX,
             },
         ] {
-            assert_eq!(pill_start_pos(&s(Some(p), Some(full)), 1.0), fallback);
+            assert_eq!(
+                pill_start_pos(&s(Some(p), Some(full)), 1.0, pill_size(1)),
+                fallback
+            );
         }
-        assert_eq!(pill_start_pos(&s(None, Some(full)), 1.0), fallback);
+        assert_eq!(
+            pill_start_pos(&s(None, Some(full)), 1.0, pill_size(1)),
+            fallback
+        );
         // Nothing usable: the OS places it.
-        assert_eq!(pill_start_pos(&s(None, None), 1.0), None);
+        assert_eq!(pill_start_pos(&s(None, None), 1.0, pill_size(1)), None);
         let wild_full = saved(50_000, 0, 420.0, 460.0);
-        assert_eq!(pill_start_pos(&s(None, Some(wild_full)), 1.0), None);
+        assert_eq!(
+            pill_start_pos(&s(None, Some(wild_full)), 1.0, pill_size(1)),
+            None
+        );
         // A full rect smaller than the pill: its top-left.
         let tiny = saved(5, 6, 100.0, 20.0);
-        assert_eq!(default_pill_pos(Some(tiny), 2.0), Some(Pos { x: 5, y: 6 }));
+        assert_eq!(
+            default_pill_pos(Some(tiny), 2.0, pill_size(1)),
+            Some(Pos { x: 5, y: 6 })
+        );
         // Garbage scale doesn't produce garbage positions.
-        assert_eq!(default_pill_pos(Some(full), f32::NAN), Some(full.pos));
+        assert_eq!(
+            default_pill_pos(Some(full), f32::NAN, pill_size(1)),
+            Some(full.pos)
+        );
     }
 
     #[test]
     fn pill_pos_tracked_in_pixels_and_saved_only_in_pill_mode() {
         let mut v = viewport(2.25);
-        v.outer_rect = Some(Rect::from_min_size(Pos2::new(100.0, 50.0), PILL_SIZE));
+        v.outer_rect = Some(Rect::from_min_size(Pos2::new(100.0, 50.0), pill_size(1)));
         v.inner_rect = v.outer_rect;
         assert_eq!(pill_pos_of(&v, 1.0), Some(Pos { x: 225, y: 113 }));
         let mut min = v.clone();

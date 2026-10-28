@@ -15,7 +15,7 @@ use crate::config::{Pos, Settings, UiMode};
 use super::settings::window_level;
 use super::window::{
     full_state_to_save, pill_pos_to_save, pill_start_pos, sane_pos, sane_size, TrackedWindow,
-    FULL_MIN, PILL_SIZE,
+    FULL_MIN,
 };
 
 /// How many passes after a switch the window may still report the old
@@ -35,9 +35,9 @@ pub fn to_points(p: Pos, px_per_point: f32) -> Pos2 {
 }
 
 /// Full → pill: un-maximize first if needed, drop the min size before
-/// shrinking, then borderless, fixed, [`PILL_SIZE`], at `pos` (if known),
-/// always on top.
-pub fn to_pill_commands(pos: Option<Pos2>, unmaximize: bool) -> Vec<ViewportCommand> {
+/// shrinking, then borderless, fixed, `size` (see
+/// [`super::window::pill_size`]), at `pos` (if known), always on top.
+pub fn to_pill_commands(pos: Option<Pos2>, unmaximize: bool, size: Vec2) -> Vec<ViewportCommand> {
     let mut cmds = Vec::with_capacity(7);
     if unmaximize {
         cmds.push(ViewportCommand::Maximized(false));
@@ -46,7 +46,7 @@ pub fn to_pill_commands(pos: Option<Pos2>, unmaximize: bool) -> Vec<ViewportComm
         ViewportCommand::MinInnerSize(Vec2::ZERO),
         ViewportCommand::Decorations(false),
         ViewportCommand::Resizable(false),
-        ViewportCommand::InnerSize(PILL_SIZE),
+        ViewportCommand::InnerSize(size),
     ]);
     if let Some(p) = pos {
         cmds.push(ViewportCommand::OuterPosition(p));
@@ -82,14 +82,16 @@ pub fn to_full_commands(
 
 /// Switch `settings` to `to`, given the window as last seen in each mode
 /// (`full`: the tracked full-mode window; `pill`: the last pill position)
-/// at the window's current `px_per_point`. Returns the commands to send;
-/// empty if already in `to`.
+/// at the window's current `px_per_point`; `pill_size` is the size the pill
+/// takes now (it depends on the account count). Returns the commands to
+/// send; empty if already in `to`.
 pub fn switch(
     settings: &mut Settings,
     to: UiMode,
     full: &TrackedWindow,
     pill: Option<Pos>,
     px_per_point: f32,
+    pill_size: Vec2,
 ) -> Vec<ViewportCommand> {
     if settings.ui_mode == to {
         return Vec::new();
@@ -99,8 +101,9 @@ pub fn switch(
         UiMode::Pill => {
             (settings.full_rect, settings.full_maximized) =
                 full_state_to_save(UiMode::Full, full, settings);
-            let pos = pill_start_pos(settings, px_per_point).map(|p| to_points(p, px_per_point));
-            to_pill_commands(pos, full.maximized == Some(true))
+            let pos = pill_start_pos(settings, px_per_point, pill_size)
+                .map(|p| to_points(p, px_per_point));
+            to_pill_commands(pos, full.maximized == Some(true), pill_size)
         }
         UiMode::Full => {
             settings.pill_pos = pill_pos_to_save(UiMode::Pill, pill, settings);
@@ -172,7 +175,9 @@ impl Settle {
 mod tests {
     use super::*;
     use crate::config::SavedRect;
-    use crate::ui::window::FULL_SIZE;
+    use crate::ui::window::{pill_size, FULL_SIZE};
+
+    const P1: Vec2 = Vec2::new(300.0, 44.0);
 
     fn rect(x: i32, y: i32, w: f32, h: f32) -> SavedRect {
         SavedRect {
@@ -186,7 +191,7 @@ mod tests {
     fn to_pill_sequence_is_the_spike_order() {
         let p = Pos2::new(10.0, 20.0);
         assert_eq!(
-            to_pill_commands(Some(p), false),
+            to_pill_commands(Some(p), false, P1),
             vec![
                 ViewportCommand::MinInnerSize(Vec2::ZERO),
                 ViewportCommand::Decorations(false),
@@ -196,7 +201,7 @@ mod tests {
                 ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
             ]
         );
-        let cmds = to_pill_commands(None, true);
+        let cmds = to_pill_commands(None, true, P1);
         assert_eq!(cmds[0], ViewportCommand::Maximized(false));
         assert_eq!(cmds[1], ViewportCommand::MinInnerSize(Vec2::ZERO));
         assert!(!cmds
@@ -250,14 +255,25 @@ mod tests {
             rect: Some(rect(100, 200, 500.0, 520.0)),
             maximized: Some(false),
         };
-        let cmds = switch(&mut s, UiMode::Pill, &seen, None, 2.25);
+        let cmds = switch(&mut s, UiMode::Pill, &seen, None, 2.25, P1);
         assert_eq!(s.ui_mode, UiMode::Pill);
         assert_eq!(s.full_rect, seen.rect);
         assert!(!s.full_maximized);
-        assert_eq!(cmds, to_pill_commands(Some(Pos2::new(400.0, 200.0)), false));
+        assert_eq!(
+            cmds,
+            to_pill_commands(Some(Pos2::new(400.0, 200.0)), false, P1)
+        );
         // Again: already there, nothing to do or record.
         let before = s.clone();
-        assert!(switch(&mut s, UiMode::Pill, &TrackedWindow::default(), None, 1.0).is_empty());
+        assert!(switch(
+            &mut s,
+            UiMode::Pill,
+            &TrackedWindow::default(),
+            None,
+            1.0,
+            P1
+        )
+        .is_empty());
         assert_eq!(s, before);
     }
 
@@ -269,10 +285,13 @@ mod tests {
             rect: Some(normal),
             maximized: Some(true),
         };
-        let cmds = switch(&mut s, UiMode::Pill, &seen, None, 1.0);
+        let cmds = switch(&mut s, UiMode::Pill, &seen, None, 1.0, P1);
         assert_eq!((s.full_rect, s.full_maximized), (Some(normal), true));
         // No pill position yet: the full window's bottom-right corner.
-        assert_eq!(cmds, to_pill_commands(Some(Pos2::new(300.0, 676.0)), true));
+        assert_eq!(
+            cmds,
+            to_pill_commands(Some(Pos2::new(300.0, 676.0)), true, P1)
+        );
     }
 
     #[test]
@@ -293,6 +312,7 @@ mod tests {
             &TrackedWindow::default(),
             pill_seen,
             2.0,
+            P1,
         );
         assert_eq!(s.ui_mode, UiMode::Full);
         assert_eq!(s.pill_pos, pill_seen);
@@ -315,9 +335,34 @@ mod tests {
             pill_pos: Some(Pos { x: 1, y: 1 }),
             ..Settings::default()
         };
-        let cmds = switch(&mut s, UiMode::Full, &TrackedWindow::default(), None, 1.0);
+        let cmds = switch(
+            &mut s,
+            UiMode::Full,
+            &TrackedWindow::default(),
+            None,
+            1.0,
+            P1,
+        );
         assert_eq!(s.pill_pos, Some(Pos { x: 1, y: 1 }));
         assert_eq!(cmds, to_full_commands(FULL_SIZE, None, true, false));
+    }
+
+    #[test]
+    fn two_accounts_enter_the_wider_pill_in_the_corner() {
+        let mut s = Settings::default();
+        let seen = TrackedWindow {
+            rect: Some(rect(100, 200, 500.0, 520.0)),
+            maximized: Some(false),
+        };
+        let size = pill_size(2);
+        let cmds = switch(&mut s, UiMode::Pill, &seen, None, 1.0, size);
+        assert!(cmds.contains(&ViewportCommand::InnerSize(size)), "{cmds:?}");
+        // Flush with the full window's bottom-right corner at its width.
+        let x = (100.0 + 500.0 - size.x).round();
+        assert!(
+            cmds.contains(&ViewportCommand::OuterPosition(Pos2::new(x, 676.0))),
+            "{cmds:?}"
+        );
     }
 
     #[test]
@@ -327,16 +372,20 @@ mod tests {
             rect: Some(rect(10, 10, 420.0, 460.0)),
             maximized: Some(false),
         };
-        switch(&mut s, UiMode::Pill, &full_seen, None, 1.0);
+        switch(&mut s, UiMode::Pill, &full_seen, None, 1.0, P1);
         switch(
             &mut s,
             UiMode::Full,
             &full_seen,
             Some(Pos { x: 70, y: 80 }),
             1.0,
+            P1,
         );
-        let cmds = switch(&mut s, UiMode::Pill, &full_seen, None, 1.0);
-        assert_eq!(cmds, to_pill_commands(Some(Pos2::new(70.0, 80.0)), false));
+        let cmds = switch(&mut s, UiMode::Pill, &full_seen, None, 1.0, P1);
+        assert_eq!(
+            cmds,
+            to_pill_commands(Some(Pos2::new(70.0, 80.0)), false, P1)
+        );
         assert_eq!(s.full_rect, full_seen.rect);
         assert_eq!(other(other(UiMode::Pill)), UiMode::Pill);
     }
