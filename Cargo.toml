@@ -53,10 +53,13 @@ windows-sys = { version = "0.61", features = [
 ] }
 # eframe's own (0.6): the HWND of the main window for its startup placement.
 raw-window-handle = "0.6"
-# The tray icon with the live 5-hour % (windows-sys only; no aws-lc/nasm).
-tray-icon = "=0.26.1"
 # Threshold alert toasts (windows 0.62, already in the tree; no aws-lc).
 tauri-winrt-notification = "=0.8.1"
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+# The tray icon with the live 5-hour % (Windows: a badge icon) or the
+# menu-bar item with every account's % as its title (macOS). No aws-lc/nasm.
+tray-icon = "=0.26.1"
 
 [profile.release]
 lto = "thin"

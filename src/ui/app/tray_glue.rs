@@ -13,12 +13,18 @@ use crate::crash;
 use crate::paths::Paths;
 
 use super::{refresh_ready, App};
-use crate::ui::tray::{self, CloseDecision, IconFace, Tray, TrayAction, TrayView};
+use crate::ui::theme;
+use crate::ui::tray::{self, CloseDecision, Tray, TrayAction};
 
 impl App {
-    /// Hide to the tray. Minimizing as well as hiding is what makes eframe
-    /// skip `ui()` (it only checks the minimized state); `logic()` goes on.
+    /// Hide to the tray (the menu bar on macOS); `logic()` goes on either
+    /// way, as eframe runs it for an invisible window on a timer instead of
+    /// waiting for a redraw. On Windows, minimizing as well as hiding is
+    /// what makes eframe skip `ui()` (it reads the minimized state). On
+    /// macOS hiding alone does it (the window reports itself occluded), and
+    /// minimizing would animate into the Dock.
     fn hide(&mut self, ctx: &egui::Context) {
+        #[cfg(not(target_os = "macos"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.hidden = true;
@@ -75,17 +81,13 @@ impl App {
         }
         // As of now: a window that rolled over since the poll reads 0%
         // with no reset.
-        let five = self.data().map(|d| d.five_hour_now(Utc::now()));
-        let pct = five.and_then(|f| f.pct);
-        let resets_at = five.and_then(|f| f.resets_at);
-        let failed = self.poll_failing();
+        let view = tray::tray_view(
+            &self.accounts.views(&theme::DARK),
+            Utc::now(),
+            !self.poller.is_alive(),
+            &Local,
+        );
         let pill = self.settings.ui_mode == UiMode::Pill;
-        // The shown account's figures, for now; no menu-bar title yet.
-        let view = TrayView {
-            face: IconFace::for_pct(pct),
-            title: String::new(),
-            tooltip: tray::tooltip_in(pct, resets_at, failed, &Local),
-        };
         if let Some(t) = self.tray.as_mut() {
             t.update(&view);
             t.set_pill_checked(pill);

@@ -1,15 +1,18 @@
-//! The tray icon: the live 5-hour % drawn as two digits on a state-colored
-//! rounded square, a tooltip, and a menu (Show / Hide, Pill mode, Refresh
-//! now, Quit).
+//! The tray icon. On Windows: the 5-hour % of the account with the most
+//! headroom drawn as two digits on a state-colored rounded square, with a
+//! tooltip listing every account. On macOS: a menu-bar item whose title is
+//! every account's 5-hour % ("46 · 12"), no icon. Both carry the same menu
+//! (Show / Hide, Pill mode, Refresh now, Quit); on macOS it opens on a left
+//! click.
 //!
-//! The pure parts (icon pixels, tooltip text, event mapping, the close
-//! decision) are testable on any platform; [`Tray`] owns the native icon.
-//! Its event handlers only push a [`TrayAction`] into a channel and wake
-//! the app; `App::logic` ([`eframe::App::logic`]) drains it, so the tray works while the
-//! window is hidden.
+//! The pure parts (icon pixels, title and tooltip text, event mapping, the
+//! close decision) are testable on any platform; [`Tray`] owns the native
+//! icon. Its event handlers only push a [`TrayAction`] into a channel and
+//! wake the app; `App::logic` ([`eframe::App::logic`]) drains it, so the
+//! tray works while the window is hidden.
 
 use std::fmt::Display;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -18,6 +21,7 @@ use eframe::egui::Color32;
 
 use crate::analytics::{self, alerts::fmt_clock_in, Level};
 
+use super::accounts::{best_headroom, AccountView};
 use super::chips::pct_text;
 use super::theme;
 
@@ -128,13 +132,112 @@ impl IconFace {
     }
 }
 
-/// Everything the tray shows for the latest polls: the icon, the menu-bar
-/// title (macOS; empty for none) and the tooltip.
+/// Everything the tray shows for the latest polls: the icon (Windows), the
+/// menu-bar title (macOS) and the tooltip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayView {
     pub face: IconFace,
     pub title: String,
     pub tooltip: String,
+}
+
+/// What the tray shows for `views` at `now` (see [`badge_face`],
+/// [`menu_bar_title`] and [`tooltip_for`]). `poller_dead`: the poller has
+/// stopped, so every figure is from before.
+pub fn tray_view<Tz: TimeZone>(
+    views: &[AccountView],
+    now: DateTime<Utc>,
+    poller_dead: bool,
+    tz: &Tz,
+) -> TrayView
+where
+    Tz::Offset: Display,
+{
+    let pcts: Vec<Option<f64>> = views.iter().map(|v| five_hour_pct(v, now)).collect();
+    TrayView {
+        face: badge_face(views, now),
+        title: menu_bar_title(&pcts),
+        tooltip: tooltip_for(views, now, poller_dead, tz),
+    }
+}
+
+/// An account's live 5-hour % at `now` (a window that rolled over since the
+/// poll reads 0%).
+fn five_hour_pct(v: &AccountView, now: DateTime<Utc>) -> Option<f64> {
+    v.data?.five_hour_now(now).pct
+}
+
+/// The menu-bar title's mark for an account without a figure.
+const NO_FIGURE: &str = "–";
+
+/// The menu-bar title: each account's 5-hour whole percent, rounded down
+/// like the chips, joined by " · " ("46 · 12"); "–" for an account without
+/// a figure, and for no accounts at all.
+pub fn menu_bar_title(pcts: &[Option<f64>]) -> String {
+    if pcts.is_empty() {
+        return NO_FIGURE.to_owned();
+    }
+    pcts.iter()
+        .map(|p| match p {
+            Some(p) => format!("{:.0}", p.floor()),
+            None => NO_FIGURE.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The Windows badge: the account with the most headroom
+/// ([`best_headroom`]), so the icon says whether there is an account left
+/// to work in.
+pub fn badge_face(views: &[AccountView], now: DateTime<Utc>) -> IconFace {
+    IconFace::for_pct(best_headroom(views, now).and_then(|i| five_hour_pct(&views[i], now)))
+}
+
+/// The tooltip for every account. One account (or none) reads as
+/// [`tooltip_in`]; more read "Claude usage" then a line per account,
+/// "Work 46% · resets 3:42 PM", marked " · stale" when its last poll failed
+/// (" · last poll failed" when it has no figure at all). At most
+/// [`TOOLTIP_MAX`] UTF-16 units.
+pub fn tooltip_for<Tz: TimeZone>(
+    views: &[AccountView],
+    now: DateTime<Utc>,
+    poller_dead: bool,
+    tz: &Tz,
+) -> String
+where
+    Tz::Offset: Display,
+{
+    let failed = |v: &AccountView| v.error.is_some() || poller_dead;
+    if views.len() <= 1 {
+        let five = views.first().and_then(|v| Some(v.data?.five_hour_now(now)));
+        let failed = views.first().map_or(poller_dead, failed);
+        return tooltip_in(
+            five.and_then(|f| f.pct),
+            five.and_then(|f| f.resets_at),
+            failed,
+            tz,
+        );
+    }
+    let mut text = "Claude usage".to_owned();
+    for v in views {
+        let five = v.data.map(|d| d.five_hour_now(now));
+        text.push_str(&format!(
+            "\n{} {}",
+            v.label,
+            pct_text(five.and_then(|f| f.pct))
+        ));
+        if let Some(at) = five.and_then(|f| f.resets_at) {
+            text.push_str(&format!(" · resets {}", fmt_clock_in(at, tz)));
+        }
+        if failed(v) {
+            text.push_str(if v.data.is_some() {
+                " · stale"
+            } else {
+                " · last poll failed"
+            });
+        }
+    }
+    cap_utf16(text, TOOLTIP_MAX)
 }
 
 /// The square's color for a level. The icon sits on the taskbar, not in
@@ -294,20 +397,20 @@ fn cap_utf16(text: String, max: usize) -> String {
     out
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub use native::{install_event_handlers, Tray};
 
-/// No tray outside Windows: nothing is ever sent.
-#[cfg(not(windows))]
+/// No tray outside Windows and macOS: nothing is ever sent.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn install_event_handlers(_ctx: &eframe::egui::Context) -> Receiver<TrayAction> {
     std::sync::mpsc::channel().1
 }
 
-/// No tray outside Windows: [`Tray::create`] always fails.
-#[cfg(not(windows))]
+/// No tray outside Windows and macOS: [`Tray::create`] always fails.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct Tray;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl Tray {
     pub fn create(_pill: bool) -> Result<Self, String> {
         Err("no tray icon on this platform".to_owned())
@@ -319,23 +422,27 @@ impl Tray {
     pub fn update(&mut self, _view: &TrayView) {}
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod native {
     use std::sync::mpsc::{channel, Receiver};
 
     use eframe::egui;
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::{
-        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    };
+    #[cfg(windows)]
+    use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconEvent};
+    use tray_icon::{TrayIcon, TrayIconBuilder};
+    #[cfg(windows)]
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
-    use super::{menu_action, render_icon_rgba, IconFace, IconLabel, TrayAction, TrayView};
+    use super::{menu_action, TrayAction, TrayView};
+    #[cfg(windows)]
+    use super::{render_icon_rgba, IconFace, IconLabel};
 
     /// The action for a click on the icon: only a left button release
     /// (right click opens the menu; moves, enters and leaves are dropped).
     /// A double click yields two releases; the app drops the second
     /// ([`super::toggle_accepted`]).
+    #[cfg(windows)]
     pub fn click_action(event: &TrayIconEvent) -> Option<TrayAction> {
         match event {
             TrayIconEvent::Click {
@@ -347,10 +454,15 @@ mod native {
         }
     }
 
-    /// Route clicks on the icon and menu picks into the returned channel,
-    /// waking `ctx` for each. Call once per process: tray-icon and muda keep
-    /// only the first handler ever set, so the handlers outlive any one
-    /// [`Tray`] (the icon is dropped and re-created with the setting).
+    /// Route menu picks (and, on Windows, clicks on the icon) into the
+    /// returned channel, waking `ctx` for each. Call once per process:
+    /// tray-icon and muda keep only the first handler ever set, so the
+    /// handlers outlive any one [`Tray`] (the icon is dropped and re-created
+    /// with the setting).
+    ///
+    /// On macOS a left click opens the menu, so clicks on the item itself
+    /// are not routed: the mouse-up that follows the menu would toggle the
+    /// window as well.
     pub fn install_event_handlers(ctx: &egui::Context) -> Receiver<TrayAction> {
         let (tx, rx) = channel();
         {
@@ -362,24 +474,33 @@ mod native {
                 }
             }));
         }
-        let ctx = ctx.clone();
-        TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-            if let Some(action) = click_action(&e) {
-                let _ = tx.send(action);
-                ctx.request_repaint();
-            }
-        }));
+        #[cfg(windows)]
+        {
+            let ctx = ctx.clone();
+            TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+                if let Some(action) = click_action(&e) {
+                    let _ = tx.send(action);
+                    ctx.request_repaint();
+                }
+            }));
+        }
         rx
     }
 
-    /// The live tray icon and its menu. Created and dropped on the main
-    /// thread (the menu items are not `Send`); dropping it removes the icon.
+    /// The live tray icon (Windows) or menu-bar item (macOS) and its menu.
+    /// Created and dropped on the main thread (the menu items are not
+    /// `Send`; on macOS tray-icon refuses any other thread); dropping it
+    /// removes the icon.
     pub struct Tray {
         icon: TrayIcon,
         pill_item: CheckMenuItem,
         /// Icon edge in pixels (the system small-icon size).
+        #[cfg(windows)]
         size: u32,
+        #[cfg(windows)]
         face: IconFace,
+        #[cfg(target_os = "macos")]
+        title: String,
         tooltip: String,
     }
 
@@ -401,18 +522,30 @@ mod native {
                 &quit,
             ])
             .map_err(|e| e.to_string())?;
+            let tooltip = super::tooltip_in(None, None, false, &chrono::Local);
+            let builder = TrayIconBuilder::new()
+                .with_id("claude-usage")
+                .with_tooltip(&tooltip)
+                .with_menu(Box::new(menu));
+            Self::build(builder, pill_item, tooltip)
+        }
+
+        /// Windows: the badge icon; left click toggles the window and right
+        /// click opens the menu.
+        #[cfg(windows)]
+        fn build(
+            builder: TrayIconBuilder,
+            pill_item: CheckMenuItem,
+            tooltip: String,
+        ) -> Result<Self, String> {
             // SAFETY: plain query, no pointers.
             let size = (unsafe { GetSystemMetrics(SM_CXSMICON) }).clamp(16, 256) as u32;
             let face = IconFace {
                 label: IconLabel::Unknown,
                 level: crate::analytics::Level::Dim,
             };
-            let tooltip = super::tooltip_in(None, None, false, &chrono::Local);
-            let icon = TrayIconBuilder::new()
-                .with_id("claude-usage")
-                .with_tooltip(&tooltip)
+            let icon = builder
                 .with_icon(render(size, face)?)
-                .with_menu(Box::new(menu))
                 .with_menu_on_left_click(false)
                 .build()
                 .map_err(|e| e.to_string())?;
@@ -421,6 +554,30 @@ mod native {
                 pill_item,
                 size,
                 face,
+                tooltip,
+            })
+        }
+
+        /// macOS: a title-only menu-bar item (tray-icon draws no image
+        /// without an icon) whose menu opens on either click. The autosave
+        /// name keeps the item where the user drags it.
+        #[cfg(target_os = "macos")]
+        fn build(
+            builder: TrayIconBuilder,
+            pill_item: CheckMenuItem,
+            tooltip: String,
+        ) -> Result<Self, String> {
+            let title = super::menu_bar_title(&[]);
+            let icon = builder
+                .with_title(&title)
+                .with_autosave_name("claude-usage")
+                .with_menu_on_left_click(true)
+                .build()
+                .map_err(|e| e.to_string())?;
+            Ok(Self {
+                icon,
+                pill_item,
+                title,
                 tooltip,
             })
         }
@@ -437,16 +594,21 @@ mod native {
             }
         }
 
-        /// Redraw the icon and tooltip, each only when it changed. The
-        /// title is a menu-bar thing; Windows has none.
+        /// Redraw the icon (Windows) or title (macOS) and the tooltip, each
+        /// only when it changed.
         pub fn update(&mut self, view: &TrayView) {
-            let face = view.face;
-            if face != self.face {
-                if let Ok(icon) = render(self.size, face) {
+            #[cfg(windows)]
+            if view.face != self.face {
+                if let Ok(icon) = render(self.size, view.face) {
                     if self.icon.set_icon(Some(icon)).is_ok() {
-                        self.face = face;
+                        self.face = view.face;
                     }
                 }
+            }
+            #[cfg(target_os = "macos")]
+            if view.title != self.title {
+                self.icon.set_title(Some(&view.title));
+                self.title.clone_from(&view.title);
             }
             if view.tooltip != self.tooltip && self.icon.set_tooltip(Some(&view.tooltip)).is_ok() {
                 self.tooltip.clone_from(&view.tooltip);
@@ -454,10 +616,12 @@ mod native {
         }
     }
 
+    #[cfg(windows)]
     fn render(size: u32, face: IconFace) -> Result<Icon, String> {
         Icon::from_rgba(render_icon_rgba(size, face), size, size).map_err(|e| e.to_string())
     }
 
+    #[cfg(windows)]
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -526,6 +690,10 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::ErrorKind;
+    use crate::model::{Snapshot, UsageWindow};
+    use crate::poller::{Dashboard, FetchErrorInfo};
+    use crate::profiles::ProfileId;
     use chrono::FixedOffset;
 
     const SIZES: [u32; 6] = [16, 20, 24, 32, 36, 48];
@@ -786,6 +954,187 @@ mod tests {
         assert_eq!(cap_utf16(exact.clone(), TOOLTIP_MAX), exact);
     }
 
+    fn t() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_791_000_000, 0).unwrap()
+    }
+
+    fn dashboard(pct: f64) -> Dashboard {
+        Dashboard {
+            snapshot: Snapshot {
+                fetched_at: t(),
+                windows: vec![UsageWindow {
+                    label: "5-hour".to_owned(),
+                    utilization: Some(pct),
+                    resets_at: Some(t() + chrono::Duration::hours(2)),
+                }],
+                extra: None,
+                breakdown: None,
+            },
+            history: Vec::new(),
+            fable_history: Vec::new(),
+            seven_day_recent: Vec::new(),
+            fable_recent: Vec::new(),
+            burners: Vec::new(),
+            window_start: t() - chrono::Duration::hours(3),
+            window_end: t() + chrono::Duration::hours(2),
+            window_samples: Vec::new(),
+            week_start: t(),
+            week_end: t(),
+            week_samples: Vec::new(),
+            persist_error: None,
+            plan: None,
+            token_expires_at: None,
+        }
+    }
+
+    fn error() -> FetchErrorInfo {
+        FetchErrorInfo {
+            kind: ErrorKind::Transport,
+            message: "down".to_owned(),
+        }
+    }
+
+    /// Account views over `accounts`: (label, data, failed).
+    fn views<'a>(
+        id: &'a ProfileId,
+        err: &'a FetchErrorInfo,
+        accounts: &'a [(&'a str, Option<Dashboard>, bool)],
+    ) -> Vec<AccountView<'a>> {
+        accounts
+            .iter()
+            .map(|(label, data, failed)| AccountView {
+                id,
+                label,
+                color: Color32::WHITE,
+                data: data.as_ref(),
+                error: failed.then_some(err),
+                stale: *failed && data.is_some(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_bar_title_lists_every_account() {
+        assert_eq!(menu_bar_title(&[Some(46.9), Some(12.0)]), "46 · 12");
+        assert_eq!(menu_bar_title(&[Some(46.9)]), "46");
+        assert_eq!(menu_bar_title(&[Some(99.6), None]), "99 · –");
+        assert_eq!(menu_bar_title(&[Some(0.0), Some(130.0)]), "0 · 130");
+        assert_eq!(menu_bar_title(&[None]), "–");
+        assert_eq!(menu_bar_title(&[]), "–");
+        // Rounds down, like the chips.
+        assert_eq!(
+            menu_bar_title(&[Some(46.9)]),
+            pct_text(Some(46.9)).trim_end_matches('%')
+        );
+    }
+
+    #[test]
+    fn tray_view_title_keeps_a_stale_accounts_last_value() {
+        let (id, err) = (ProfileId::new("p"), error());
+        let accounts = [
+            ("Work", Some(dashboard(46.0)), true),
+            ("Home", Some(dashboard(12.0)), false),
+            ("New", None, true),
+        ];
+        let view = tray_view(&views(&id, &err, &accounts), t(), false, &Utc);
+        assert_eq!(view.title, "46 · 12 · –");
+    }
+
+    #[test]
+    fn badge_shows_the_account_with_the_most_headroom() {
+        let (id, err) = (ProfileId::new("p"), error());
+        let accounts = [
+            ("Work", Some(dashboard(80.0)), false),
+            ("Home", Some(dashboard(30.0)), false),
+            ("New", None, false),
+        ];
+        assert_eq!(
+            badge_face(&views(&id, &err, &accounts), t()),
+            IconFace::for_pct(Some(30.0))
+        );
+        // The lower one goes stale: the fresh one wins.
+        let accounts = [
+            ("Work", Some(dashboard(80.0)), false),
+            ("Home", Some(dashboard(30.0)), true),
+        ];
+        assert_eq!(
+            badge_face(&views(&id, &err, &accounts), t()),
+            IconFace::for_pct(Some(80.0))
+        );
+        assert_eq!(badge_face(&[], t()), IconFace::for_pct(None));
+        let accounts = [("New", None, true)];
+        assert_eq!(
+            badge_face(&views(&id, &err, &accounts), t()),
+            IconFace::for_pct(None)
+        );
+    }
+
+    #[test]
+    fn tooltip_for_one_account_reads_as_before() {
+        let (id, err) = (ProfileId::new("p"), error());
+        let tz = FixedOffset::west_opt(4 * 3600).unwrap();
+        let reset = fmt_clock_in(t() + chrono::Duration::hours(2), &tz);
+        let accounts = [("Work", Some(dashboard(46.9)), false)];
+        assert_eq!(
+            tooltip_for(&views(&id, &err, &accounts), t(), false, &tz),
+            format!("Claude usage · 5h 46% · resets {reset}")
+        );
+        let accounts = [("Work", Some(dashboard(46.9)), true)];
+        assert_eq!(
+            tooltip_for(&views(&id, &err, &accounts), t(), false, &tz),
+            format!("Claude usage · 5h 46% · resets {reset} · last poll failed")
+        );
+        assert_eq!(tooltip_for(&[], t(), false, &tz), "Claude usage · 5h —");
+        assert_eq!(
+            tooltip_for(&[], t(), true, &tz),
+            "Claude usage · 5h — · last poll failed"
+        );
+    }
+
+    #[test]
+    fn tooltip_for_several_accounts_has_a_line_each() {
+        let (id, err) = (ProfileId::new("p"), error());
+        let tz = FixedOffset::west_opt(4 * 3600).unwrap();
+        let reset = fmt_clock_in(t() + chrono::Duration::hours(2), &tz);
+        let accounts = [
+            ("Work", Some(dashboard(46.9)), false),
+            ("Home", Some(dashboard(12.0)), true),
+            ("New", None, true),
+        ];
+        assert_eq!(
+            tooltip_for(&views(&id, &err, &accounts), t(), false, &tz),
+            format!(
+                "Claude usage\nWork 46% · resets {reset}\nHome 12% · resets {reset} · stale\nNew — · last poll failed"
+            )
+        );
+        // A stopped poller marks every account.
+        let accounts = [
+            ("Work", Some(dashboard(46.9)), false),
+            ("Home", Some(dashboard(12.0)), false),
+        ];
+        assert_eq!(
+            tooltip_for(&views(&id, &err, &accounts), t(), true, &tz),
+            format!(
+                "Claude usage\nWork 46% · resets {reset} · stale\nHome 12% · resets {reset} · stale"
+            )
+        );
+    }
+
+    #[test]
+    fn tooltip_for_two_long_accounts_is_capped() {
+        let (id, err) = (ProfileId::new("p"), error());
+        let long_a = "Ä".repeat(60) + "😀";
+        let long_b = "B".repeat(60);
+        let accounts = [
+            (long_a.as_str(), Some(dashboard(46.0)), true),
+            (long_b.as_str(), Some(dashboard(12.0)), false),
+        ];
+        let text = tooltip_for(&views(&id, &err, &accounts), t(), false, &Utc);
+        assert!(text.encode_utf16().count() <= TOOLTIP_MAX, "{text}");
+        assert!(text.ends_with('…'));
+        assert!(text.starts_with(&format!("Claude usage\n{long_a} 46%")));
+    }
+
     #[test]
     fn menu_ids_map_to_actions() {
         assert_eq!(menu_action(MENU_SHOW_HIDE), Some(TrayAction::ToggleVisible));
@@ -793,6 +1142,11 @@ mod tests {
         assert_eq!(menu_action(MENU_REFRESH), Some(TrayAction::Refresh));
         assert_eq!(menu_action(MENU_QUIT), Some(TrayAction::Quit));
         assert_eq!(menu_action("something else"), None);
+        // The ids are what the menu items are built with; keep them stable.
+        assert_eq!(
+            [MENU_SHOW_HIDE, MENU_PILL, MENU_REFRESH, MENU_QUIT],
+            ["show_hide", "pill", "refresh", "quit"]
+        );
     }
 
     #[test]

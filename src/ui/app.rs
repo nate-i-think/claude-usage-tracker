@@ -19,7 +19,7 @@ use eframe::egui::{
 
 use crate::config::{Pos, Settings, UiMode};
 use crate::paths::Paths;
-use crate::poller::{Dashboard, PollMsg, Poller};
+use crate::poller::{PollMsg, Poller};
 
 use super::accounts::{self, AccountView, Accounts};
 use super::alerts::AlertHook;
@@ -116,7 +116,8 @@ pub struct App {
     /// Creating the tray icon failed; not retried until the setting is
     /// turned off and on again.
     tray_failed: bool,
-    /// Hidden to the tray (minimized and invisible; only `logic()` runs).
+    /// Hidden to the tray or menu bar (invisible, and minimized on
+    /// Windows; only `logic()` runs).
     hidden: bool,
     /// Quit was chosen: the close that follows is not turned into a hide.
     quitting: bool,
@@ -199,15 +200,10 @@ impl App {
         app
     }
 
-    /// An account's last poll failed or the poller has stopped (the tray
-    /// tooltip and the pill's state dot say so).
+    /// An account's last poll failed or the poller has stopped (the pill's
+    /// state dot says so).
     fn poll_failing(&self) -> bool {
         self.accounts.any_error() || !self.poller.is_alive()
-    }
-
-    /// The shown account's latest successful poll.
-    fn data(&self) -> Option<&Dashboard> {
-        self.accounts.primary()?.poll.data.as_deref()
     }
 
     fn drain_events(&mut self) {
