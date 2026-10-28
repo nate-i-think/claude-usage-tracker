@@ -20,13 +20,13 @@ use crate::config::{Pos, Settings, UiMode};
 use crate::paths::Paths;
 use crate::poller::{Dashboard, PollMsg, Poller};
 
-use super::accounts::{self, Accounts};
+use super::accounts::{self, AccountView, Accounts};
 use super::alerts::AlertHook;
 use super::banners::{banner, BannerKind};
 use super::layout::{self, right_then_left, GAP};
 use super::mode::{self, Settle, SettleStep};
 use super::notify::{self, AppId};
-use super::pill::{self, PillAction, PillState};
+use super::pill::{self, PillAction, PillSegment, PillState};
 use super::settings::{self, PanelAction, SettingsPanel};
 use super::tray::{self, Tray, TrayAction};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
@@ -305,24 +305,28 @@ impl App {
     /// threshold alerts for a new poll, and a clicked toast showing the
     /// window.
     fn background_hooks(&mut self, ctx: &egui::Context) {
-        let shown = self.accounts.primary().and_then(|a| {
-            let d = a.poll.data.as_deref()?;
-            Some((&a.profile.id, d))
-        });
+        // Colors play no part in the alerts.
+        let views = self.accounts.views(&theme::DARK);
         self.alerts
-            .after_poll(shown, &mut self.settings, Utc::now());
+            .after_poll(&views, &mut self.settings, Utc::now());
         if self.toast_clicks.try_iter().count() > 0 {
             self.show(ctx);
         }
     }
 
     /// Hand this frame's motion preferences to the widgets and advance the
-    /// near-cap pulse; asks for the next pulse frame only while it moves
-    /// and the window is visible. Called from `ui()`, which only runs while
-    /// the window is shown, so the three pulses play where they are seen.
+    /// near-cap pulse, which follows the fresh account nearest its cap
+    /// ([`accounts::hottest`]); asks for the next pulse frame only while it
+    /// moves and the window is visible. Called from `ui()`, which only runs
+    /// while the window is shown, so the three pulses play where they are
+    /// seen.
     fn update_motion(&mut self, ctx: &egui::Context) {
         motion::set_reduce_motion(ctx, self.settings.reduce_motion);
-        let five = self.data().map(|d| d.five_hour_now(Utc::now()));
+        let now = Utc::now();
+        let views = self.accounts.views(&theme::DARK);
+        let five = accounts::hottest(&views, now)
+            .and_then(|i| views[i].data)
+            .map(|d| d.five_hour_now(now));
         self.pulse = self.pulse_tracker.update(
             five.and_then(|f| f.pct),
             five.and_then(|f| f.resets_at),
@@ -340,43 +344,43 @@ impl App {
     /// settings buttons on the right.
     fn header(&mut self, ui: &mut Ui) {
         let now = Utc::now();
-        let chips = self
-            .data()
-            .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now));
         let pulse = self.pulse.level;
+        let settings_open = self.settings_panel.is_some();
+        let ready = refresh_ready(self.last_refresh, Instant::now());
+        let views = self
+            .accounts
+            .views(theme::Palette::for_visuals(ui.visuals()));
+        // The buttons' clicks, acted on once the accounts are no longer
+        // borrowed for the chips.
+        let (mut settings, mut pill, mut refresh) = (false, false, false);
         right_then_left(
             ui,
             Align::Min,
             |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 ui.spacing_mut().button_padding = egui::vec2(4.0, 4.0);
-                if icon_button(ui, self.settings_panel.is_some(), true, "⚙")
+                settings = icon_button(ui, settings_open, true, "⚙")
                     .on_hover_text("Settings")
-                    .clicked()
-                {
-                    self.toggle_settings();
-                }
-                if icon_button(ui, false, true, "◱")
+                    .clicked();
+                pill = icon_button(ui, false, true, "◱")
                     .on_hover_text("Compact pill (click it to come back)")
-                    .clicked()
-                {
-                    self.set_mode(ui.ctx(), UiMode::Pill);
-                }
-                let ready = refresh_ready(self.last_refresh, Instant::now());
-                if icon_button(ui, false, ready, "⟳")
+                    .clicked();
+                refresh = icon_button(ui, false, ready, "⟳")
                     .on_hover_text("Refresh now")
                     .on_disabled_hover_text("Refreshed just now")
-                    .clicked()
-                {
-                    self.refresh_now();
-                }
+                    .clicked();
             },
-            |ui| {
-                if let Some(chips) = &chips {
-                    chips::show_chips(ui, chips, now, pulse);
-                }
-            },
+            |ui| chips::show_account_chips(ui, &views, now, pulse),
         );
+        if settings {
+            self.toggle_settings();
+        }
+        if pill {
+            self.set_mode(ui.ctx(), UiMode::Pill);
+        }
+        if refresh {
+            self.refresh_now();
+        }
     }
 
     /// Open the settings panel with a fresh draft, or close it (discarding
@@ -411,18 +415,21 @@ impl App {
     fn pill_ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let palette = theme::Palette::for_visuals(ui.visuals());
-        let now = Utc::now();
-        let chips = self
-            .data()
-            .map(|d| chips::chips(&d.snapshot, d.window_start, d.window_end, now))
-            .unwrap_or_default();
+        let segments = pill_segments(&self.accounts.views(palette), Utc::now());
         let failed = self.poll_failing();
         let ready = refresh_ready(self.last_refresh, Instant::now());
         let frame = Frame::NONE.fill(palette.surface);
         let action = CentralPanel::default()
             .frame(frame)
             .show(ui, |ui| {
-                pill::show_pill(ui, &mut self.pill, &chips, failed, self.pulse.level, ready)
+                pill::show_pill(
+                    ui,
+                    &mut self.pill,
+                    &segments,
+                    failed,
+                    self.pulse.level,
+                    ready,
+                )
             })
             .inner;
         match action {
@@ -498,17 +505,33 @@ fn icon_button(ui: &mut Ui, selected: bool, enabled: bool, icon: &str) -> egui::
     ui.add_enabled(enabled, button)
 }
 
-/// The dashboard body for one successful poll: the charts, footer strip,
-/// Details.
-fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
+/// The pill's segments: one per account with data, in order (the pill
+/// draws the first, for now).
+fn pill_segments(views: &[AccountView], now: DateTime<Utc>) -> Vec<PillSegment> {
+    views
+        .iter()
+        .filter_map(|v| {
+            let d = v.data?;
+            let chips = chips::chips(&d.snapshot, d.window_start, d.window_end, now);
+            PillSegment::from_chips(&chips, v.color, v.label)
+        })
+        .collect()
+}
+
+/// The dashboard body once some account has data: the charts, footer
+/// strip, Details.
+fn dashboard(ui: &mut Ui, views: &[AccountView], settings: &mut Settings) {
+    let Some(d) = accounts::first_data(views) else {
+        return;
+    };
     let now = Utc::now();
     let fresh = week::Freshness {
         age: now - d.snapshot.fetched_at,
         stale: snapshot_stale(d.snapshot.fetched_at, now, settings),
     };
-    charts(ui, d, now, fresh);
-    footer::show_footer(ui, d);
-    details::show_details(ui, d, settings, now);
+    charts(ui, views, now, fresh);
+    footer::show_footer(ui, views);
+    details::show_details(ui, views, settings, now);
 }
 
 /// The 5-hour and the 7-day timelines, each on its titled card, both
@@ -517,15 +540,15 @@ fn dashboard(ui: &mut Ui, d: &Dashboard, settings: &mut Settings) {
 /// content (measured the frame before); else stacked, 5-hour first. The
 /// weekly rows are muted when the snapshot is stale (see
 /// [`week::Freshness`]).
-fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>, fresh: week::Freshness) {
+fn charts(ui: &mut Ui, views: &[AccountView], now: DateTime<Utc>, fresh: week::Freshness) {
     let palette = theme::Palette::for_visuals(ui.visuals());
     let Some((left, right)) = layout::chart_widths(ui.available_width()) else {
         let size = layout::CardSize {
             chart: timeline::FULL_HEIGHT,
             min_content: 0.0,
         };
-        timeline::show_timeline_card(ui, d, now, palette, size);
-        week::show_week_card(ui, d, now, palette, size, fresh);
+        timeline::show_timeline_card(ui, views, now, palette, size);
+        week::show_week_card(ui, views, now, palette, size, fresh);
         return;
     };
     let id = egui::Id::new("charts-level-height");
@@ -539,10 +562,10 @@ fn charts(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>, fresh: week::Freshness
             ui.spacing_mut().item_spacing.x = GAP;
             let column = egui::Layout::top_down(egui::Align::Min);
             let a = ui.allocate_ui_with_layout(egui::vec2(left, 0.0), column, |ui| {
-                timeline::show_timeline_card(ui, d, now, palette, size)
+                timeline::show_timeline_card(ui, views, now, palette, size)
             });
             let b = ui.allocate_ui_with_layout(egui::vec2(right, 0.0), column, |ui| {
-                week::show_week_card(ui, d, now, palette, size, fresh)
+                week::show_week_card(ui, views, now, palette, size, fresh)
             });
             [a.inner, b.inner]
         })
@@ -607,10 +630,10 @@ impl eframe::App for App {
                     self.header(ui);
                     self.settings_panel(ui);
                     self.banners(ui);
-                    let shown = self.accounts.primary().and_then(|a| a.poll.data.as_deref());
-                    if let Some(d) = shown {
-                        dashboard(ui, d, &mut self.settings);
-                    }
+                    let views = self
+                        .accounts
+                        .views(theme::Palette::for_visuals(ui.visuals()));
+                    dashboard(ui, &views, &mut self.settings);
                 });
             });
         });

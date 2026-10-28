@@ -128,6 +128,15 @@ impl IconFace {
     }
 }
 
+/// Everything the tray shows for the latest polls: the icon, the menu-bar
+/// title (macOS; empty for none) and the tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayView {
+    pub face: IconFace,
+    pub title: String,
+    pub tooltip: String,
+}
+
 /// The square's color for a level. The icon sits on the taskbar, not in
 /// the app's theme, so it always uses the light palette's deep state colors,
 /// which carry white digits at 4.5:1 or better.
@@ -307,7 +316,7 @@ impl Tray {
         false
     }
     pub fn set_pill_checked(&self, _on: bool) {}
-    pub fn update(&mut self, _face: IconFace, _tooltip: String) {}
+    pub fn update(&mut self, _view: &TrayView) {}
 }
 
 #[cfg(windows)]
@@ -321,7 +330,7 @@ mod native {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
-    use super::{menu_action, render_icon_rgba, IconFace, IconLabel, TrayAction};
+    use super::{menu_action, render_icon_rgba, IconFace, IconLabel, TrayAction, TrayView};
 
     /// The action for a click on the icon: only a left button release
     /// (right click opens the menu; moves, enters and leaves are dropped).
@@ -428,8 +437,10 @@ mod native {
             }
         }
 
-        /// Redraw the icon and tooltip, each only when it changed.
-        pub fn update(&mut self, face: IconFace, tooltip: String) {
+        /// Redraw the icon and tooltip, each only when it changed. The
+        /// title is a menu-bar thing; Windows has none.
+        pub fn update(&mut self, view: &TrayView) {
+            let face = view.face;
             if face != self.face {
                 if let Ok(icon) = render(self.size, face) {
                     if self.icon.set_icon(Some(icon)).is_ok() {
@@ -437,8 +448,8 @@ mod native {
                     }
                 }
             }
-            if tooltip != self.tooltip && self.icon.set_tooltip(Some(&tooltip)).is_ok() {
-                self.tooltip = tooltip;
+            if view.tooltip != self.tooltip && self.icon.set_tooltip(Some(&view.tooltip)).is_ok() {
+                self.tooltip.clone_from(&view.tooltip);
             }
         }
     }

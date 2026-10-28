@@ -11,6 +11,7 @@ use crate::config::Settings;
 use crate::poller::Dashboard;
 use crate::storage::InstanceUsage;
 
+use super::accounts::AccountView;
 use super::layout::{right_then_left, GAP};
 use super::rows::{self, BurnTag};
 use super::theme::{self, Palette};
@@ -70,9 +71,22 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// The Details card for the accounts. For now the first account with data
+/// is drawn, as one account always was (see [`show_account_details`]).
+pub fn show_details(
+    ui: &mut Ui,
+    accounts: &[AccountView],
+    settings: &mut Settings,
+    now: DateTime<Utc>,
+) {
+    if let Some(d) = super::accounts::first_data(accounts) {
+        show_account_details(ui, d, settings, now);
+    }
+}
+
 /// The Details card. Clicking the header flips (and so persists) the open
 /// state.
-pub fn show_details(ui: &mut Ui, d: &Dashboard, settings: &mut Settings, now: DateTime<Utc>) {
+fn show_account_details(ui: &mut Ui, d: &Dashboard, settings: &mut Settings, now: DateTime<Utc>) {
     let palette = Palette::for_visuals(ui.visuals());
     theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());

@@ -33,6 +33,7 @@ use crate::analytics::{
 };
 use crate::poller::Dashboard;
 
+use super::accounts::AccountView;
 use super::motion;
 use super::theme::Palette;
 
@@ -1012,12 +1013,28 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
     }
 }
 
+/// The 5-hour card for the accounts. For now the first account with data
+/// is drawn, as one account always was (see [`show_account_card`]); 0
+/// (nothing drawn) without data.
+pub fn show_timeline_card(
+    ui: &mut Ui,
+    accounts: &[AccountView],
+    now: DateTime<Utc>,
+    palette: &Palette,
+    size: super::layout::CardSize,
+) -> f32 {
+    match super::accounts::first_data(accounts) {
+        Some(d) => show_account_card(ui, d, now, palette, size),
+        None => 0.0,
+    }
+}
+
 /// The timeline's card: the title with the window's span as its subtitle
 /// (see [`window_span_in`]), the timeline, `size.chart` tall, and the "5h
 /// burn" row under it.
 ///
 /// Returns the content's natural height (before `size.min_content`).
-pub fn show_timeline_card(
+fn show_account_card(
     ui: &mut Ui,
     d: &Dashboard,
     now: DateTime<Utc>,

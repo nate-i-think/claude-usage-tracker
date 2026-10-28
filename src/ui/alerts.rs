@@ -1,10 +1,12 @@
 //! Threshold alerts glue: after each new poll, decide which alerts fire
 //! ([`crate::analytics::alerts::evaluate`]) and hand their copy to the
 //! notifier thread ([`crate::ui::notify`]). The edge state lives in
-//! [`Settings::alert_states`], keyed by profile id (only the shown
-//! account is checked, for now), so the app's usual settings sync persists
-//! it and a restart does not repeat an alert.
+//! [`Settings::alert_states`], keyed by profile id, so the app's usual
+//! settings sync persists it and a restart does not repeat an alert. Every
+//! account with fresh data is checked on its own; with more than one
+//! account a toast names the one it is about.
 
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
 use chrono::{DateTime, Utc};
@@ -14,6 +16,8 @@ use crate::analytics::{compute_rate, projection, Projection};
 use crate::config::Settings;
 use crate::poller::Dashboard;
 use crate::profiles::ProfileId;
+
+use super::accounts::AccountView;
 
 /// The copy of the settings panel's "Send test notification".
 pub fn test_copy() -> AlertCopy {
@@ -51,42 +55,53 @@ pub fn alerts_for(
 /// Runs the alert check once per poll result and sends what fires.
 pub struct AlertHook {
     toasts: Sender<AlertCopy>,
-    /// `fetched_at` of the last poll checked.
-    last_poll: Option<DateTime<Utc>>,
+    /// Per account, `fetched_at` of the last poll checked.
+    last_poll: HashMap<ProfileId, DateTime<Utc>>,
 }
 
 impl AlertHook {
     pub fn new(toasts: Sender<AlertCopy>) -> Self {
         Self {
             toasts,
-            last_poll: None,
+            last_poll: HashMap::new(),
         }
     }
 
-    /// Check profile `id`'s `data` if it is a poll not seen yet: fired
-    /// alerts go to the notifier, the new edge state into `settings`
-    /// (persisted by the app's settings sync since it now differs from what
-    /// was saved). Never blocks.
+    /// Check each account's data that is a poll not seen yet: fired alerts
+    /// go to the notifier (named after the account when there are several),
+    /// the new edge state into `settings` (persisted by the app's settings
+    /// sync since it now differs from what was saved). Stale accounts (the
+    /// latest poll failed) are skipped: their figures are old. Never blocks.
     pub fn after_poll(
         &mut self,
-        account: Option<(&ProfileId, &Dashboard)>,
+        accounts: &[AccountView],
         settings: &mut Settings,
         now: DateTime<Utc>,
     ) {
-        let Some((id, d)) = account else { return };
-        if self.last_poll == Some(d.snapshot.fetched_at) {
-            return;
-        }
-        self.last_poll = Some(d.snapshot.fetched_at);
-        let toggles = settings.alerts;
-        let state = settings
-            .alert_states
-            .entry(id.as_str().to_owned())
-            .or_default();
-        for copy in alerts_for(d, state, toggles, now) {
-            // The notifier thread gone (it never exits on its own): nothing
-            // to deliver to.
-            let _ = self.toasts.send(copy);
+        let named = accounts.len() >= 2;
+        for a in accounts {
+            let Some(d) = a.data.filter(|_| !a.stale) else {
+                continue;
+            };
+            if self.last_poll.get(a.id) == Some(&d.snapshot.fetched_at) {
+                continue;
+            }
+            self.last_poll.insert(a.id.clone(), d.snapshot.fetched_at);
+            let toggles = settings.alerts;
+            let state = settings
+                .alert_states
+                .entry(a.id.as_str().to_owned())
+                .or_default();
+            for copy in alerts_for(d, state, toggles, now) {
+                let copy = if named {
+                    copy.for_account(a.label)
+                } else {
+                    copy
+                };
+                // The notifier thread gone (it never exits on its own):
+                // nothing to deliver to.
+                let _ = self.toasts.send(copy);
+            }
         }
     }
 
@@ -99,7 +114,9 @@ impl AlertHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::ErrorKind;
     use crate::model::{Snapshot, UsageWindow};
+    use crate::poller::FetchErrorInfo;
     use crate::profiles::DEFAULT_ID;
     use chrono::{Duration, TimeZone};
     use std::sync::mpsc::{channel, Receiver};
@@ -151,12 +168,20 @@ mod tests {
         rx.try_iter().map(|c| c.title).collect()
     }
 
+    fn view<'a>(id: &'a ProfileId, label: &'a str, d: Option<&'a Dashboard>) -> AccountView<'a> {
+        AccountView {
+            id,
+            label,
+            color: eframe::egui::Color32::WHITE,
+            data: d,
+            error: None,
+            stale: false,
+        }
+    }
+
     fn run(hook: &mut AlertHook, settings: &mut Settings, d: &Dashboard) {
-        hook.after_poll(
-            Some((&ProfileId::new(DEFAULT_ID), d)),
-            settings,
-            d.snapshot.fetched_at,
-        );
+        let id = ProfileId::new(DEFAULT_ID);
+        hook.after_poll(&[view(&id, "me", Some(d))], settings, d.snapshot.fetched_at);
     }
 
     #[test]
@@ -187,7 +212,9 @@ mod tests {
         settings.alert_states.clear();
         run(&mut hook, &mut settings, &d);
         assert_eq!(titles(&rx), ["5-hour usage at 80%"]);
-        hook.after_poll(None, &mut settings, t0());
+        hook.after_poll(&[], &mut settings, t0());
+        let id = ProfileId::new(DEFAULT_ID);
+        hook.after_poll(&[view(&id, "me", None)], &mut settings, t0());
         assert!(titles(&rx).is_empty());
     }
 
@@ -284,6 +311,52 @@ mod tests {
         run(&mut hook, &mut settings, &d);
         assert!(titles(&rx).is_empty());
         assert_eq!(default_state(&settings), AlertState::default());
+    }
+
+    #[test]
+    fn each_account_alerts_on_its_own_and_is_named() {
+        let (tx, rx) = channel();
+        let mut hook = AlertHook::new(tx);
+        let mut settings = Settings::default();
+        let (a, b) = (ProfileId::new(DEFAULT_ID), ProfileId::new("claude-b"));
+        let (a76, b60) = (poll(1, 76.0, 0), poll(1, 60.0, 0));
+        let both = |da, db| [view(&a, "me", Some(da)), view(&b, "work", Some(db))];
+        hook.after_poll(&both(&a76, &b60), &mut settings, t0());
+        assert_eq!(titles(&rx), ["me — 5-hour usage at 76%"]);
+        // Same fetched_at for both: each account remembers its own poll.
+        let (a77, b80) = (poll(2, 77.0, 0), poll(2, 80.0, 0));
+        hook.after_poll(&both(&a77, &b80), &mut settings, t0());
+        assert_eq!(titles(&rx), ["work — 5-hour usage at 80%"]);
+        assert_ne!(settings.alert_states["claude-b"], AlertState::default());
+        assert_ne!(settings.alert_states[DEFAULT_ID], AlertState::default());
+        // One account alone: no name.
+        let b91 = poll(3, 91.0, 0);
+        hook.after_poll(&[view(&b, "work", Some(&b91))], &mut settings, t0());
+        assert_eq!(titles(&rx), ["5-hour usage at 91%"]);
+    }
+
+    #[test]
+    fn stale_accounts_do_not_alert() {
+        let (tx, rx) = channel();
+        let mut hook = AlertHook::new(tx);
+        let mut settings = Settings::default();
+        let id = ProfileId::new(DEFAULT_ID);
+        let d = poll(1, 95.0, 0);
+        let error = FetchErrorInfo {
+            kind: ErrorKind::Transport,
+            message: "down".into(),
+        };
+        let stale = AccountView {
+            error: Some(&error),
+            stale: true,
+            ..view(&id, "me", Some(&d))
+        };
+        hook.after_poll(&[stale], &mut settings, t0());
+        assert!(titles(&rx).is_empty());
+        assert!(settings.alert_states.is_empty());
+        // Fresh again with the same data: checked now.
+        hook.after_poll(&[view(&id, "me", Some(&d))], &mut settings, t0());
+        assert_eq!(titles(&rx), ["5-hour usage at 95%"]);
     }
 
     #[test]

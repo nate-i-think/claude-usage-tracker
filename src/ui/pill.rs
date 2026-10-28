@@ -64,15 +64,55 @@ impl PillModel {
 /// The countdown's place while no 5-hour window is active.
 pub const IDLE_COUNTDOWN: &str = "5h · idle";
 
-/// The pill's model: the 5-hour stat chip's data.
-pub fn model(chips: &[Chip]) -> PillModel {
-    chips
+/// One account's piece of the pill: its 5-hour window, plus the weekly
+/// figures the tooltip lists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PillSegment {
+    /// The account's series color.
+    pub color: Color32,
+    /// The account's label.
+    pub label: String,
+    /// The 5-hour utilization.
+    pub pct: Option<f64>,
+    /// The 5-hour state level ([`analytics::color_for`] of `pct`).
+    pub level: Level,
+    pub resets_at: Option<DateTime<Utc>>,
+    /// The 5-hour pace delta (see [`chips::pace_text`]); `None` without a %.
+    pub pace: Option<f64>,
+    /// No 5-hour window is active: "5h · idle" in place of the countdown.
+    pub idle: bool,
+    /// The weekly windows for the tooltip: ("7-day all", %), ("Fable", %).
+    pub weekly: Vec<(&'static str, Option<f64>)>,
+}
+
+impl PillSegment {
+    /// The segment for one account's stat chips (5-hour first, see
+    /// [`chips::chips`]); `None` without chips (nothing polled yet).
+    pub fn from_chips(chips: &[Chip], color: Color32, label: &str) -> Option<PillSegment> {
+        let five = chips.first()?;
+        Some(PillSegment {
+            color,
+            label: label.to_owned(),
+            pct: five.pct,
+            level: analytics::color_for(five.pct),
+            resets_at: five.resets_at,
+            pace: five.pace.filter(|_| five.pct.is_some()),
+            idle: five.idle,
+            weekly: chips[1..].iter().map(|c| (c.label, c.pct)).collect(),
+        })
+    }
+}
+
+/// The pill's model: the first segment's 5-hour window (one account is
+/// drawn, for now).
+pub fn model(segments: &[PillSegment]) -> PillModel {
+    segments
         .first()
-        .map(|c| PillModel {
-            pct: c.pct,
-            pace: c.pace.filter(|_| c.pct.is_some()),
-            resets_at: c.resets_at,
-            idle: c.idle,
+        .map(|s| PillModel {
+            pct: s.pct,
+            pace: s.pace.filter(|_| s.pct.is_some()),
+            resets_at: s.resets_at,
+            idle: s.idle,
         })
         .unwrap_or(PillModel::EMPTY)
 }
@@ -95,7 +135,7 @@ pub fn countdown_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> S
 /// the 5-hour line with pace and reset, then the weekly windows (or the
 /// last poll's failure).
 pub fn tooltip_lines_in<Tz: TimeZone>(
-    chips: &[Chip],
+    segments: &[PillSegment],
     failed: bool,
     now: DateTime<Utc>,
     tz: &Tz,
@@ -103,7 +143,7 @@ pub fn tooltip_lines_in<Tz: TimeZone>(
 where
     Tz::Offset: Display,
 {
-    let Some(five) = chips.first() else {
+    let Some(five) = segments.first() else {
         let second = if failed {
             "Last poll failed · click to see why"
         } else {
@@ -124,9 +164,9 @@ where
     let second = if failed {
         "Last poll failed · click to see why".to_owned()
     } else {
-        chips[1..]
+        five.weekly
             .iter()
-            .map(|c| format!("{} {}", c.label, chips::pct_text(c.pct)))
+            .map(|(label, pct)| format!("{label} {}", chips::pct_text(*pct)))
             .collect::<Vec<_>>()
             .join(" · ")
     };
@@ -221,14 +261,15 @@ pub struct PillState {
 
 // --- Painting -----------------------------------------------------------------
 
-/// Draw the pill into the whole of `ui` and handle its input. `chips` are
-/// this poll's stat chips (empty before the first poll), `failed` whether
+/// Draw the pill into the whole of `ui` and handle its input. `segments`
+/// are the accounts' 5-hour windows (empty before the first poll; only the
+/// first is drawn, for now), `failed` whether
 /// the last poll failed, `pulse` the near-cap pulse level, `refresh_ready`
 /// whether a manual refresh is allowed now.
 pub fn show_pill(
     ui: &mut Ui,
     state: &mut PillState,
-    chips: &[Chip],
+    segments: &[PillSegment],
     failed: bool,
     pulse: f32,
     refresh_ready: bool,
@@ -271,10 +312,10 @@ pub fn show_pill(
         return action;
     }
 
-    let model = model(chips);
+    let model = model(segments);
     paint_stats(ui, rect, &model, failed, pulse, palette, now);
     if !response.dragged() {
-        let lines = tooltip_lines_in(chips, failed, now, &Local);
+        let lines = tooltip_lines_in(segments, failed, now, &Local);
         response.on_hover_ui(|ui| {
             for line in lines {
                 ui.label(RichText::new(line).small());
@@ -433,6 +474,26 @@ mod tests {
         }
     }
 
+    /// One account's segment from its chips.
+    fn seg(chips: &[Chip]) -> Vec<PillSegment> {
+        PillSegment::from_chips(chips, Color32::WHITE, "me")
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn segment_is_the_five_hour_chip_plus_weekly() {
+        let chips = [
+            chip("5-hour", Some(46.0), Some(6.2)),
+            chip("7-day all", Some(13.0), None),
+        ];
+        let s = &seg(&chips)[0];
+        assert_eq!(s.label, "me");
+        assert_eq!(s.level, analytics::color_for(Some(46.0)));
+        assert_eq!(s.weekly, [("7-day all", Some(13.0))]);
+        assert!(PillSegment::from_chips(&[], Color32::WHITE, "me").is_none());
+    }
+
     #[test]
     fn model_is_the_five_hour_chip() {
         let chips = [
@@ -440,7 +501,7 @@ mod tests {
             chip("7-day all", Some(13.0), None),
         ];
         assert_eq!(
-            model(&chips),
+            model(&seg(&chips)),
             PillModel {
                 pct: Some(46.0),
                 pace: Some(6.2),
@@ -450,7 +511,7 @@ mod tests {
         );
         assert_eq!(model(&[]), PillModel::EMPTY);
         // No % → no pace either.
-        assert_eq!(model(&[chip("5-hour", None, Some(3.0))]).pace, None);
+        assert_eq!(model(&seg(&[chip("5-hour", None, Some(3.0))])).pace, None);
     }
 
     #[test]
@@ -462,11 +523,11 @@ mod tests {
             idle: true,
             ..chip("5-hour", None, None)
         };
-        let m = model(std::slice::from_ref(&idle));
+        let m = model(&seg(std::slice::from_ref(&idle)));
         assert!(m.idle);
         assert_eq!((m.pct, m.pace, m.resets_at), (Some(0.0), None, None));
         let utc = FixedOffset::east_opt(0).unwrap();
-        let [a, _] = tooltip_lines_in(&[idle], false, t(0), &utc);
+        let [a, _] = tooltip_lines_in(&seg(&[idle]), false, t(0), &utc);
         assert_eq!(a, "5-hour 0% · no active window");
     }
 
@@ -489,11 +550,12 @@ mod tests {
             chip("7-day all", Some(13.4), None),
             chip("Fable", Some(0.0), None),
         ];
-        let [a, b] = tooltip_lines_in(&chips, false, t(0), &utc);
+        let segs = seg(&chips);
+        let [a, b] = tooltip_lines_in(&segs, false, t(0), &utc);
         assert!(a.starts_with("5-hour 46% · ▲+6 · resets "), "{a}");
         assert!(a.ends_with("· in 1h 59m"), "{a}");
         assert_eq!(b, "7-day all 13% · Fable 0%");
-        let [_, b] = tooltip_lines_in(&chips, true, t(0), &utc);
+        let [_, b] = tooltip_lines_in(&segs, true, t(0), &utc);
         assert_eq!(b, "Last poll failed · click to see why");
         let [a, b] = tooltip_lines_in(&[], false, t(0), &utc);
         assert_eq!(

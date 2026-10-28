@@ -13,7 +13,7 @@ use crate::crash;
 use crate::paths::Paths;
 
 use super::{refresh_ready, App};
-use crate::ui::tray::{self, CloseDecision, IconFace, Tray, TrayAction};
+use crate::ui::tray::{self, CloseDecision, IconFace, Tray, TrayAction, TrayView};
 
 impl App {
     /// Hide to the tray. Minimizing as well as hiding is what makes eframe
@@ -80,11 +80,14 @@ impl App {
         let resets_at = five.and_then(|f| f.resets_at);
         let failed = self.poll_failing();
         let pill = self.settings.ui_mode == UiMode::Pill;
+        // The shown account's figures, for now; no menu-bar title yet.
+        let view = TrayView {
+            face: IconFace::for_pct(pct),
+            title: String::new(),
+            tooltip: tray::tooltip_in(pct, resets_at, failed, &Local),
+        };
         if let Some(t) = self.tray.as_mut() {
-            t.update(
-                IconFace::for_pct(pct),
-                tray::tooltip_in(pct, resets_at, failed, &Local),
-            );
+            t.update(&view);
             t.set_pill_checked(pill);
         }
     }

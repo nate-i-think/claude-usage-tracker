@@ -8,6 +8,7 @@ use crate::analytics::{self, BurnLine, Eta, FiveHourState, Level};
 use crate::model::ExtraUsage;
 use crate::poller::Dashboard;
 
+use super::accounts::AccountView;
 use super::theme::Palette;
 use super::{digits, motion, rows, Run, Tone};
 
@@ -96,9 +97,17 @@ pub fn show_burn_row(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     super::show_runs(ui, &runs).on_hover_text(burn_hover(burn.as_ref()));
 }
 
+/// The footer strip for the accounts. For now the first account with data
+/// is drawn, as one account always was (see [`show_account_footer`]).
+pub fn show_footer(ui: &mut Ui, accounts: &[AccountView]) {
+    if let Some(d) = super::accounts::first_data(accounts) {
+        show_account_footer(ui, d);
+    }
+}
+
 /// The footer strip on a card: the extra-usage gauge, when analytics says
 /// the block is visible; nothing otherwise.
-pub fn show_footer(ui: &mut Ui, d: &Dashboard) {
+fn show_account_footer(ui: &mut Ui, d: &Dashboard) {
     let Some(extra) = analytics::visible_extra(&d.snapshot) else {
         return;
     };

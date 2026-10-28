@@ -152,6 +152,27 @@ pub struct AccountView<'a> {
     pub stale: bool,
 }
 
+/// The data the single-account views draw: the first account with data
+/// (as [`Accounts::primary`] picks).
+pub fn first_data<'a>(views: &[AccountView<'a>]) -> Option<&'a Dashboard> {
+    views.iter().find_map(|v| v.data)
+}
+
+/// The account the near-cap pulse follows: the highest live 5-hour % at
+/// `now` among fresh (non-stale) accounts with data; ties go to the first.
+pub fn hottest(views: &[AccountView], now: DateTime<Utc>) -> Option<usize> {
+    views
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.stale)
+        .filter_map(|(i, v)| Some((i, v.data?.five_hour_now(now).pct?)))
+        .fold(None, |best: Option<(usize, f64)>, (i, pct)| match best {
+            Some((_, b)) if b >= pct => best,
+            _ => Some((i, pct)),
+        })
+        .map(|(i, _)| i)
+}
+
 /// The account with the most 5-hour headroom at `now`: the lowest live
 /// 5-hour %, fresh accounts before stale ones. `None` without data.
 pub fn best_headroom(views: &[AccountView], now: DateTime<Utc>) -> Option<usize> {
@@ -378,6 +399,36 @@ mod tests {
         accounts.apply(err("c", "down"), &mut settings);
         let views = accounts.views(&crate::ui::theme::DARK);
         assert_eq!(best_headroom(&views, now), Some(1));
+    }
+
+    #[test]
+    fn hottest_is_the_highest_fresh_account_and_first_data_the_first() {
+        let mut accounts = Accounts::default();
+        let mut settings = Settings::default();
+        accounts.apply(
+            PollEvent::Profiles(vec![profile("a"), profile("b"), profile("c")]),
+            &mut settings,
+        );
+        let now = t();
+        let views = accounts.views(&crate::ui::theme::DARK);
+        assert_eq!(hottest(&views, now), None);
+        assert!(first_data(&views).is_none());
+        accounts.apply(ok("b", 40.0), &mut settings);
+        accounts.apply(ok("c", 80.0), &mut settings);
+        let views = accounts.views(&crate::ui::theme::DARK);
+        assert_eq!(hottest(&views, now), Some(2));
+        assert_eq!(
+            first_data(&views).unwrap().snapshot.five_hour_pct(),
+            Some(40.0)
+        );
+        // "c" goes stale: its old figure no longer drives the pulse.
+        accounts.apply(err("c", "down"), &mut settings);
+        let views = accounts.views(&crate::ui::theme::DARK);
+        assert_eq!(hottest(&views, now), Some(1));
+        // Ties go to the first.
+        accounts.apply(ok("a", 40.0), &mut settings);
+        let views = accounts.views(&crate::ui::theme::DARK);
+        assert_eq!(hottest(&views, now), Some(0));
     }
 
     #[test]

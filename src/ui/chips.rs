@@ -16,6 +16,7 @@ use eframe::egui::{
 use crate::analytics::{self, alerts::fmt_clock_in, Level};
 use crate::model::Snapshot;
 
+use super::accounts::AccountView;
 use super::digits;
 use super::layout::{self, GAP};
 use super::motion;
@@ -243,11 +244,21 @@ pub fn pace_color(tone: PaceTone, palette: &Palette) -> Color32 {
     }
 }
 
+/// The accounts' stat chips. For now the first account with data is
+/// drawn, as one account always was (see [`show_chips`]); nothing before
+/// the first poll.
+pub fn show_account_chips(ui: &mut Ui, accounts: &[AccountView], now: DateTime<Utc>, pulse: f32) {
+    if let Some(d) = super::accounts::first_data(accounts) {
+        let chips = chips(&d.snapshot, d.window_start, d.window_end, now);
+        show_chips(ui, &chips, now, pulse);
+    }
+}
+
 /// The chips, packed into as many rows as the width needs. Percentages
 /// and their state colors ease to each poll's values; the border and glow
 /// of the chip that [`Chip::pulses`] show `pulse` (a [`motion::Pulse`]
 /// level, 0 = none).
-pub fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
+fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
     let palette = Palette::for_visuals(ui.visuals());
     let ctx = ui.ctx().clone();
     let shown: Vec<(Option<f64>, Color32)> = chips

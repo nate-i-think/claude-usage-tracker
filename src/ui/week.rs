@@ -14,6 +14,7 @@ use eframe::egui::Ui;
 use crate::analytics::{self, Level, Projection, WeeklyOutlook};
 use crate::poller::Dashboard;
 
+use super::accounts::AccountView;
 use super::layout::CardSize;
 use super::theme::Palette;
 use super::timeline::{
@@ -397,11 +398,28 @@ pub fn week_chart(
     }
 }
 
+/// The weekly card for the accounts. For now the first account with data
+/// is drawn, as one account always was (see [`show_account_card`]); 0
+/// (nothing drawn) without data.
+pub fn show_week_card(
+    ui: &mut Ui,
+    accounts: &[AccountView],
+    now: DateTime<Utc>,
+    palette: &Palette,
+    size: CardSize,
+    fresh: Freshness,
+) -> f32 {
+    match super::accounts::first_data(accounts) {
+        Some(d) => show_account_card(ui, d, now, palette, size, fresh),
+        None => 0.0,
+    }
+}
+
 /// The weekly card: the title with the window's span as its subtitle, the
 /// chart, `size.chart` tall, and one projection row per weekly limit under
 /// it, muted when `fresh.stale`. Returns the content's natural height
 /// (before `size.min_content`).
-pub fn show_week_card(
+fn show_account_card(
     ui: &mut Ui,
     d: &Dashboard,
     now: DateTime<Utc>,

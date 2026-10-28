@@ -671,7 +671,10 @@ mod tests {
         assert!(near(lab(Color32::WHITE), [100.0, 0.0, 0.0]));
         assert!(near(lab(Color32::BLACK), [0.0, 0.0, 0.0]));
         // sRGB red: L 53.24, a 80.09, b 67.20.
-        assert!(near(lab(Color32::from_rgb(255, 0, 0)), [53.24, 80.09, 67.20]));
+        assert!(near(
+            lab(Color32::from_rgb(255, 0, 0)),
+            [53.24, 80.09, 67.20]
+        ));
         // Greys are untouched by the simulation; red and green collapse.
         let grey = Color32::from_rgb(128, 128, 128);
         assert!(near(lab_deuteranopia(grey), lab(grey)));

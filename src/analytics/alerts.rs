@@ -146,6 +146,17 @@ pub struct AlertCopy {
     pub body: String,
 }
 
+impl AlertCopy {
+    /// The copy naming the account it is about: "work — 5-hour usage at
+    /// 78%" (used once more than one account is polled).
+    pub fn for_account(self, label: &str) -> AlertCopy {
+        AlertCopy {
+            title: format!("{label} — {}", self.title),
+            body: self.body,
+        }
+    }
+}
+
 /// [`alert_copy_in`] in local time.
 pub fn alert_copy(kind: AlertKind, resets_at: DateTime<Utc>, now: DateTime<Utc>) -> AlertCopy {
     alert_copy_in(kind, resets_at, now, &Local)
@@ -514,6 +525,14 @@ mod tests {
             alert_copy_in(AlertKind::Crossed75 { pct: 95 }, resets, now, &tz()).title,
             "5-hour usage at 95%"
         );
+    }
+
+    #[test]
+    fn account_named_in_the_title() {
+        let copy = alert_copy_in(AlertKind::Crossed75 { pct: 78 }, t(14, 0), t(12, 1), &tz());
+        let named = copy.clone().for_account("work");
+        assert_eq!(named.title, "work — 5-hour usage at 78%");
+        assert_eq!(named.body, copy.body);
     }
 
     #[test]
