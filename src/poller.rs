@@ -208,16 +208,22 @@ impl UsageApi for HttpApi {
 }
 
 /// The usage endpoint over a profile's Claude Code OAuth credential. The
-/// credential is cached and re-read only once it has expired or after a
-/// 401; an expired one fails without a request. Never refreshes or writes
-/// a credential.
+/// credential is cached and re-read only once it has expired, after a 401,
+/// or when the profile's account changed (`/login` or `/logout` in the same
+/// config dir rewrites the same Keychain item); an expired one fails
+/// without a request. Never refreshes or writes a credential.
 pub struct OAuthSource<A: UsageApi = HttpApi> {
     api: A,
     store: Arc<dyn CredentialStore>,
-    /// The credential last read, and where from (a changed locator, e.g. a
-    /// new Keychain override, forces a re-read).
-    cached: Option<(CredentialLocator, OAuthCredential)>,
+    /// The credential last read, with where from and the account the
+    /// profile was signed in to then (a changed locator, e.g. a new
+    /// Keychain override, or a changed account forces a re-read).
+    cached: Option<(CacheKey, OAuthCredential)>,
 }
+
+/// What an [`OAuthSource`]'s cached credential is good for: a locator and
+/// the profile's `accountUuid` (`None` while signed out or unknown).
+type CacheKey = (CredentialLocator, Option<String>);
 
 impl OAuthSource {
     pub fn new(store: Arc<dyn CredentialStore>) -> Self {
@@ -234,33 +240,35 @@ impl<A: UsageApi> OAuthSource<A> {
         }
     }
 
-    /// Read the credential from the store and cache it.
-    fn load(&mut self, loc: &CredentialLocator) -> Result<OAuthCredential, FetchError> {
-        let cred = self.store.load(loc).map_err(|e| match e {
+    /// Read the credential from the store and cache it under `key`; a
+    /// failed read clears the cache.
+    fn load(&mut self, key: &CacheKey) -> Result<OAuthCredential, FetchError> {
+        self.cached = None;
+        let cred = self.store.load(&key.0).map_err(|e| match e {
             CredError::NotFound(_) => FetchError::NoCredentials(String::new()),
             other => FetchError::NoCredentials(other.to_string()),
         })?;
-        self.cached = Some((loc.clone(), cred.clone()));
+        self.cached = Some((key.clone(), cred.clone()));
         Ok(cred)
     }
 
     /// The cached credential while it is current, else a fresh read.
     fn credential(
         &mut self,
-        loc: &CredentialLocator,
+        key: &CacheKey,
         now: DateTime<Utc>,
     ) -> Result<OAuthCredential, FetchError> {
         match &self.cached {
-            Some((at, cred)) if at == loc && !cred.is_expired(now) => Ok(cred.clone()),
-            _ => self.load(loc),
+            Some((at, cred)) if at == key && !cred.is_expired(now) => Ok(cred.clone()),
+            _ => self.load(key),
         }
     }
 }
 
 impl<A: UsageApi> UsageSource for OAuthSource<A> {
     fn fetch(&mut self, profile: &Profile) -> Result<FetchOk, FetchError> {
-        let loc = profile.locator();
-        let mut cred = self.credential(&loc, Utc::now())?;
+        let key = (profile.locator(), profile.account_uuid().map(str::to_owned));
+        let mut cred = self.credential(&key, Utc::now())?;
         if cred.is_expired(Utc::now()) {
             return Err(FetchError::TokenExpired);
         }
@@ -268,7 +276,7 @@ impl<A: UsageApi> UsageSource for OAuthSource<A> {
             // Claude Code may have refreshed the token since it was read:
             // read it once more and retry only if it changed.
             Err(FetchError::Unauthorized) => {
-                let fresh = self.load(&loc)?;
+                let fresh = self.load(&key)?;
                 if fresh.fingerprint() == cred.fingerprint() {
                     return Err(FetchError::Unauthorized);
                 }
@@ -339,8 +347,12 @@ pub struct ProfileRuntime {
     /// `next_due` is a 429 backoff, which a refresh does not override.
     backoff: bool,
     /// Tells this runtime's fetch results from those of an earlier runtime
-    /// for the same id (removed and re-added while a fetch was in flight).
+    /// for the same id (removed and re-added while a fetch was in flight),
+    /// or of an earlier account in the same config dir.
     generation: u64,
+    /// The account uuid this runtime last polled for (the last one known:
+    /// a transiently unreadable `.claude.json` does not clear it).
+    account: Option<String>,
 }
 
 impl ProfileRuntime {
@@ -357,15 +369,21 @@ impl ProfileRuntime {
             catch_recoverable(|| BurnHistory::seeded(&paths, Utc::now())).unwrap_or_default();
         Self {
             dirs: SessionDirs::for_profile(&profile, cowork_dir),
-            profile,
             paths,
             history,
             source: Some(source),
             next_due: None,
             backoff: false,
             generation: 0,
+            account: profile_account(&profile),
+            profile,
         }
     }
+}
+
+/// `profile`'s account uuid, lowercased for comparison.
+fn profile_account(profile: &Profile) -> Option<String> {
+    profile.account_uuid().map(str::to_ascii_lowercase)
 }
 
 /// One profile's poll, start to end: fetch, record, persist, build the
@@ -901,7 +919,10 @@ impl Engine {
     fn reconcile(&mut self, now: Instant) -> Option<PollEvent> {
         self.discovered_at = Some(now);
         let found = catch_recoverable(|| (self.deps.discover)()).unwrap_or_default();
-        let profiles = profiles::polled(&self.settings.profiles, &found);
+        // Sticky: a profile once discovered stays polled (unaccounted) when
+        // a later discovery misses it, e.g. its `.claude.json` mid-write.
+        profiles::merge_discovered(&mut self.settings.profiles, &found);
+        let profiles = profiles::resolve(&self.settings.profiles, &found);
         let mut old = std::mem::take(&mut self.runtimes);
         for p in &profiles {
             let kept = old
@@ -942,14 +963,25 @@ impl Engine {
     }
 
     /// When `rt`'s config dir is now signed in to a different account than
-    /// last seen, set its history aside and start a fresh one.
+    /// last seen: poll it on a fresh source (the old one caches the old
+    /// account's token, and its result, if in flight, is dropped), and set
+    /// the old account's history aside for a fresh one (unless
+    /// [`AccountChange::Leave`]).
     fn check_account(&mut self, rt: &mut ProfileRuntime) {
-        let Some(uuid) = rt.profile.account_uuid() else {
+        // Signed out, or `.claude.json` unreadable for now: the source
+        // re-reads its credential once the account it cached under is gone,
+        // and the history stays the last account's.
+        let Some(uuid) = rt.profile.account_uuid().map(str::to_owned) else {
             return;
         };
+        let now = uuid.to_ascii_lowercase();
+        if rt.account.as_ref().is_some_and(|was| *was != now) {
+            self.restart_source(rt);
+        }
+        rt.account = Some(now);
         let id = rt.profile.id.clone();
         if let Some(old) = self.accounts.get(&id) {
-            if !old.eq_ignore_ascii_case(uuid) {
+            if !old.eq_ignore_ascii_case(&uuid) {
                 if self.on_change == AccountChange::Leave {
                     self.change_left = true;
                     return;
@@ -961,7 +993,18 @@ impl Engine {
                 rt.history = BurnHistory::default();
             }
         }
-        self.accounts.insert(id, uuid.to_owned());
+        self.accounts.insert(id, uuid);
+    }
+
+    /// Give `rt` a new source and generation, due now: a fetch in flight on
+    /// the old source is discarded when it returns (generation mismatch),
+    /// old source and all.
+    fn restart_source(&mut self, rt: &mut ProfileRuntime) {
+        rt.source = Some((self.deps.source_for)(&rt.profile));
+        rt.generation = self.next_generation;
+        self.next_generation += 1;
+        rt.next_due = None;
+        rt.backoff = false;
     }
 
     /// Start a fetch thread for every idle profile that is due.
@@ -2566,6 +2609,219 @@ mod tests {
             src.fetch(&test_profile()).unwrap_err(),
             FetchError::NoCredentials(why) if why.contains("locked")
         ));
+    }
+
+    #[test]
+    fn oauth_rereads_when_the_account_changes() {
+        let hour = ChronoDuration::hours(1);
+        let (mut src, store) = oauth(
+            vec![
+                Ok(cred_json(TOKEN, hour)),
+                Ok(cred_json(TOKEN2, hour)),
+                Err(|| CredError::NotFound("logged out".into())),
+            ],
+            vec![],
+        );
+        let p = test_profile();
+        src.fetch(&p).unwrap();
+        src.fetch(&p).unwrap();
+        assert_eq!(store.loads(), 1, "same account: cached");
+        // /login with another account in the same dir (same Keychain item).
+        let mut other = p.clone();
+        other.account.as_mut().unwrap().account_uuid = Some("uuid-other".into());
+        src.fetch(&other).unwrap();
+        assert_eq!(store.loads(), 2);
+        assert_eq!(src.api.bearers, [TOKEN, TOKEN, TOKEN2]);
+        // /logout: no account any more, so the cached token is not used.
+        let mut out = other.clone();
+        out.account = None;
+        let e = src.fetch(&out).unwrap_err();
+        assert!(matches!(e, FetchError::NoCredentials(_)), "{e:?}");
+        assert_eq!(src.api.bearers.len(), 3, "no request after logout");
+    }
+
+    /// One config dir's Keychain item, which `/login` overwrites.
+    struct SwitchStore(Mutex<&'static str>);
+
+    impl CredentialStore for SwitchStore {
+        fn load(&self, _: &CredentialLocator) -> Result<OAuthCredential, CredError> {
+            let token = *self.0.lock().unwrap();
+            credentials::parse_credentials_json(&cred_json(token, ChronoDuration::hours(1)))
+        }
+    }
+
+    /// The usage endpoint: 11 % for [`TOKEN`]'s account, 22 % for any
+    /// other; records the bearers.
+    #[derive(Clone, Default)]
+    struct SharedApi(Arc<Mutex<Vec<String>>>);
+
+    impl UsageApi for SharedApi {
+        fn get_usage(&mut self, bearer: &str) -> Result<Snapshot, FetchError> {
+            self.0.lock().unwrap().push(bearer.to_owned());
+            let pct = if bearer == TOKEN { 11.0 } else { 22.0 };
+            Ok(snap(Utc::now(), Some(pct), None))
+        }
+    }
+
+    /// An [`Engine`] driven by hand over real [`OAuthSource`]s for the
+    /// default profile, signed in to `uuid-default` with [`TOKEN`].
+    struct EngineRig {
+        engine: Engine,
+        results: Receiver<Inbox>,
+        store: Arc<SwitchStore>,
+        api: SharedApi,
+        found: Arc<Mutex<Vec<Discovered>>>,
+        root: Paths,
+        home: PathBuf,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl EngineRig {
+        fn start(ids: &[&str]) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let root = Paths::with_data_dir(tmp.path().join("data"));
+            let store = Arc::new(SwitchStore(Mutex::new(TOKEN)));
+            let api = SharedApi::default();
+            let found: Vec<Discovered> = ids.iter().map(|id| discovered(&home, id)).collect();
+            let found = Arc::new(Mutex::new(found));
+            let deps = PollerDeps {
+                source_for: {
+                    let (store, api) = (Arc::clone(&store), api.clone());
+                    Box::new(move |_: &Profile| {
+                        let store: Arc<dyn CredentialStore> = store.clone();
+                        Box::new(OAuthSource::with_api(api.clone(), store)) as Box<dyn UsageSource>
+                    })
+                },
+                discover: {
+                    let found = Arc::clone(&found);
+                    Box::new(move || found.lock().unwrap().clone())
+                },
+                cowork_dir: tmp.path().join("cowork"),
+            };
+            let (tx, results) = mpsc::channel();
+            let engine = Engine::new(deps, root.clone(), Settings::default(), tx);
+            Self {
+                engine,
+                results,
+                store,
+                api,
+                found,
+                root,
+                home,
+                _tmp: tmp,
+            }
+        }
+
+        /// `/login` with another account in `~/.claude`.
+        fn switch_account(&self) {
+            *self.store.0.lock().unwrap() = TOKEN2;
+            let mut found = self.found.lock().unwrap();
+            let account = found[0].account.as_mut().unwrap();
+            account.account_uuid = Some("uuid-new".into());
+            account.email = Some("new@example.com".into());
+        }
+
+        /// Fetch results as they arrive, until `n` or a quiet second.
+        fn results(&self, n: usize) -> Vec<Fetched> {
+            let mut out = Vec::new();
+            while out.len() < n {
+                match self.results.recv_timeout(WAIT) {
+                    Ok(Inbox::Fetched(f)) => out.push(f),
+                    Ok(Inbox::Control(_)) => {}
+                    Err(_) => break,
+                }
+            }
+            out
+        }
+
+        /// Fold in every result, returning the 5-hour % of each recorded.
+        fn complete_all(&mut self, results: Vec<Fetched>) -> Vec<f64> {
+            results
+                .into_iter()
+                .filter_map(|f| self.engine.complete(f, Instant::now()))
+                .map(|event| match event {
+                    PollEvent::Profile { outcome, .. } => ok_pct(outcome),
+                    other => panic!("expected Profile, got {other:?}"),
+                })
+                .collect()
+        }
+
+        fn default_paths(&self) -> Paths {
+            self.root.for_profile(&ProfileId::new(DEFAULT_ID))
+        }
+
+        fn ids(&self) -> Vec<String> {
+            let rts = &self.engine.runtimes;
+            rts.iter().map(|r| r.profile.id.to_string()).collect()
+        }
+    }
+
+    #[test]
+    fn account_switch_in_the_same_dir_fetches_with_the_new_token() {
+        let mut rig = EngineRig::start(&[DEFAULT_ID]);
+        rig.engine.reconcile(Instant::now());
+        rig.engine.dispatch(Instant::now());
+        let first = rig.results(1);
+        assert_eq!(rig.complete_all(first), [11.0]);
+
+        rig.switch_account();
+        rig.engine.reconcile(Instant::now());
+        rig.engine.refresh_all();
+        rig.engine.dispatch(Instant::now());
+        let second = rig.results(1);
+        assert_eq!(rig.complete_all(second), [22.0]);
+        assert_eq!(rig.api.0.lock().unwrap().last().unwrap(), TOKEN2);
+        let paths = rig.default_paths();
+        let fresh = fs::read_to_string(paths.history_file()).unwrap();
+        assert!(fresh.contains("22.0") && !fresh.contains("11.0"), "{fresh}");
+        let archived = fs::read_to_string(paths.data_dir().join("history.uuid-def.jsonl"));
+        assert!(archived.unwrap().contains("11.0"));
+    }
+
+    #[test]
+    fn old_accounts_in_flight_fetch_never_lands_in_the_new_history() {
+        let mut rig = EngineRig::start(&[DEFAULT_ID]);
+        rig.engine.reconcile(Instant::now());
+        // A fetch for the old account is in flight (its result unread)...
+        rig.engine.dispatch(Instant::now());
+        // ...when the dir is signed in to another account.
+        rig.switch_account();
+        rig.engine.reconcile(Instant::now());
+        // The new account is polled at once, on a fresh source.
+        rig.engine.dispatch(Instant::now());
+        let results = rig.results(2);
+        assert_eq!(results.len(), 2, "a fetch for the new account started");
+        // Whichever token the old fetch read, its result is discarded.
+        assert_eq!(rig.complete_all(results), [22.0]);
+        let fresh = fs::read_to_string(rig.default_paths().history_file()).unwrap();
+        assert_eq!(fresh.lines().count(), 1, "{fresh}");
+        assert!(!fresh.contains("11.0"), "{fresh}");
+        // The runtime polls on afterwards (its source is not lost).
+        rig.engine.refresh_all();
+        rig.engine.dispatch(Instant::now());
+        let next = rig.results(1);
+        assert_eq!(rig.complete_all(next), [22.0]);
+    }
+
+    #[test]
+    fn a_profile_missing_from_one_discovery_keeps_polling() {
+        let mut rig = EngineRig::start(&[DEFAULT_ID, "claude-b"]);
+        rig.engine.reconcile(Instant::now());
+        assert_eq!(rig.ids(), ["default", "claude-b"]);
+        // Its .claude.json is unreadable for a moment (mid-write).
+        rig.found.lock().unwrap().truncate(1);
+        rig.engine.reconcile(Instant::now());
+        assert_eq!(rig.ids(), ["default", "claude-b"], "runtime kept");
+        let b = &rig.engine.runtimes[1].profile;
+        assert_eq!(b.config_dir, rig.home.join(".claude-b"));
+        assert_eq!(b.locator(), profile(&rig.home, "claude-b").locator());
+        assert!(rig
+            .engine
+            .settings
+            .profiles
+            .iter()
+            .any(|p| p.id == "claude-b"));
     }
 
     #[test]
