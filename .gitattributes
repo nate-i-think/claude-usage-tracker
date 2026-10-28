@@ -1,0 +1,2 @@
+# Keep LF everywhere so Windows and macOS checkouts agree.
+* text=auto eol=lf
