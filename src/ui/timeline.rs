@@ -14,6 +14,12 @@
 //! and missing values truly break. How long a gap breaks the line is per
 //! chart (10 minutes for 5 hours, an hour for a week).
 //!
+//! A chart holds one [`SeriesData`] per account. One account draws as
+//! above; several overlay over the union of their windows (see
+//! [`overlay_charts`]), each in its series color with a light tint area
+//! and a legend in the card's title row, each reset a colored mark on the
+//! time axis, and the hover lists every account's value ([`hover_rows`]).
+//!
 //! Geometry (mapping, segmenting, thinning, dashes, ticks, labels, hover
 //! lookup) is in pure functions tested without a GPU; [`show_chart`] only
 //! paints.
@@ -24,7 +30,9 @@ use std::ops::Range;
 use chrono::{DateTime, Duration, DurationRound, Local, NaiveTime, TimeZone, Timelike, Utc};
 use eframe::egui::{
     epaint::{Mesh, PathStroke},
-    pos2, vec2, Align2, Color32, FontId, Id, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
+    pos2,
+    text::{LayoutJob, TextFormat},
+    vec2, Align2, Color32, FontId, Id, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
     TextStyle, Ui, Vec2,
 };
 
@@ -32,6 +40,7 @@ use crate::analytics::{
     self, alerts::fmt_clock_in, FiveHourState, Projection, WeekSample, WindowSample,
 };
 use crate::poller::Dashboard;
+use crate::profiles::ProfileId;
 
 use super::accounts::AccountView;
 use super::motion;
@@ -868,10 +877,87 @@ pub enum Overlay {
     /// A clay area under the main area, one value per point (the 5-hour
     /// chart's Fable share).
     Share(Vec<Option<f64>>),
-    /// A clay line of each point's [`Point::overlay`] (the weekly chart's
-    /// Fable 7-day meter, its own limit).
-    Line,
+    /// A line of each point's [`Point::overlay`] (the weekly chart's Fable
+    /// 7-day meter, its own limit): solid clay for one account, dashed in
+    /// the account's color among several.
+    Line { color: Color32, dashed: bool },
 }
+
+/// How a series fills under its line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AreaStyle {
+    /// The gradient in this state color (one account).
+    State(Color32),
+    /// A light gradient in the series' own color, this opaque at the line
+    /// (one account among several).
+    Tint(f32),
+}
+
+/// One account's layer of a chart: its samples, its meters, its colors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesData {
+    /// Distinguishes this series' eased values (see [`motion_id`]).
+    pub key: u64,
+    /// The account's name in the legend and the tooltip.
+    pub label: String,
+    /// The line, the bridges, and (with [`AreaStyle::Tint`]) the area.
+    pub color: Color32,
+    pub area: AreaStyle,
+    pub overlay: Overlay,
+    pub points: Vec<Point>,
+    /// The meters' lines, each tagged with its [`LineKind`].
+    pub lines: Vec<Line>,
+    /// Stale data (the last poll failed): painted at [`DIM_ALPHA`].
+    pub dimmed: bool,
+    /// The account's own window end (its reset): hover reads nothing past
+    /// it.
+    pub end: DateTime<Utc>,
+    /// The snapshot's fetch time in ms, so projections draw in per poll.
+    pub poll_key: i64,
+}
+
+impl SeriesData {
+    /// `c` as this series paints it: faded when [`SeriesData::dimmed`].
+    pub fn tone(&self, c: Color32) -> Color32 {
+        if self.dimmed {
+            c.gamma_multiply(DIM_ALPHA)
+        } else {
+            c
+        }
+    }
+
+    /// The area's gradient: (at the line, at the baseline).
+    pub fn area_colors(&self) -> (Color32, Color32) {
+        let (top, bottom) = match self.area {
+            AreaStyle::State(c) => (
+                c.gamma_multiply(AREA_TOP_ALPHA),
+                c.gamma_multiply(AREA_BASE_ALPHA),
+            ),
+            AreaStyle::Tint(a) => (
+                self.color.gamma_multiply(a),
+                self.color
+                    .gamma_multiply(a * AREA_BASE_ALPHA / AREA_TOP_ALPHA),
+            ),
+        };
+        (self.tone(top), self.tone(bottom))
+    }
+}
+
+/// One entry of a chart's legend: a swatch (a short line, dashed for the
+/// weekly chart's Fable lines) and a name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LegendEntry {
+    pub label: String,
+    pub color: Color32,
+    pub dashed: bool,
+}
+
+/// Opacity at the line of a series' area among several accounts.
+pub const SERIES_TINT: f32 = 0.16;
+/// Opacity of a stale series.
+pub const DIM_ALPHA: f32 = 0.45;
+/// At most this many labelled ticks on an overlaid chart's time axis.
+const MAX_TICKS: usize = 8;
 
 /// How a chart writes times: "3:10p" for a 5-hour window, "Mon 3p" for a
 /// week.
@@ -928,33 +1014,210 @@ pub struct Line {
     pub cap_color: Color32,
 }
 
-/// Everything a timeline draws: the window, the samples, the meters.
+/// Everything a timeline draws: the window, and per account its samples
+/// and meters. One series is one account drawn as it always was (state
+/// colors, the Fable layer); two or more overlay in their series colors
+/// with a legend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chart {
     /// Distinguishes this chart's eased values.
     pub id: &'static str,
+    /// The window: one account's, or the union of several (see
+    /// [`union_window`]).
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub now: DateTime<Utc>,
-    pub points: Vec<Point>,
+    pub series: Vec<SeriesData>,
     /// A longer gap between samples ends a solid line (see [`segments`]).
     pub gap_break: Duration,
-    /// The main area's state color.
-    pub state: Color32,
-    pub overlay: Overlay,
     /// Labelled ticks along the bottom.
     pub ticks: Vec<(DateTime<Utc>, String)>,
     /// At the right end of the time axis: "reset 11:10p".
     pub end_label: Option<String>,
-    /// The meters' lines, each tagged with its [`LineKind`].
-    pub lines: Vec<Line>,
+    /// Each account's reset, a tick in its color on the time axis (with
+    /// two or more series).
+    pub end_marks: Vec<(DateTime<Utc>, Color32)>,
+    /// Right-aligned in the card's title row (with two or more series).
+    pub legend: Vec<LegendEntry>,
     /// Opacity of a bridged gap's fill relative to the normal fill.
     pub bridge_fill: f32,
     pub style: TimeStyle,
-    /// The snapshot's fetch time in ms, so projections draw in per poll.
-    pub poll_key: i64,
     /// Centered in an empty chart in place of "collecting samples…".
     pub note: Option<&'static str>,
+}
+
+impl Chart {
+    /// Several accounts overlaid (series colors, legend, series hover).
+    pub fn overlaid(&self) -> bool {
+        self.series.len() >= 2
+    }
+}
+
+/// A series' key: a hash of its account's id, stable within a run.
+pub fn series_key(id: &ProfileId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    h.finish()
+}
+
+/// The id of one eased value of a meter's line: per chart, series, meter.
+pub fn motion_id(chart: &'static str, key: u64, kind: LineKind, what: &'static str) -> Id {
+    Id::new((chart, key, kind, what))
+}
+
+/// The span covering every window: the earliest start to the latest end.
+/// `None` without windows.
+pub fn union_window(
+    windows: impl IntoIterator<Item = (DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    windows
+        .into_iter()
+        .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
+}
+
+/// At most `max` of `ticks`, evenly every n-th from the first.
+pub fn thin_ticks(ticks: Vec<(DateTime<Utc>, String)>, max: usize) -> Vec<(DateTime<Utc>, String)> {
+    if ticks.len() <= max || max == 0 {
+        return ticks;
+    }
+    let step = ticks.len().div_ceil(max);
+    ticks.into_iter().step_by(step).collect()
+}
+
+/// The legend of `series`: one entry per series in its color, and a dashed
+/// "Fable" entry in `fable_color` when some series draws its Fable meter
+/// as a dashed line. Empty with fewer than two series (one account needs
+/// none).
+pub fn legend_for(series: &[SeriesData], fable_color: Color32) -> Vec<LegendEntry> {
+    if series.len() < 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<LegendEntry> = series
+        .iter()
+        .map(|s| LegendEntry {
+            label: s.label.clone(),
+            color: s.tone(s.color),
+            dashed: false,
+        })
+        .collect();
+    if series
+        .iter()
+        .any(|s| matches!(s.overlay, Overlay::Line { dashed: true, .. }))
+    {
+        out.push(LegendEntry {
+            label: "Fable".to_owned(),
+            color: fable_color,
+            dashed: true,
+        });
+    }
+    out
+}
+
+/// One account's series (from its single-account chart) restyled to sit
+/// among others: its own color for the lines and dots and a light tint
+/// area, no Fable share area, Fable 7-day as a dashed line in its color,
+/// dimmed when stale. Cap marks keep their colors.
+pub fn as_series(mut s: SeriesData, view: &AccountView) -> SeriesData {
+    s.key = series_key(view.id);
+    s.label = view.label.to_owned();
+    s.color = view.color;
+    s.area = AreaStyle::Tint(SERIES_TINT);
+    s.overlay = match s.overlay {
+        Overlay::Line { .. } => Overlay::Line {
+            color: view.color,
+            dashed: true,
+        },
+        _ => Overlay::None,
+    };
+    for l in &mut s.lines {
+        l.color = view.color;
+    }
+    s.dimmed = view.stale;
+    s
+}
+
+/// One account's chart to overlay with others (see [`overlay_charts`]).
+pub struct Part<'a> {
+    /// The account's own chart (one series).
+    pub chart: Chart,
+    pub view: &'a AccountView<'a>,
+    /// Its window, `None` while it has no active one (an idle 5 hours).
+    pub window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Its reset time is known: the window end gets a mark.
+    pub reset_known: bool,
+}
+
+/// Several accounts' charts as one: each a series (see [`as_series`]) over
+/// the union of their windows, each known reset an end mark in the
+/// account's color, `ticks` over the union (thinned to [`MAX_TICKS`]), the
+/// union's end time (or "now" with no reset known) at the axis end, and a
+/// legend. With no active window at all, the first chart's empty state.
+/// `None` without parts.
+pub fn overlay_charts(
+    parts: Vec<Part>,
+    palette: &Palette,
+    ticks: impl Fn(DateTime<Utc>, DateTime<Utc>) -> Vec<(DateTime<Utc>, String)>,
+) -> Option<Chart> {
+    let first = parts.first()?;
+    let (id, now, gap_break, bridge_fill, style) = {
+        let c = &first.chart;
+        (c.id, c.now, c.gap_break, c.bridge_fill, c.style)
+    };
+    let union = union_window(parts.iter().filter_map(|p| p.window));
+    let (start, end) = union.unwrap_or((first.chart.start, first.chart.end));
+    let end_marks = parts
+        .iter()
+        .filter(|p| p.reset_known)
+        .filter_map(|p| Some((p.window?.1, view_tone(p.view))))
+        .collect::<Vec<_>>();
+    let note = if union.is_some() {
+        None
+    } else {
+        first.chart.note
+    };
+    let end_label = union.map(|_| {
+        if end_marks.is_empty() {
+            "now".to_owned()
+        } else {
+            style.short(end, &Local)
+        }
+    });
+    let series: Vec<SeriesData> = parts
+        .into_iter()
+        .filter_map(|p| {
+            let s = p.chart.series.into_iter().next()?;
+            Some(as_series(s, p.view))
+        })
+        .collect();
+    Some(Chart {
+        id,
+        start,
+        end,
+        now,
+        legend: legend_for(&series, palette.text_muted),
+        series,
+        gap_break,
+        ticks: if union.is_some() {
+            thin_ticks(ticks(start, end), MAX_TICKS)
+        } else {
+            Vec::new()
+        },
+        end_label,
+        end_marks,
+        bridge_fill,
+        style,
+        note,
+    })
+}
+
+/// An account's color as its series paints it: faded when stale.
+fn view_tone(view: &AccountView) -> Color32 {
+    if view.stale {
+        view.color.gamma_multiply(DIM_ALPHA)
+    } else {
+        view.color
+    }
 }
 
 /// The 5-hour chart for `d` at `now`. With no active window
@@ -991,10 +1254,19 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
         start: d.window_start,
         end: d.window_end,
         now,
-        points: samples.iter().map(Point::from).collect(),
+        series: vec![SeriesData {
+            key: 0,
+            label: String::new(),
+            color: state,
+            area: AreaStyle::State(state),
+            overlay: Overlay::Share(analytics::fable_layer(samples)),
+            points: samples.iter().map(Point::from).collect(),
+            lines,
+            dimmed: false,
+            end: d.window_end,
+            poll_key: snap.fetched_at.timestamp_millis(),
+        }],
         gap_break: Duration::minutes(GAP_BREAK_MINUTES),
-        state,
-        overlay: Overlay::Share(analytics::fable_layer(samples)),
         bridge_fill: BRIDGE_FILL_SCALE,
         ticks: if idle {
             Vec::new()
@@ -1006,16 +1278,45 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
             FiveHourState::Trailing => Some("now".to_owned()),
             FiveHourState::Idle => None,
         },
-        lines,
+        end_marks: Vec::new(),
+        legend: Vec::new(),
         style: TimeStyle::Clock,
-        poll_key: snap.fetched_at.timestamp_millis(),
         note: idle.then_some(IDLE_NOTE),
     }
 }
 
-/// The 5-hour card for the accounts. For now the first account with data
-/// is drawn, as one account always was (see [`show_account_card`]); 0
-/// (nothing drawn) without data.
+/// The 5-hour chart of several accounts with data (see [`overlay_charts`]):
+/// each account's own 5-hour window, the idle ones adding no window.
+pub fn five_hour_series_chart(
+    views: &[&AccountView],
+    now: DateTime<Utc>,
+    palette: &Palette,
+) -> Option<Chart> {
+    let parts = views
+        .iter()
+        .filter_map(|v| {
+            let d = v.data?;
+            let live = d.five_hour_now(now);
+            let active = live.state != FiveHourState::Idle;
+            Some(Part {
+                chart: five_hour_chart(d, now, palette),
+                view: v,
+                window: active.then_some((d.window_start, d.window_end)),
+                reset_known: active && live.resets_at.is_some(),
+            })
+        })
+        .collect();
+    overlay_charts(parts, palette, |a, b| hour_ticks_in(a, b, &Local))
+}
+
+/// The accounts that have data: the ones the charts draw.
+pub fn with_data<'v, 'a>(accounts: &'v [AccountView<'a>]) -> Vec<&'v AccountView<'a>> {
+    accounts.iter().filter(|v| v.data.is_some()).collect()
+}
+
+/// The 5-hour card for the accounts: one account with data as it always
+/// was (see [`show_account_card`]), several overlaid (see
+/// [`show_series_card`]); 0 (nothing drawn) without data.
 pub fn show_timeline_card(
     ui: &mut Ui,
     accounts: &[AccountView],
@@ -1023,9 +1324,10 @@ pub fn show_timeline_card(
     palette: &Palette,
     size: super::layout::CardSize,
 ) -> f32 {
-    match super::accounts::first_data(accounts) {
-        Some(d) => show_account_card(ui, d, now, palette, size),
-        None => 0.0,
+    match with_data(accounts)[..] {
+        [] => 0.0,
+        [v] => show_account_card(ui, v, now, palette, size),
+        ref several => show_series_card(ui, several, now, palette, size),
     }
 }
 
@@ -1036,14 +1338,16 @@ pub fn show_timeline_card(
 /// Returns the content's natural height (before `size.min_content`).
 fn show_account_card(
     ui: &mut Ui,
-    d: &Dashboard,
+    view: &AccountView,
     now: DateTime<Utc>,
     palette: &Palette,
     size: super::layout::CardSize,
 ) -> f32 {
+    let Some(d) = view.data else { return 0.0 };
     let reset_known = d.five_hour_now(now).resets_at.is_some();
     let span = window_span_in(d.window_start, d.window_end, reset_known, &Local);
-    let chart = five_hour_chart(d, now, palette);
+    let mut chart = five_hour_chart(d, now, palette);
+    chart.series[0].key = series_key(view.id);
     super::theme::card(palette)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1059,8 +1363,130 @@ fn show_account_card(
         .inner
 }
 
+/// The 5-hour card of several accounts: the title with the legend, the
+/// overlaid chart, and each account's "5h burn" row under its name.
+fn show_series_card(
+    ui: &mut Ui,
+    views: &[&AccountView],
+    now: DateTime<Utc>,
+    palette: &Palette,
+    size: super::layout::CardSize,
+) -> f32 {
+    let Some(chart) = five_hour_series_chart(views, now, palette) else {
+        return 0.0;
+    };
+    super::theme::card(palette)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let top = ui.cursor().top();
+            ui.set_min_height(size.min_content);
+            show_title(ui, palette, TITLE, None, &chart.legend);
+            show_chart(ui, &chart, palette, size.chart);
+            for v in views {
+                let Some(d) = v.data else { continue };
+                series_header(ui, palette, v);
+                super::footer::show_burn_row(ui, d, now);
+            }
+            ui.cursor().top() - top - ui.spacing().item_spacing.y
+        })
+        .inner
+}
+
+/// A chart card's title row: [`super::theme::chart_title`] with the
+/// subtitle, or, with a `legend`, the legend right-aligned in its place
+/// (entries that don't fit after the title are dropped from the end).
+pub fn show_title(
+    ui: &mut Ui,
+    palette: &Palette,
+    title: &str,
+    subtitle: Option<&str>,
+    legend: &[LegendEntry],
+) {
+    if legend.is_empty() {
+        super::theme::chart_title(ui, palette, title, subtitle);
+        return;
+    }
+    let top = ui.cursor().top();
+    super::theme::chart_title(ui, palette, title, None);
+    let bottom = ui.cursor().top() - ui.spacing().item_spacing.y;
+    let rect = Rect::from_min_max(
+        pos2(ui.min_rect().left(), top),
+        pos2(ui.min_rect().left() + ui.available_width(), bottom),
+    );
+    let title_font = super::theme::semibold(TextStyle::Body.resolve(ui.style()).size);
+    let small = TextStyle::Small.resolve(ui.style());
+    let painter = ui.painter_at(rect);
+    let title_w = painter
+        .layout_no_wrap(title.to_owned(), title_font, palette.text)
+        .size()
+        .x;
+    let galleys: Vec<_> = legend
+        .iter()
+        .map(|e| painter.layout_no_wrap(e.label.clone(), small.clone(), palette.text_muted))
+        .collect();
+    let widths: Vec<f32> = galleys
+        .iter()
+        .map(|g| LEGEND_SWATCH + LEGEND_SWATCH_GAP + g.size().x)
+        .collect();
+    let room = rect.width() - title_w - super::theme::CHART_TITLE_GAP;
+    let shown = legend_fit(&widths, LEGEND_GAP, room);
+    let total: f32 =
+        widths[..shown].iter().sum::<f32>() + LEGEND_GAP * shown.saturating_sub(1) as f32;
+    let mut x = rect.right() - total;
+    let y = rect.center().y;
+    for (e, g) in legend.iter().zip(galleys).take(shown) {
+        let (a, b) = (pos2(x, y), pos2(x + LEGEND_SWATCH, y));
+        let stroke = Stroke::new(2.0, e.color);
+        if e.dashed {
+            for seg in dashes(a, b, 3.0, 2.0) {
+                painter.line_segment(seg, stroke);
+            }
+        } else {
+            painter.line_segment([a, b], stroke);
+        }
+        x += LEGEND_SWATCH + LEGEND_SWATCH_GAP;
+        let w = g.size().x;
+        painter.galley(pos2(x, y - g.size().y / 2.0), g, palette.text_muted);
+        x += w + LEGEND_GAP;
+    }
+}
+
+/// A legend swatch's length, its gap to the name, and the gap between
+/// entries.
+const LEGEND_SWATCH: f32 = 12.0;
+const LEGEND_SWATCH_GAP: f32 = 4.0;
+const LEGEND_GAP: f32 = 10.0;
+
+/// How many legend entries `widths` wide (`gap` apart), from the first,
+/// fit in `room`.
+pub fn legend_fit(widths: &[f32], gap: f32, room: f32) -> usize {
+    let mut used = 0.0;
+    for (i, w) in widths.iter().enumerate() {
+        used += w + if i > 0 { gap } else { 0.0 };
+        if used > room {
+            return i;
+        }
+    }
+    widths.len()
+}
+
+/// An account's name over its rows on an overlaid card: a dot in its color
+/// and the name, muted; "stale" after it when its last poll failed.
+pub fn series_header(ui: &mut Ui, palette: &Palette, view: &AccountView) {
+    use eframe::egui::RichText;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new("●").small().color(view_tone(view)));
+        ui.label(RichText::new(view.label).small().color(palette.text_muted));
+        if view.stale {
+            ui.label(RichText::new("· stale").small().color(palette.text_muted));
+        }
+    });
+}
+
 /// Paint `chart`, `height` tall across the available width. Hovering shows
-/// a crosshair and a tooltip.
+/// a crosshair and a tooltip: one account's sample or projection, or every
+/// account's value at the pointer when several are overlaid.
 pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
@@ -1082,9 +1508,16 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
     paint_y_axis(&painter, axes.plot, palette, &font);
     paint_time_axis(&painter, &axes, palette, &font, rect.left(), chart);
 
-    let samples = &chart.points;
-    let segs = segments(samples, chart.gap_break);
-    if segs.is_empty() {
+    let layers: Vec<(Vec<Range<usize>>, Vec<Bridge>)> = chart
+        .series
+        .iter()
+        .map(|s| {
+            let segs = segments(&s.points, chart.gap_break);
+            let gaps = bridges(&s.points, &segs);
+            (segs, gaps)
+        })
+        .collect();
+    if layers.iter().all(|(segs, _)| segs.is_empty()) {
         // Between the 50% and 75% gridlines, so neither strikes it through.
         painter.text(
             pos2(axes.plot.center().x, y_in(axes.plot, 62.5)),
@@ -1095,48 +1528,191 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
         );
         return response;
     }
-    let gaps = bridges(samples, &segs);
-    paint_areas(&painter, &axes, palette, chart, &segs, &gaps);
+    // Every account's fills first, so no tint covers another's line.
+    let lines: Vec<Vec<Vec<Pos2>>> = chart
+        .series
+        .iter()
+        .zip(&layers)
+        .map(|(s, (segs, gaps))| paint_fills(&painter, &axes, palette, chart, s, segs, gaps))
+        .collect();
+    for ((s, (_, gaps)), lines) in chart.series.iter().zip(&layers).zip(lines) {
+        paint_lines(&painter, &axes, chart, s, gaps, lines);
+    }
 
     // Each dot eases to its poll's %; each projection draws in when it first
-    // appears and when a poll moves its end.
+    // appears and when a poll moves its end. All accounts' meters share one
+    // pass, so every end label keeps clear of every other.
     let ctx = ui.ctx().clone();
     let ends: Vec<Ends> = chart
-        .lines
+        .series
         .iter()
-        .map(|line| Ends {
-            pct: motion::eased(&ctx, Id::new((chart.id, line.kind, "now-pct")), line.pct),
+        .zip(&layers)
+        .filter(|(_, (segs, _))| !segs.is_empty())
+        .flat_map(|(s, _)| s.lines.iter().map(move |line| (s, line)))
+        .map(|(s, line)| Ends {
+            pct: motion::eased(
+                &ctx,
+                motion_id(chart.id, s.key, line.kind, "now-pct"),
+                line.pct,
+            ),
             projection: line.projection,
             label: line.label,
             share: line.projection.map_or(1.0, |p| {
                 motion::draw_in(
                     &ctx,
-                    Id::new((chart.id, line.kind, "projection")),
-                    chart.poll_key,
+                    motion_id(chart.id, s.key, line.kind, "projection"),
+                    s.poll_key,
                     p.end_pct,
                 )
             }),
-            color: line.color,
-            cap_color: line.cap_color,
+            color: s.tone(line.color),
+            cap_color: s.tone(line.cap_color),
         })
         .collect();
     paint_now(&painter, &axes, palette, chart, &ends, &font);
 
     if let Some(pointer) = response.hover_pos() {
         if axes.plot.x_range().contains(pointer.x) {
+            if chart.overlaid() {
+                let t = axes.t_at(pointer.x);
+                let rows = hover_rows(chart, t);
+                paint_series_hover(&painter, &axes, palette, &rows, t);
+                let job = hover_job(&chart.style.tip(t, &Local), &rows, &font, palette.text);
+                return response.on_hover_text_at_pointer(job);
+            }
+            let (s, (segs, gaps)) = (&chart.series[0], &layers[0]);
             // The main meter's projection, else the overlay's, drives the
             // hover beyond now.
             let projecting = [LineKind::Main, LineKind::Overlay]
                 .iter()
-                .filter_map(|k| chart.lines.iter().find(|l| l.kind == *k))
+                .filter_map(|k| s.lines.iter().find(|l| l.kind == *k))
                 .find_map(|l| l.projection.map(|p| (l.pct, p)));
-            let target = hover_target(&axes, samples, &gaps, chart.now, projecting, pointer.x);
-            let drawn = drawn_values(samples, &segs, Series::Main);
-            let tip = paint_hover(&painter, &axes, palette, chart, &drawn, target, pointer.x);
+            let target = hover_target(&axes, &s.points, gaps, chart.now, projecting, pointer.x);
+            let drawn = drawn_values(&s.points, segs, Series::Main);
+            let tip = paint_hover(
+                &painter, &axes, palette, chart, s, &drawn, target, pointer.x,
+            );
             return response.on_hover_text_at_pointer(tip);
         }
     }
     response
+}
+
+/// One account's value in the overlaid hover tooltip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoverRow {
+    pub label: String,
+    pub color: Color32,
+    /// The main meter's %.
+    pub value: f64,
+    /// The Fable meter's % (its share on the 5-hour chart), when shown.
+    pub fable: Option<f64>,
+    /// Read off the projection beyond now.
+    pub projected: bool,
+}
+
+/// Every series' value at `t`, in series order. At or before now: the
+/// last sample at or before `t`, when it is at most the chart's gap break
+/// old (else the account has no reading there and no row). Beyond now: the
+/// main meter's projection (held at its end, or at its % without one).
+/// Nothing past the account's own window end.
+pub fn hover_rows(chart: &Chart, t: DateTime<Utc>) -> Vec<HoverRow> {
+    chart
+        .series
+        .iter()
+        .filter(|s| t <= s.end)
+        .filter_map(|s| {
+            let row = |value, fable, projected| HoverRow {
+                label: s.label.clone(),
+                color: s.tone(s.color),
+                value,
+                fable,
+                projected,
+            };
+            if t > chart.now {
+                let at = |kind: LineKind| {
+                    s.lines.iter().find(|l| l.kind == kind).map(|l| {
+                        l.projection
+                            .and_then(|p| projected_pct(chart.now, l.pct, &p, t))
+                            .unwrap_or(l.pct)
+                    })
+                };
+                return Some(row(at(LineKind::Main)?, at(LineKind::Overlay), true));
+            }
+            let i = s
+                .points
+                .iter()
+                .rposition(|p| p.t <= t && p.value.is_some())?;
+            let p = &s.points[i];
+            if t - p.t > chart.gap_break {
+                return None;
+            }
+            let fable = match &s.overlay {
+                Overlay::Share(share) => share.get(i).copied().flatten().filter(|f| *f > 0.0),
+                Overlay::Line { .. } => p.overlay,
+                Overlay::None => None,
+            };
+            Some(row(p.value?, fable, false))
+        })
+        .collect()
+}
+
+/// A hover row's text after its dot: "nate 46%", "nate 46% · Fable 52%",
+/// "work projected 71%".
+pub fn hover_row_text(row: &HoverRow) -> String {
+    let what = if row.projected { " projected" } else { "" };
+    let mut text = format!("{}{what} {:.0}%", row.label, row.value);
+    if let Some(f) = row.fable {
+        text.push_str(&format!(" · Fable {f:.0}%"));
+    }
+    text
+}
+
+/// The overlaid tooltip as plain text: "3:10 PM\n● nate 46%\n● work 12%".
+pub fn hover_tip(time: &str, rows: &[HoverRow]) -> String {
+    let mut out = time.to_owned();
+    for r in rows {
+        out.push_str(&format!("\n● {}", hover_row_text(r)));
+    }
+    out
+}
+
+/// [`hover_tip`] with each dot in its account's color.
+fn hover_job(time: &str, rows: &[HoverRow], font: &FontId, text: Color32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let format = |color| TextFormat {
+        font_id: font.clone(),
+        color,
+        ..TextFormat::default()
+    };
+    job.append(time, 0.0, format(text));
+    for r in rows {
+        job.append("\n●", 0.0, format(r.color));
+        job.append(&format!(" {}", hover_row_text(r)), 0.0, format(text));
+    }
+    job
+}
+
+/// The overlaid hover: a vertical line at `t` and a dot on each account's
+/// value.
+fn paint_series_hover(
+    painter: &Painter,
+    axes: &Axes,
+    palette: &Palette,
+    rows: &[HoverRow],
+    t: DateTime<Utc>,
+) {
+    let stroke = Stroke::new(1.0, palette.text_muted.gamma_multiply(0.7));
+    let x = axes.x_at(t);
+    painter.vline(x, axes.plot.y_range(), stroke);
+    for r in rows {
+        painter.circle(
+            axes.pos(t, r.value),
+            3.0,
+            palette.surface,
+            Stroke::new(1.5, r.color),
+        );
+    }
 }
 
 /// The y axis of `plot`: gridlines at 25/50/75 with labels, the dashed 100%
@@ -1204,26 +1780,34 @@ fn paint_time_axis(
     if let Some(g) = end {
         painter.galley(pos2(end_left, y), g, palette.text_muted);
     }
+    for (t, color) in &chart.end_marks {
+        let x = axes.x_at(*t);
+        painter.vline(
+            x,
+            axes.plot.bottom() - 4.0..=axes.plot.bottom() + 4.0,
+            Stroke::new(2.0, *color),
+        );
+    }
 }
 
-/// The faint bridge fills, the main area per segment (gradient fill), the
-/// overlay (the Fable share area with a surface-colored separator on top,
-/// or the Fable line), then the main lines and the dotted bridge lines.
-fn paint_areas(
+/// One series' fills: the faint bridge fills, the main area per segment
+/// (gradient fill), and the Fable share area with a surface-colored
+/// separator on top. Returns the main line of each segment (for
+/// [`paint_lines`]).
+fn paint_fills(
     painter: &Painter,
     axes: &Axes,
     palette: &Palette,
     chart: &Chart,
+    s: &SeriesData,
     segs: &[Range<usize>],
     gaps: &[Bridge],
-) {
-    let samples = &chart.points;
-    let state = chart.state;
+) -> Vec<Vec<Pos2>> {
+    let samples = &s.points;
     let baseline = axes.plot.bottom();
-    let top = state.gamma_multiply(AREA_TOP_ALPHA);
-    let bottom = state.gamma_multiply(AREA_BASE_ALPHA);
-    let fable_fill = palette.fable.gamma_multiply(FABLE_ALPHA);
-    let share = match &chart.overlay {
+    let (top, bottom) = s.area_colors();
+    let fable_fill = s.tone(palette.fable.gamma_multiply(FABLE_ALPHA));
+    let share = match &s.overlay {
         Overlay::Share(share) => Some(share.as_slice()),
         _ => None,
     };
@@ -1279,27 +1863,51 @@ fn paint_areas(
         }
         lines.push(line);
     }
-    let dotted = Stroke::new(1.5, state.gamma_multiply(BRIDGE_LINE_ALPHA));
+    lines
+}
+
+/// One series' lines over the fills: the dotted bridge lines, the main
+/// `lines` (from [`paint_fills`]), then the Fable line.
+fn paint_lines(
+    painter: &Painter,
+    axes: &Axes,
+    chart: &Chart,
+    s: &SeriesData,
+    gaps: &[Bridge],
+    lines: Vec<Vec<Pos2>>,
+) {
+    let samples = &s.points;
+    let color = s.tone(s.color);
+    let main = |i: usize| axes.pos(samples[i].t, samples[i].value.unwrap_or(0.0));
+    let dotted = Stroke::new(1.5, color.gamma_multiply(BRIDGE_LINE_ALPHA));
     for b in gaps {
         for seg in dashes(main(b.from), main(b.to), DOT, DOT_GAP) {
             painter.line_segment(seg, dotted);
         }
     }
     for line in lines {
-        paint_polyline(painter, line, state);
+        paint_polyline(painter, line, color);
     }
-    if chart.overlay == Overlay::Line {
-        paint_overlay_line(painter, axes, palette, chart);
+    if let Overlay::Line { color, dashed } = s.overlay {
+        paint_overlay_line(painter, axes, chart, s, s.tone(color), dashed);
     }
 }
 
-/// The overlay meter as a clay line, with its own breaks and dotted bridges.
-fn paint_overlay_line(painter: &Painter, axes: &Axes, palette: &Palette, chart: &Chart) {
-    let samples = &chart.points;
+/// The overlay meter as a line in `color` (dashed or solid), with its own
+/// breaks and dotted bridges.
+fn paint_overlay_line(
+    painter: &Painter,
+    axes: &Axes,
+    chart: &Chart,
+    s: &SeriesData,
+    color: Color32,
+    dashed: bool,
+) {
+    let samples = &s.points;
     let segs = segments_of(samples, chart.gap_break, Series::Overlay);
     let gaps = bridges_of(samples, &segs, Series::Overlay);
     let at = |i: usize| axes.pos(samples[i].t, samples[i].overlay.unwrap_or(0.0));
-    let dotted = Stroke::new(1.5, palette.fable.gamma_multiply(BRIDGE_LINE_ALPHA));
+    let dotted = Stroke::new(1.5, color.gamma_multiply(BRIDGE_LINE_ALPHA));
     for b in &gaps {
         for seg in dashes(at(b.from), at(b.to), DOT, DOT_GAP) {
             painter.line_segment(seg, dotted);
@@ -1311,8 +1919,61 @@ fn paint_overlay_line(painter: &Painter, axes: &Axes, palette: &Palette, chart: 
             .zip(drawn)
             .map(|(i, v)| axes.pos(samples[i].t, v))
             .collect();
-        paint_polyline(painter, thin_columns(&raw), palette.fable);
+        let line = thin_columns(&raw);
+        if dashed && line.len() >= 2 {
+            for piece in dashed_polyline(&line, DASH, DASH_GAP) {
+                painter.add(Shape::line(piece, PathStroke::new(1.5, color)));
+            }
+        } else {
+            paint_polyline(painter, line, color);
+        }
     }
+}
+
+/// The dashes along the polyline through `points`, `dash` long and `gap`
+/// apart, the pattern running on across its vertices (so a line of many
+/// short steps still reads as dashed). Each dash is a polyline of its own.
+pub fn dashed_polyline(points: &[Pos2], dash: f32, gap: f32) -> Vec<Vec<Pos2>> {
+    let mut out: Vec<Vec<Pos2>> = Vec::new();
+    if points.len() < 2 || dash <= 0.0 {
+        return out;
+    }
+    let gap = gap.max(0.0);
+    // Distance into the current dash (on) or gap (off).
+    let (mut on, mut into) = (true, 0.0_f32);
+    let mut current: Vec<Pos2> = vec![points[0]];
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let length = a.distance(b);
+        if length <= 0.0 {
+            continue;
+        }
+        let dir = (b - a) / length;
+        let mut d = 0.0;
+        while d < length {
+            let left = if on { dash } else { gap } - into;
+            let step = left.min(length - d);
+            d += step;
+            into += step;
+            let p = a + dir * d;
+            if on {
+                current.push(p);
+            }
+            if into >= if on { dash } else { gap } {
+                if on {
+                    out.push(std::mem::take(&mut current));
+                } else {
+                    current = vec![p];
+                }
+                on = !on;
+                into = 0.0;
+            }
+        }
+    }
+    if on && current.len() >= 2 {
+        out.push(current);
+    }
+    out
 }
 
 /// A solid 2 pt line, or a dot for a lone sample.
@@ -1479,16 +2140,18 @@ fn paint_now(
 /// Crosshair for the hover `target` and its tooltip text: a full
 /// crosshair on a sample or the projection, a vertical line over a gap or
 /// an empty spot.
+#[allow(clippy::too_many_arguments)]
 fn paint_hover(
     painter: &Painter,
     axes: &Axes,
     palette: &Palette,
     chart: &Chart,
+    series: &SeriesData,
     drawn: &[Option<f64>],
     target: HoverTarget,
     pointer_x: f32,
 ) -> String {
-    let samples = &chart.points;
+    let samples = &series.points;
     let style = chart.style;
     let time = |t: DateTime<Utc>| style.tip(t, &Local);
     let point = |t: DateTime<Utc>, pct: f64| Some(axes.pos(t, pct));
@@ -1496,7 +2159,7 @@ fn paint_hover(
         HoverTarget::Projected { t, pct } => {
             // Each meter at `t`: on its projection, else held at its %.
             let at = |kind: LineKind| {
-                chart.lines.iter().find(|l| l.kind == kind).map(|l| {
+                series.lines.iter().find(|l| l.kind == kind).map(|l| {
                     l.projection
                         .and_then(|p| projected_pct(chart.now, l.pct, &p, t))
                         .unwrap_or(l.pct)
@@ -1515,9 +2178,11 @@ fn paint_hover(
             let pct = s.value.unwrap_or(0.0);
             // The tip reads the real sample; the dot sits on the drawn line.
             let on_line = drawn.get(i).copied().flatten().unwrap_or(pct);
-            let tip = match (&chart.overlay, style) {
+            let tip = match (&series.overlay, style) {
                 (Overlay::Share(share), _) => sample_tip(&time(s.t), pct, share[i]),
-                (Overlay::Line, TimeStyle::Weekday) => week_sample_tip(&time(s.t), pct, s.overlay),
+                (Overlay::Line { .. }, TimeStyle::Weekday) => {
+                    week_sample_tip(&time(s.t), pct, s.overlay)
+                }
                 (_, TimeStyle::Weekday) => week_sample_tip(&time(s.t), pct, None),
                 (_, TimeStyle::Clock) => sample_tip(&time(s.t), pct, None),
             };
@@ -1603,8 +2268,8 @@ mod tests {
     }
 
     fn assert_idle(c: &Chart) {
-        assert!(c.points.is_empty(), "{:?}", c.points);
-        assert!(c.lines.is_empty(), "no now dot or projection");
+        assert!(c.series[0].points.is_empty(), "{:?}", c.series[0].points);
+        assert!(c.series[0].lines.is_empty(), "no now dot or projection");
         assert!(c.ticks.is_empty(), "no times on an idle axis");
         assert_eq!(c.end_label, None);
         assert_eq!(c.note, Some(IDLE_NOTE));
@@ -1621,8 +2286,8 @@ mod tests {
     fn five_hour_chart_idle_once_the_reset_passes_between_polls() {
         let d = five_dash(t_at(14, 10), 80.0, Some(t_at(14, 20)));
         let live = five_hour_chart(&d, t_at(14, 15), &crate::ui::theme::DARK);
-        assert_eq!(live.points.len(), 2);
-        assert_eq!(live.lines.len(), 1);
+        assert_eq!(live.series[0].points.len(), 2);
+        assert_eq!(live.series[0].lines.len(), 1);
         assert!(live.end_label.as_deref().unwrap().starts_with("reset "));
         assert_eq!(live.note, None);
         // 14:21: past the chart's end, before the next poll.
@@ -1634,10 +2299,10 @@ mod tests {
     fn five_hour_chart_trailing_without_a_reset_ends_now() {
         let d = five_dash(t_at(14, 53), 6.0, None);
         let c = five_hour_chart(&d, t_at(14, 53), &crate::ui::theme::DARK);
-        assert_eq!(c.points.len(), 2);
+        assert_eq!(c.series[0].points.len(), 2);
         assert_eq!(c.end_label.as_deref(), Some("now"));
-        assert_eq!(c.lines.len(), 1);
-        assert_eq!(c.lines[0].label, None, "no safe or cap claimed");
+        assert_eq!(c.series[0].lines.len(), 1);
+        assert_eq!(c.series[0].lines[0].label, None, "no safe or cap claimed");
         assert_eq!(c.note, None);
     }
 
@@ -2502,6 +3167,358 @@ mod tests {
         assert!(!label_shown(EndLabel::AtCap, 500.0, 10.0));
         assert!(!label_shown(EndLabel::Safe, 0.0, 70.0));
         assert!(label_shown(EndLabel::Safe, 80.0, 70.0));
+    }
+
+    // --- several accounts -----------------------------------------------------
+
+    fn view<'a>(
+        id: &'a ProfileId,
+        label: &'a str,
+        d: &'a Dashboard,
+        stale: bool,
+    ) -> AccountView<'a> {
+        AccountView {
+            id,
+            label,
+            color: crate::ui::theme::DARK.series(id.as_str().len() as u8),
+            data: Some(d),
+            error: None,
+            stale,
+        }
+    }
+
+    #[test]
+    fn union_window_spans_every_window() {
+        assert_eq!(union_window([]), None);
+        assert_eq!(union_window([(at(0), at(300))]), Some((at(0), at(300))));
+        assert_eq!(
+            union_window([(at(60), at(360)), (at(0), at(300)), (at(30), at(330))]),
+            Some((at(0), at(360)))
+        );
+    }
+
+    #[test]
+    fn overlaid_five_hour_chart_spans_both_windows_with_a_mark_per_reset() {
+        let now = t_at(14, 0);
+        let a = five_dash(now, 40.0, Some(t_at(15, 0)));
+        let b = five_dash(now, 10.0, Some(t_at(17, 30)));
+        let (ia, ib) = (ProfileId::new("default"), ProfileId::new("work"));
+        let (va, vb) = (view(&ia, "nate", &a, false), view(&ib, "work", &b, true));
+        let c = five_hour_series_chart(&[&va, &vb], now, &crate::ui::theme::DARK).unwrap();
+        assert!(c.overlaid());
+        assert_eq!((c.start, c.end), (t_at(10, 0), t_at(17, 30)));
+        assert_eq!(
+            c.end_marks,
+            vec![
+                (t_at(15, 0), va.color),
+                (t_at(17, 30), vb.color.gamma_multiply(DIM_ALPHA))
+            ]
+        );
+        assert_eq!(c.series.len(), 2);
+        for (s, v) in c.series.iter().zip([&va, &vb]) {
+            assert_eq!(s.color, v.color);
+            assert_eq!(s.label, v.label);
+            assert_eq!(s.area, AreaStyle::Tint(SERIES_TINT));
+            assert_eq!(s.overlay, Overlay::None, "no Fable share area");
+            assert!(s.lines.iter().all(|l| l.color == v.color));
+            assert_eq!(s.key, series_key(v.id));
+        }
+        // The stale account is dimmed, the fresh one not.
+        assert!(!c.series[0].dimmed && c.series[1].dimmed);
+        assert_eq!(
+            c.series[1].tone(vb.color),
+            vb.color.gamma_multiply(DIM_ALPHA)
+        );
+        let (top, _) = c.series[1].area_colors();
+        assert_eq!(
+            top,
+            vb.color
+                .gamma_multiply(SERIES_TINT)
+                .gamma_multiply(DIM_ALPHA)
+        );
+        assert_eq!(c.legend.len(), 2);
+        assert_eq!(c.legend[0].label, "nate");
+        assert!(c.ticks.len() <= MAX_TICKS);
+        assert!(c.note.is_none());
+    }
+
+    #[test]
+    fn overlaid_idle_accounts_add_no_window() {
+        let now = t_at(14, 0);
+        let a = five_dash(now, 40.0, Some(t_at(15, 0)));
+        let mut idle = five_dash(now, 0.0, None);
+        idle.window_samples.clear();
+        let (ia, ib) = (ProfileId::new("a"), ProfileId::new("b"));
+        let (va, vb) = (view(&ia, "a", &a, false), view(&ib, "b", &idle, false));
+        let c = five_hour_series_chart(&[&va, &vb], now, &crate::ui::theme::DARK).unwrap();
+        assert_eq!((c.start, c.end), (t_at(10, 0), t_at(15, 0)));
+        assert_eq!(c.end_marks.len(), 1);
+        assert!(c.series[1].points.is_empty() && c.series[1].lines.is_empty());
+        // Both idle: the empty state.
+        let vc = view(&ia, "a", &idle, false);
+        let c = five_hour_series_chart(&[&vc, &vb], now, &crate::ui::theme::DARK).unwrap();
+        assert_eq!(c.note, Some(IDLE_NOTE));
+        assert!(c.ticks.is_empty() && c.end_marks.is_empty() && c.end_label.is_none());
+    }
+
+    #[test]
+    fn one_account_draws_as_it_always_did() {
+        let now = t_at(14, 0);
+        let d = five_dash(now, 40.0, Some(t_at(15, 0)));
+        let id = ProfileId::new("default");
+        let views = [view(&id, "nate", &d, true)];
+        assert_eq!(with_data(&views).len(), 1);
+        let c = five_hour_chart(&d, now, &crate::ui::theme::DARK);
+        assert!(!c.overlaid());
+        let s = &c.series[0];
+        let state = crate::ui::theme::DARK.level(analytics::color_for(Some(40.0)));
+        assert_eq!((s.color, s.area), (state, AreaStyle::State(state)));
+        assert!(matches!(s.overlay, Overlay::Share(_)));
+        assert!(!s.dimmed);
+        assert_eq!(
+            s.area_colors(),
+            (
+                state.gamma_multiply(AREA_TOP_ALPHA),
+                state.gamma_multiply(AREA_BASE_ALPHA)
+            )
+        );
+        assert!(c.legend.is_empty() && c.end_marks.is_empty());
+        assert_eq!(legend_for(&c.series, Color32::GRAY), vec![]);
+    }
+
+    fn series_of(label: &str, points: Vec<Point>, lines: Vec<Line>) -> SeriesData {
+        SeriesData {
+            key: label.len() as u64,
+            label: label.to_owned(),
+            color: Color32::RED,
+            area: AreaStyle::Tint(SERIES_TINT),
+            overlay: Overlay::Line {
+                color: Color32::RED,
+                dashed: true,
+            },
+            points,
+            lines,
+            dimmed: false,
+            end: at(300),
+            poll_key: 0,
+        }
+    }
+
+    fn chart_of(series: Vec<SeriesData>, now: DateTime<Utc>) -> Chart {
+        Chart {
+            id: "test",
+            start: at(0),
+            end: at(300),
+            now,
+            series,
+            gap_break: gap(),
+            ticks: Vec::new(),
+            end_label: None,
+            end_marks: Vec::new(),
+            legend: Vec::new(),
+            bridge_fill: 1.0,
+            style: TimeStyle::Clock,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn hover_rows_read_each_series_and_skip_gaps() {
+        let main = |pct, end_pct| Line {
+            kind: LineKind::Main,
+            pct,
+            projection: Some(Projection {
+                end_t: at(300),
+                end_pct,
+                cap_at: None,
+            }),
+            label: None,
+            color: Color32::RED,
+            cap_color: Color32::RED,
+        };
+        let a = series_of(
+            "nate",
+            vec![
+                Point {
+                    t: at(0),
+                    value: Some(10.0),
+                    overlay: Some(50.0),
+                },
+                Point {
+                    t: at(5),
+                    value: Some(12.0),
+                    overlay: None,
+                },
+                Point {
+                    t: at(40),
+                    value: Some(20.0),
+                    overlay: None,
+                },
+            ],
+            vec![main(20.0, 60.0)],
+        );
+        let mut b = series_of(
+            "work",
+            vec![
+                Point {
+                    t: at(20),
+                    value: Some(5.0),
+                    overlay: None,
+                },
+                Point {
+                    t: at(38),
+                    value: Some(6.0),
+                    overlay: None,
+                },
+            ],
+            vec![main(5.0, 5.0)],
+        );
+        b.overlay = Overlay::None;
+        b.end = at(200);
+        let c = chart_of(vec![a, b], at(100));
+        let read = |m| -> Vec<(String, f64, Option<f64>, bool)> {
+            hover_rows(&c, at(m))
+                .into_iter()
+                .map(|r| (r.label, r.value, r.fable, r.projected))
+                .collect()
+        };
+        // Only "nate" has a reading by then, with its Fable 7-day.
+        assert_eq!(read(2), vec![("nate".into(), 10.0, Some(50.0), false)]);
+        assert_eq!(
+            read(25),
+            vec![("work".into(), 5.0, None, false)],
+            "nate's last sample is 20 min old: a gap, no row"
+        );
+        assert_eq!(
+            read(14),
+            vec![("nate".into(), 12.0, None, false)],
+            "work starts at 20"
+        );
+        // Both: each account's last sample at or before the time.
+        assert_eq!(
+            read(45),
+            vec![
+                ("nate".into(), 20.0, None, false),
+                ("work".into(), 6.0, None, false)
+            ]
+        );
+        assert!(read(55).is_empty(), "both readings over 10 min old");
+        // Beyond now: the projections, nothing past an account's own end.
+        assert_eq!(
+            read(200),
+            vec![
+                ("nate".into(), 40.0, None, true),
+                ("work".into(), 5.0, None, true)
+            ]
+        );
+        assert_eq!(read(250), vec![("nate".into(), 50.0, None, true)]);
+        // Before every sample: nothing.
+        assert!(hover_rows(&c, at(-5)).is_empty());
+    }
+
+    #[test]
+    fn hover_tip_lists_every_series() {
+        let row = |label: &str, value, fable, projected| HoverRow {
+            label: label.to_owned(),
+            color: Color32::RED,
+            value,
+            fable,
+            projected,
+        };
+        assert_eq!(
+            hover_tip(
+                "3:10 PM",
+                &[
+                    row("nate", 46.2, None, false),
+                    row("work", 12.0, None, false)
+                ]
+            ),
+            "3:10 PM\n● nate 46%\n● work 12%"
+        );
+        assert_eq!(
+            hover_row_text(&row("nate", 41.0, Some(52.0), false)),
+            "nate 41% · Fable 52%"
+        );
+        assert_eq!(
+            hover_row_text(&row("work", 71.0, None, true)),
+            "work projected 71%"
+        );
+        assert_eq!(hover_tip("3:10 PM", &[]), "3:10 PM");
+    }
+
+    #[test]
+    fn motion_ids_differ_per_account() {
+        let (a, b) = (
+            series_key(&ProfileId::new("default")),
+            series_key(&ProfileId::new("work")),
+        );
+        assert_ne!(a, b);
+        assert_eq!(a, series_key(&ProfileId::new("default")), "stable");
+        let id = |k| motion_id("timeline", k, LineKind::Main, "now-pct");
+        assert_ne!(id(a), id(b));
+        assert_ne!(
+            motion_id("timeline", a, LineKind::Main, "now-pct"),
+            motion_id("week", a, LineKind::Main, "now-pct")
+        );
+        assert_ne!(
+            id(a),
+            motion_id("timeline", a, LineKind::Overlay, "now-pct")
+        );
+    }
+
+    #[test]
+    fn legend_only_with_two_or_more_series() {
+        let one = vec![series_of("nate", Vec::new(), Vec::new())];
+        assert!(legend_for(&one, Color32::GRAY).is_empty());
+        let mut two = vec![one[0].clone(), series_of("work", Vec::new(), Vec::new())];
+        two[1].overlay = Overlay::None;
+        two[1].dimmed = true;
+        let legend = legend_for(&two, Color32::GRAY);
+        let names: Vec<_> = legend
+            .iter()
+            .map(|e| (e.label.as_str(), e.dashed))
+            .collect();
+        assert_eq!(names, [("nate", false), ("work", false), ("Fable", true)]);
+        assert_eq!(legend[1].color, Color32::RED.gamma_multiply(DIM_ALPHA));
+        assert_eq!(legend[2].color, Color32::GRAY);
+        // No dashed Fable line: no Fable entry.
+        two[0].overlay = Overlay::None;
+        assert_eq!(legend_for(&two, Color32::GRAY).len(), 2);
+    }
+
+    #[test]
+    fn legend_entries_fit_from_the_first() {
+        assert_eq!(legend_fit(&[30.0, 40.0], 10.0, 80.0), 2);
+        assert_eq!(legend_fit(&[30.0, 40.0], 10.0, 79.0), 1);
+        assert_eq!(legend_fit(&[30.0, 40.0], 10.0, 20.0), 0);
+        assert_eq!(legend_fit(&[], 10.0, 20.0), 0);
+    }
+
+    #[test]
+    fn ticks_thin_to_a_maximum() {
+        let ticks: Vec<_> = (0..14).map(|i| (at(i), i.to_string())).collect();
+        let thin = thin_ticks(ticks.clone(), 8);
+        assert_eq!(labels(&thin), ["0", "2", "4", "6", "8", "10", "12"]);
+        assert_eq!(thin_ticks(ticks[..8].to_vec(), 8).len(), 8);
+    }
+
+    #[test]
+    fn dashes_run_on_across_vertices() {
+        // Ten 1-px steps: one 5-px dash, a 4-px gap, then the next dash.
+        let points: Vec<Pos2> = (0..=10).map(|i| pos2(i as f32, 0.0)).collect();
+        let pieces = dashed_polyline(&points, 5.0, 4.0);
+        let ends: Vec<(f32, f32)> = pieces
+            .iter()
+            .map(|p| (p.first().unwrap().x, p.last().unwrap().x))
+            .collect();
+        assert_eq!(ends, [(0.0, 5.0), (9.0, 10.0)]);
+        // Around a corner: the dash bends with the line.
+        let bent = dashed_polyline(&[pos2(0.0, 0.0), pos2(3.0, 0.0), pos2(3.0, 3.0)], 5.0, 4.0);
+        assert_eq!(
+            bent[0],
+            vec![pos2(0.0, 0.0), pos2(3.0, 0.0), pos2(3.0, 2.0)]
+        );
+        assert!(dashed_polyline(&[pos2(0.0, 0.0)], 5.0, 4.0).is_empty());
     }
 
     #[test]

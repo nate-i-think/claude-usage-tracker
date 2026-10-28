@@ -5,6 +5,12 @@
 //! and often the first to cap), a dashed projection per meter from the
 //! weekly outlook, daily ticks, and "reset Mon 11p" at the end. Under the
 //! chart, one row per weekly limit gives its projection in words.
+//!
+//! With several accounts the chart overlays them (see
+//! [`week_series_chart`]): each account's 7-day-all line solid and its
+//! Fable line dashed in its series color, and its rows grouped under its
+//! name. The app's [`Freshness`] is the primary account's; each account's
+//! is derived from it ([`freshness_of`]).
 
 use std::fmt::Display;
 
@@ -18,7 +24,8 @@ use super::accounts::AccountView;
 use super::layout::CardSize;
 use super::theme::Palette;
 use super::timeline::{
-    self, weekday_time_in, Chart, EndLabel, Line, LineKind, Overlay, Point, TimeStyle,
+    self, weekday_time_in, AreaStyle, Chart, EndLabel, Line, LineKind, Overlay, Point, SeriesData,
+    TimeStyle,
 };
 use super::{Run, Tone};
 
@@ -376,31 +383,107 @@ pub fn week_chart(
         start: d.week_start,
         end: d.week_end,
         now,
-        points,
+        series: vec![SeriesData {
+            key: 0,
+            label: String::new(),
+            color: state,
+            area: AreaStyle::State(state),
+            overlay: if show_fable {
+                Overlay::Line {
+                    color: palette.fable,
+                    dashed: false,
+                }
+            } else {
+                Overlay::None
+            },
+            points,
+            lines,
+            dimmed: false,
+            end: d.week_end,
+            poll_key: snap.fetched_at.timestamp_millis(),
+        }],
         gap_break: Duration::minutes(timeline::WEEK_GAP_BREAK_MINUTES),
-        state,
-        overlay: if show_fable {
-            Overlay::Line
-        } else {
-            Overlay::None
-        },
         ticks: timeline::day_ticks_in(d.week_start, d.week_end, &Local),
         end_label: Some(if reset_known {
             format!("reset {}", weekday_time_in(d.week_end, &Local))
         } else {
             "now".to_owned()
         }),
-        lines,
+        end_marks: Vec::new(),
+        legend: Vec::new(),
         bridge_fill: WEEK_BRIDGE_FILL,
         style: TimeStyle::Weekday,
-        poll_key: snap.fetched_at.timestamp_millis(),
         note: None,
     }
 }
 
-/// The weekly card for the accounts. For now the first account with data
-/// is drawn, as one account always was (see [`show_account_card`]); 0
-/// (nothing drawn) without data.
+/// One account's weekly rows on an overlaid card: its outlooks and whether
+/// they are muted.
+pub struct AccountRows<'a> {
+    pub view: &'a AccountView<'a>,
+    pub rows: Vec<(Meter, WeeklyOutlook)>,
+    pub stale: bool,
+}
+
+/// `fresh` (the primary account's, from the app) for an account whose
+/// snapshot is `age` old and whose last poll failed when `poll_failed`.
+/// The app knows the poll interval, so only the primary's staleness is
+/// given: an account at least as old as a stale primary is stale too, as
+/// is one whose last poll failed. Its outlooks are aged by its own age.
+pub fn freshness_of(fresh: Freshness, age: Duration, poll_failed: bool) -> Freshness {
+    Freshness {
+        age,
+        stale: poll_failed || (fresh.stale && age >= fresh.age),
+    }
+}
+
+/// The weekly rows of every account with data (see [`freshness_of`]).
+pub fn account_rows<'a>(
+    views: &[&'a AccountView<'a>],
+    now: DateTime<Utc>,
+    fresh: Freshness,
+) -> Vec<AccountRows<'a>> {
+    views
+        .iter()
+        .filter_map(|v| {
+            let d = v.data?;
+            let f = freshness_of(fresh, now - d.snapshot.fetched_at, v.stale);
+            Some(AccountRows {
+                view: v,
+                rows: outlooks(d, f),
+                stale: f.stale,
+            })
+        })
+        .collect()
+}
+
+/// The weekly chart of several accounts (see [`timeline::overlay_charts`]):
+/// each account's 7-day-all line solid and its Fable line dashed, in its
+/// color, its projections cut at its own window end.
+pub fn week_series_chart(
+    accounts: &[AccountRows],
+    now: DateTime<Utc>,
+    palette: &Palette,
+) -> Option<Chart> {
+    let parts = accounts
+        .iter()
+        .filter_map(|a| {
+            let d = a.view.data?;
+            Some(timeline::Part {
+                chart: week_chart(d, now, palette, &a.rows),
+                view: a.view,
+                window: Some((d.week_start, d.week_end)),
+                reset_known: d.snapshot.seven_day_resets_at().is_some(),
+            })
+        })
+        .collect();
+    timeline::overlay_charts(parts, palette, |a, b| timeline::day_ticks_in(a, b, &Local))
+}
+
+/// The weekly card for the accounts: one account with data as it always
+/// was (see [`show_account_card`], muted by `fresh`), several overlaid (see
+/// [`show_series_card`]; each account's freshness from `fresh` by
+/// [`freshness_of`]); 0 (nothing drawn) without data.
 pub fn show_week_card(
     ui: &mut Ui,
     accounts: &[AccountView],
@@ -409,10 +492,41 @@ pub fn show_week_card(
     size: CardSize,
     fresh: Freshness,
 ) -> f32 {
-    match super::accounts::first_data(accounts) {
-        Some(d) => show_account_card(ui, d, now, palette, size, fresh),
-        None => 0.0,
+    match timeline::with_data(accounts)[..] {
+        [] => 0.0,
+        [v] => show_account_card(ui, v, now, palette, size, fresh),
+        ref several => show_series_card(ui, several, now, palette, size, fresh),
     }
+}
+
+/// The weekly card of several accounts: the title with the legend, the
+/// overlaid chart, and each account's projection rows under its name.
+fn show_series_card(
+    ui: &mut Ui,
+    views: &[&AccountView],
+    now: DateTime<Utc>,
+    palette: &Palette,
+    size: CardSize,
+    fresh: Freshness,
+) -> f32 {
+    let accounts = account_rows(views, now, fresh);
+    let Some(chart) = week_series_chart(&accounts, now, palette) else {
+        return 0.0;
+    };
+    super::theme::card(palette)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let top = ui.cursor().top();
+            ui.set_min_height(size.min_content);
+            timeline::show_title(ui, palette, TITLE, None, &chart.legend);
+            timeline::show_chart(ui, &chart, palette, size.chart);
+            for a in &accounts {
+                timeline::series_header(ui, palette, a.view);
+                outlook_rows(ui, &a.rows, a.stale);
+            }
+            ui.cursor().top() - top - ui.spacing().item_spacing.y
+        })
+        .inner
 }
 
 /// The weekly card: the title with the window's span as its subtitle, the
@@ -421,14 +535,16 @@ pub fn show_week_card(
 /// (before `size.min_content`).
 fn show_account_card(
     ui: &mut Ui,
-    d: &Dashboard,
+    view: &AccountView,
     now: DateTime<Utc>,
     palette: &Palette,
     size: CardSize,
     fresh: Freshness,
 ) -> f32 {
+    let Some(d) = view.data else { return 0.0 };
     let rows = outlooks(d, fresh);
-    let chart = week_chart(d, now, palette, &rows);
+    let mut chart = week_chart(d, now, palette, &rows);
+    chart.series[0].key = timeline::series_key(view.id);
     let reset_known = d.snapshot.seven_day_resets_at().is_some();
     let span = timeline::week_span_in(d.week_start, d.week_end, reset_known, &Local);
     super::theme::card(palette)
@@ -489,6 +605,7 @@ fn outlook_rows(ui: &mut Ui, rows: &[(Meter, WeeklyOutlook)], stale: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::ProfileId;
 
     fn t(d: u32, h: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap()
@@ -731,6 +848,165 @@ mod tests {
             outlook_hover(Meter::Fable, &WeeklyOutlook::AtCap { reset: None }, &Utc),
             "Fable 7-day: at cap\nfrees up at the weekly reset"
         );
+    }
+
+    // --- several accounts -----------------------------------------------------
+
+    /// A dashboard polled at `at` with 7-day all at `pct` resetting at
+    /// `reset`, and Fable 7-day at `fable` (resetting two days after) when
+    /// given; its week ends at the reset.
+    fn week_dash(
+        at: DateTime<Utc>,
+        pct: f64,
+        reset: DateTime<Utc>,
+        fable: Option<f64>,
+    ) -> Dashboard {
+        use crate::analytics::WeekSample;
+        use crate::model::{Snapshot, UsageWindow, FABLE_LABEL, SEVEN_DAY_LABEL};
+        let mut windows = vec![UsageWindow {
+            label: SEVEN_DAY_LABEL.to_owned(),
+            utilization: Some(pct),
+            resets_at: Some(reset),
+        }];
+        if let Some(f) = fable {
+            windows.push(UsageWindow {
+                label: FABLE_LABEL.to_owned(),
+                utilization: Some(f),
+                resets_at: Some(reset + Duration::days(2)),
+            });
+        }
+        let sample = |h: i64, v: f64| WeekSample {
+            t: at - Duration::hours(h),
+            seven_day: Some(v),
+            fable,
+        };
+        Dashboard {
+            snapshot: Snapshot {
+                fetched_at: at,
+                windows,
+                extra: None,
+                breakdown: None,
+            },
+            history: Vec::new(),
+            fable_history: Vec::new(),
+            seven_day_recent: Vec::new(),
+            fable_recent: Vec::new(),
+            burners: Vec::new(),
+            window_start: at,
+            window_end: at,
+            window_samples: Vec::new(),
+            week_start: reset - Duration::days(7),
+            week_end: reset,
+            week_samples: vec![sample(2, pct - 1.0), sample(0, pct)],
+            persist_error: None,
+            plan: None,
+            token_expires_at: None,
+        }
+    }
+
+    fn view<'a>(id: &'a ProfileId, d: &'a Dashboard, stale: bool) -> AccountView<'a> {
+        AccountView {
+            id,
+            label: id.as_str(),
+            color: crate::ui::theme::DARK.series(id.as_str().len() as u8),
+            data: Some(d),
+            error: None,
+            stale,
+        }
+    }
+
+    #[test]
+    fn overlaid_week_chart_dashes_fable_only_where_reported() {
+        let now = t(12, 12);
+        let palette = &crate::ui::theme::DARK;
+        let a = week_dash(now, 40.0, t(14, 0), Some(30.0));
+        let b = week_dash(now, 20.0, t(16, 0), None);
+        let (ia, ib) = (ProfileId::new("default"), ProfileId::new("work"));
+        let (va, vb) = (view(&ia, &a, false), view(&ib, &b, true));
+        let fresh = Freshness {
+            age: Duration::zero(),
+            stale: false,
+        };
+        let accounts = account_rows(&[&va, &vb], now, fresh);
+        assert_eq!(accounts[0].rows.len(), 2, "7d all and Fable");
+        assert_eq!(accounts[1].rows.len(), 1);
+        assert!(
+            !accounts[0].stale && accounts[1].stale,
+            "a failed poll mutes"
+        );
+        let c = week_series_chart(&accounts, now, palette).unwrap();
+        assert_eq!((c.start, c.end), (t(7, 0), t(16, 0)));
+        assert_eq!(c.end_marks.len(), 2);
+        assert_eq!(
+            c.series[0].overlay,
+            Overlay::Line {
+                color: va.color,
+                dashed: true
+            }
+        );
+        assert_eq!(c.series[1].overlay, Overlay::None);
+        assert!(c.series[1].dimmed);
+        assert!(c.series[0].points.iter().all(|p| p.overlay == Some(30.0)));
+        assert!(c.series[1].points.iter().all(|p| p.overlay.is_none()));
+        // Each projection stays within its own account's window.
+        for (s, end) in c.series.iter().zip([a.week_end, b.week_end]) {
+            for l in &s.lines {
+                assert!(l.projection.is_none_or(|p| p.end_t <= end));
+            }
+        }
+        let legend: Vec<_> = c
+            .legend
+            .iter()
+            .map(|e| (e.label.as_str(), e.dashed))
+            .collect();
+        assert_eq!(
+            legend,
+            [("default", false), ("work", false), ("Fable", true)]
+        );
+    }
+
+    #[test]
+    fn one_account_week_chart_keeps_the_fable_clay_line() {
+        let now = t(12, 12);
+        let palette = &crate::ui::theme::DARK;
+        let d = week_dash(now, 40.0, t(14, 0), Some(30.0));
+        let fresh = Freshness {
+            age: Duration::zero(),
+            stale: false,
+        };
+        let c = week_chart(&d, now, palette, &outlooks(&d, fresh));
+        let s = &c.series[0];
+        assert_eq!(
+            s.overlay,
+            Overlay::Line {
+                color: palette.fable,
+                dashed: false
+            }
+        );
+        let state = palette.level(analytics::color_for(Some(40.0)));
+        assert_eq!((s.color, s.area), (state, AreaStyle::State(state)));
+        assert!(c.legend.is_empty() && c.end_marks.is_empty());
+    }
+
+    #[test]
+    fn each_account_ages_and_mutes_by_its_own_snapshot() {
+        let fresh = Freshness {
+            age: Duration::minutes(30),
+            stale: true,
+        };
+        let f = freshness_of(fresh, Duration::minutes(40), false);
+        assert_eq!(f.age, Duration::minutes(40));
+        assert!(f.stale, "older than a stale primary");
+        assert!(!freshness_of(fresh, Duration::minutes(2), false).stale);
+        assert!(
+            freshness_of(fresh, Duration::minutes(2), true).stale,
+            "poll failed"
+        );
+        let ok = Freshness {
+            stale: false,
+            ..fresh
+        };
+        assert!(!freshness_of(ok, Duration::minutes(40), false).stale);
     }
 
     #[test]
