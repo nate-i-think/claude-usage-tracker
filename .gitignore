@@ -9,7 +9,6 @@
 # but if anyone accidentally creates these in the repo, ignore them.
 history.jsonl
 latest.json
-anonymous_id
 
 # OS clutter
 Thumbs.db

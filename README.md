@@ -1,6 +1,8 @@
 # claude-usage-monitor
 
-A small desktop widget that shows your `claude.ai` plan usage in real time. It polls the same `/api/organizations/{org}/usage` endpoint that powers the official settings page, so the numbers you see are the ones Anthropic uses to enforce your caps, across Claude Code, Cowork, web chat, and any other surface that draws from the same pool.
+A small desktop widget that shows your Claude plan usage in real time, for every Claude Code account on the machine at once. It signs in with the OAuth token Claude Code already keeps and polls the usage endpoint behind Claude Code's `/usage` (`https://api.anthropic.com/api/oauth/usage`), so the numbers you see are the ones Anthropic uses to enforce your caps, across Claude Code, Cowork, web chat, and any other surface that draws from the same pool.
+
+Each Claude Code config directory (`~/.claude`, and any `~/.claude-*` you use with `CLAUDE_CONFIG_DIR`) is a **profile**. The app finds them on its own and polls all of them together; see [Accounts](#accounts-claude-code-profiles).
 
 Written in Rust with [egui](https://github.com/emilk/egui). It ships two binaries: `claude-usage` (the GUI) and `claude-usage-cli` (a one-shot text report, a diagnostic dump, and an MCP server so Claude can check its own usage).
 
@@ -8,7 +10,7 @@ Written in Rust with [egui](https://github.com/emilk/egui). It ships two binarie
 
 ## What it shows
 
-The window opens at 420x760 (minimum 360x320) in a warm dark theme. From top to bottom:
+The window opens at 420x760 (minimum 360x320) in a warm dark theme. With one account it looks as below; with several, see [Several accounts](#several-accounts). From top to bottom:
 
 - **Stat chips**: one chip each for the 5-hour window, the 7-day window (all models), and Fable when the API reports it. Each shows the utilization (rounded down, so 99.6% never reads as the cap) in its state color: green below 50%, yellow from 50%, orange from 75%, red from 90%. Next to it is the **pace**: utilization minus the share of the window that has elapsed, so `▲+6` means you are 6 points ahead of an even burn that would land exactly at 100% at the reset, and `▼-4` means 4 points behind. The delta is muted unless it is 10 points or more either way (ahead in amber, behind in green). Hover a chip for the reset time and the pace in words. To the right are three buttons: refresh now (⟳, rests 5 s after a click), pill mode (◱), and Settings (⚙).
 - **5-hour window** (the hero timeline, titled with the window's span, "6:10p – 11:10p"): the current 5-hour window, from its start to the reset, on a 0–100% scale.
@@ -32,9 +34,10 @@ The window opens at 420x760 (minimum 360x320) in a warm dark theme. From top to 
 - **Details** (click to expand; it stays open or closed across restarts):
   - The other usage windows (per-model caps beyond Fable). Windows at 0% are hidden unless "Show all buckets" is on.
   - The ALL and FABLE burn lines in full, and the projected-use advice ("safe to spin up another agent").
-  - **Top burners**: the projects using the most tokens in the current 5-hour window, attributed from local Claude Code (`~/.claude/projects/`) and Cowork (`%APPDATA%\Claude\local-agent-mode-sessions\`) session logs. A project is named after the last folder of the working directory recorded in its session log.
-  - The plan label and how long ago the last poll was.
-- **Errors**: a failed poll shows a banner above the last good data, which stays visible. A `permission_error` from the API adds a hint that the client SHA may be stale, with a button to open Settings.
+  - The week's usage by surface (Claude Code, Cowork, chat, ...), when the API reports the breakdown.
+  - **Top burners**: the projects using the most tokens in the current 5-hour window, attributed from the profile's local Claude Code session logs (`<config dir>/projects/`) and Cowork's (`~/Library/Application Support/Claude/local-agent-mode-sessions/` on macOS, `%APPDATA%\Claude\local-agent-mode-sessions\` on Windows). Cowork files its sessions under the account's id, so they count for the profile signed in to that account (sessions of no known account count for the default profile). A project is named after the last folder of the working directory recorded in its session log.
+  - The plan label, how long the account's token is still valid, and how long ago the last poll was.
+- **Errors**: a failed poll shows a banner above the last good data, which stays visible: "work — token expired" with the fix underneath ("token expired — run Claude Code in ~/.claude to refresh"). That account's data is dimmed with a "stale" badge until a poll succeeds again; hover the badge for the error. See [Accounts](#accounts-claude-code-profiles).
 
 Numbers and bars glide to their new values on each poll, and the projection draws itself in. When the 5-hour window reaches 90%, its chip breathes three times and then holds a red outline and glow; it re-arms once usage drops below 88% or a new window starts.
 
@@ -46,11 +49,24 @@ The theme is dark by default, and a light "cream" theme is built in:
 
 Switch between them (or follow the system) with **Theme** in [Settings](#settings).
 
+### Several accounts
+
+With two or more profiles polled, everything above shows all of them at once, in the order set in Settings → Accounts, each in its own series color (blue, violet, teal, ...; also chosen there):
+
+- **Chips** are grouped per account: a colored dot and the account's label over its 5-hour, 7-day and Fable chips. The chips keep their state colors, so the account color and the level never compete. Only the 5-hour chip of the account nearest its cap pulses.
+- **Both timelines** overlay the accounts over the union of their windows: each account's line in its color with a light tint under it, a legend in the card's title row, and each account's reset as a colored mark on the time axis. Hover lists every account's value at that moment. The 5-hour Fable share layer is left out; on the 7-day chart each account's Fable line is dashed in its color. The burn and weekly projection rows are grouped under each account's name.
+- **Details** has one section per account.
+- An account whose last poll failed keeps its last good data, dimmed and badged "stale".
+
+Labels default to the email's local part (at most 16 characters) or, without one, the config directory's name; rename them in Settings → Accounts.
+
 ## Pill mode
 
 ![Pill mode](docs/screenshot-pill.png)
 
 A compact 300x44 always-on-top bar for parking in a screen corner: a ring and the 5-hour percentage, the time to reset ("5h · 3h55m", or "5h · 10m" under an hour; "5h · idle" between windows), the pace, and a state dot. The dot is hollow while polls fail or before the first data, and pulses at 90% like the chip.
+
+With two or more accounts the pill widens to one segment per account, split by a hairline: a ring in the account's color, its 5-hour % in the state color, and the countdown (no pace, to keep it compact). The ring of the account nearest its cap breathes at 90%; a stale account's segment is dimmed.
 
 - **Enter** it with the ◱ button in the header, or the tray menu's **Pill mode**. Settings → **Start in pill mode** opens the app as the pill every time.
 - **Leave** it with a click on the pill; the full window comes back at its old place and size (maximized, if it was).
@@ -58,9 +74,16 @@ A compact 300x44 always-on-top bar for parking in a screen corner: a ring and th
 - **Right-click** swaps the pill's content for a row of actions: Expand, Refresh, Settings, Quit. Esc, a click on the background, or clicking another window closes the row.
 - **Hover** for a two-line summary: the 5-hour window with its pace and reset, then the 7-day and Fable figures (or "Last poll failed").
 
-## Tray icon
+## Menu bar (macOS) and tray icon (Windows)
 
-With **Show tray icon** on (the default), the notification area shows a rounded square with the 5-hour percentage in two digits ("08", "46"), colored by state; "!!" means 100% or more and "–" means no data yet. Its tooltip reads "Claude usage · 5h 46% · resets 3:42 PM" (no reset between windows), plus "last poll failed" while polls fail. The icon keeps updating while the window is hidden.
+**macOS.** With **Show menu-bar item** on (the default), the menu bar shows every account's 5-hour percentage as text, in account order: "46 · 12" ("–" for an account with no figure yet). It keeps updating while the window is hidden.
+
+- **Click** it for the menu: Show / Hide, Pill mode (checked while in the pill), Refresh now, and Quit.
+- **Close to menu bar**: while the item is on and **Close button hides to menu bar** is ticked (the default), the window's red close button hides the window instead of quitting. Polling and the menu-bar figures keep running.
+- **Bring it back** with Show in the menu, or by reopening the app: click its Dock icon, switch to it with Cmd+Tab, or launch it again.
+- **To quit**, use **Quit** in the menu or in the pill's right-click row, or untick **Close button hides to menu bar** and close the window.
+
+**Windows.** With **Show tray icon** on (the default), the notification area shows a rounded square with a 5-hour percentage in two digits ("08", "46"), colored by state; "!!" means 100% or more and "–" means no data yet. With several accounts it shows the account with the most headroom (the lowest 5-hour %), so it tells you whether there is an account left to work in. Its tooltip reads "Claude usage · 5h 46% · resets 3:42 PM" (no reset between windows), plus "last poll failed" while polls fail; with several accounts, "Claude usage" and then a line per account ("work 46% · resets 3:42 PM", marked "stale" when its last poll failed). The icon keeps updating while the window is hidden.
 
 - **Left-click** hides the window or brings it back.
 - **Right-click** opens the menu: Show / Hide, Pill mode (checked while in the pill), Refresh now, and Quit.
@@ -69,13 +92,13 @@ With **Show tray icon** on (the default), the notification area shows a rounded 
 
 ## Alerts
 
-The app sends a Windows notification when the 5-hour window:
+On Windows, the app sends a notification when an account's 5-hour window:
 
 - reaches 75%,
 - reaches 90%,
 - is projected to hit the cap before the reset, at least 10 minutes ahead.
 
-Each alert fires at most once per 5-hour window, including across restarts. Each has its own toggle in Settings → Alerts, and **Send test notification** there shows a sample right away.
+Every account is checked on its own, and each alert fires at most once per account per 5-hour window, including across restarts. With several accounts the title names the account ("work — 5-hour usage at 80%"). Each alert has its own toggle in Settings → Alerts, and **Send test notification** there shows a sample right away.
 
 Notifications appear under the name **Claude Usage Monitor** with a coral "%" icon, in the notification banner and in the notification center. With Windows' **Do not disturb** on, they go to the notification center without a banner. To make the toasts carry that name, the app registers itself under an explicit AppUserModelID (see [Privacy & security](#privacy--security)). That ID also groups the taskbar button, so if you pinned `claude-usage.exe` to the taskbar before this version, the old pin may not group with the running window: unpin it and pin the running window again.
 
@@ -90,15 +113,20 @@ Open Settings with ⚙. Changes take effect on **Apply**, except **Always on top
 - **Show all buckets**: list usage windows at 0% in Details too.
 - **Always on top**: keep the full window above other windows. (The pill is always on top.)
 - **Theme**: **System**, **Dark** (the default) or **Light**.
-- **Cookie file**: an explicit `cookies.sqlite`; blank means auto-detect (see [Signing in](#signing-in)).
-- **Client SHA**: see [Refreshing the client SHA](#refreshing-the-client-sha). Settings shows which source is in use.
-- **Window**: **Show tray icon**; **Close button hides to tray** (needs the tray icon); **Start in pill mode**.
-- **Alerts**: **5-hour window reaches 75%**; **5-hour window reaches 90%**; **Projected to hit the cap before reset**; **Send test notification**.
+- **Accounts**: one card per profile, in display (and poll) order:
+  - the account **color** (six swatches), **Enabled** (unticked: not polled or shown), and ▲ / ▼ to reorder;
+  - the **label** (blank: from the account's email);
+  - the config directory, the Keychain service it reads, and a status line ("me@example.com · token valid 3h", or the last error in red, with the full message on hover);
+  - **Advanced → Keychain service override**, for a credential stored under a service name the app does not derive (blank: derived from the folder).
+
+  Under the cards, **Add folder** adds a config directory by hand (for one outside `~/.claude-*`; such a card has **Forget** to remove it), and **Rescan** looks for new folders now. Discovered profiles appear on their own; to drop one for good, untick **Enabled** (it would otherwise be rediscovered).
+- **Window**: **Show menu-bar item** / **Show tray icon**; **Close button hides to menu bar** / **to tray** (needs the item or icon); **Start in pill mode**.
+- **Alerts** (Windows only; elsewhere they have no effect): **5-hour window reaches 75%**; **5-hour window reaches 90%**; **Projected to hit the cap before reset**; **Send test notification**.
 - **Motion**: **Reduce motion** (values snap instead of gliding, and the near-cap chip holds steady instead of pulsing); **Keep pulsing near cap** (the chip and pill dot keep breathing for as long as the 5-hour window is at 90% or more, instead of three breaths. It repaints about 10 times a second, which costs a few percent of a CPU core while it lasts: about 9% of one core in testing at an earlier 15 times a second, against about 2.5% when idle).
 
 ## Install
 
-You need a Rust toolchain ([rustup](https://rustup.rs)). The project is built and tested with Rust 1.96 on Windows; other platforms should build but are untested.
+You need a Rust toolchain ([rustup](https://rustup.rs)). The project is built with Rust 1.96 or later and runs on macOS and Windows; Linux builds (without the tray, alerts and rounded pill corners) but is untested.
 
 ```bash
 git clone <this repo>
@@ -106,7 +134,7 @@ cd claude-usage-monitor
 cargo build --release
 ```
 
-The binaries land in `target/release/`: `claude-usage.exe` (GUI) and `claude-usage-cli.exe` (CLI). If you have [just](https://github.com/casey/just), the justfile wraps the common commands:
+The binaries land in `target/release/`: `claude-usage` (GUI) and `claude-usage-cli` (CLI), with `.exe` on Windows. If you have [just](https://github.com/casey/just), the justfile wraps the common commands:
 
 ```bash
 just start        # build (release) and run the GUI; `just run` is an alias
@@ -116,66 +144,87 @@ just test         # cargo test
 just lint         # cargo clippy --all-targets -- -D warnings
 ```
 
-`just start` runs from the repo root, so it picks up the repo's `client_sha.txt` (see [Refreshing the client SHA](#refreshing-the-client-sha)). If you copy `claude-usage.exe` somewhere else, or launch it from a shortcut whose "Start in" folder is not the repo root, copy `client_sha.txt` next to the exe or paste the SHA into Settings.
+Before the first run, sign in to Claude Code (next section).
 
-Before the first run, sign in (next section) and make sure a current client SHA is available (the section after).
+## Accounts (Claude Code profiles)
 
-## Signing in
+The app has no login of its own: it uses Claude Code's. Run `claude` and sign in with `/login` (a Pro or Max subscription), and the app picks the account up on its next poll.
 
-Sign in to `claude.ai` in a Firefox-family browser: **Firefox, Zen, LibreWolf, Floorp, or Waterfox**. The app reads your session cookies straight from the browser's `cookies.sqlite` (through a temporary copy, so the browser can stay open) and picks the profile with the freshest `sessionKey`.
+**Which folders count.** A profile is a Claude Code config directory that is signed in:
 
-If your browser keeps its profile somewhere non-standard, point the app at the right `cookies.sqlite`: in the GUI, set **Cookie file** in Settings; on the CLI, pass `--cookie-file PATH`.
+- `~/.claude`, the default (its account is in `~/.claude.json`), and
+- every `~/.claude-*` directory whose own `.claude.json` has a signed-in account (`oauthAccount`), such as `~/.claude-work` used with `CLAUDE_CONFIG_DIR=~/.claude-work claude`. A `~/.claude-*` folder without one (a sync folder, say) is skipped.
 
-Chrome, Edge, Brave, and Safari are not supported (see [Changes from the Python version](#changes-from-the-python-version)).
+Folders signed in to the same account count once (the first wins). The app looks again on every poll, so a new folder appears without a restart; **Rescan** in Settings looks right away, and **Add folder** takes a directory elsewhere. A profile's id is the folder's name without the dot (`~/.claude-work` → `claude-work`; `~/.claude` → `default`).
 
-## Refreshing the client SHA
+To add a second account:
 
-Anthropic ships a new web-client build every couple of weeks, and the build hash (the `anthropic-client-sha` request header) rotates with it. When the hash goes stale, the API returns `permission_error` even with a valid session, and the GUI shows a "client SHA may be stale" hint.
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-work claude   # then /login with the other account
+```
 
-To get the current value:
+**Where the token comes from.**
 
-1. Open `claude.ai/settings/usage` in your browser.
-2. Open DevTools (F12) → **Network** tab → filter by **Fetch/XHR**.
-3. Reload the page.
-4. Find the request to `/api/organizations/.../usage`.
-5. In the **Headers** tab, copy the value of the `anthropic-client-sha` header.
+- **macOS**: the login Keychain, where Claude Code keeps it, read with `/usr/bin/security find-generic-password`. The default profile's item is `Claude Code-credentials`; another folder's is `Claude Code-credentials-<8 hex>`, the first 8 hex digits of the SHA-256 of the exact `CLAUDE_CONFIG_DIR` value (for example `/Users/me/.claude-work`). If the Keychain has no item, the app falls back to `<config dir>/.credentials.json`.
+- **Windows and Linux**: `<config dir>/.credentials.json`.
 
-Then put it in one of these places. The app uses the first one that has a value:
+**The Keychain prompt (macOS).** The first time the app reads a profile's item, macOS asks whether `security` may access "Claude Code-credentials…". Click **Always Allow**: plain **Allow** works too, but asks again the next time the app re-reads the token (when it expires or Claude Code rotates it). There is one item, so one prompt, per profile. While a prompt is waiting, only that profile's poll waits; the others keep going. A denied or failed read shows as "not signed in", with the reason.
 
-1. The `CLAUDE_USAGE_TUI_CLIENT_SHA` environment variable.
-2. The **Client SHA** field in the GUI's Settings (GUI only; values shorter than 8 characters are ignored). Settings shows which source is in use.
-3. `client_sha.txt` next to the executable.
-4. `client_sha.txt` in the current working directory.
+**Read-only tokens.** The app never refreshes, rotates or writes a credential; that is Claude Code's job, and doing it here could sign Claude Code out. Claude Code's access tokens last a few hours and are refreshed whenever Claude Code runs. So:
 
-The repo ships a `client_sha.txt` at its root. A binary in `target/release/` finds it only through rule 4, that is, when you launch it from the repo root (as `just start` and `cargo run` do). If you run the binary from anywhere else, copy `client_sha.txt` next to the `.exe`, paste the SHA into Settings, or set the environment variable.
+- When a profile's token has expired, the app makes no request and shows "token expired — run Claude Code in ~/.claude-work to refresh". Start `claude` in that profile (`CLAUDE_CONFIG_DIR=~/.claude-work claude`) for a moment, and the next poll picks the new token up. Meanwhile the last good data stays on screen, marked stale.
+- If the API rejects a token (401), the app reads the credential again once; if Claude Code has stored a newer one, it retries with it, otherwise it shows the same message.
+- Settings → Accounts shows how long each token is still valid.
+
+A rate limit (429) pauses that profile's polling for the `Retry-After` time, or two poll intervals without one.
 
 ## CLI
 
 ```bash
-claude-usage-cli once                      # fetch once, record it, print a text report
-claude-usage-cli once --plan "Max 5x"      # plan label in the title (default "Max")
-claude-usage-cli once --show-all           # include 0% windows
-claude-usage-cli once --cookie-file PATH   # explicit cookies.sqlite
-claude-usage-cli debug                     # diagnose cookies, client SHA, and the endpoint
-claude-usage-cli debug --cookie-file PATH
-claude-usage-cli mcp                       # MCP server on stdio (see below)
+claude-usage-cli once                       # poll every enabled profile, record it, print a text report per profile
+claude-usage-cli once --profile work        # only one profile (its id, label or config dir)
+claude-usage-cli once --plan "Max 5x"       # plan label in the titles (default: the GUI's setting)
+claude-usage-cli once --show-all            # include 0% windows
+claude-usage-cli debug                      # diagnose every profile's folder, credential and endpoint
+claude-usage-cli debug --profile work
+claude-usage-cli mcp                        # MCP server on stdio (see below)
 ```
 
-`once` goes through the same code path as the GUI's poller: it appends to `history.jsonl` and rewrites `latest.json`, so it also refreshes the data the MCP server reports. It exits non-zero on failure.
+`once` prints one section per profile:
 
-The CLI does **not** read the GUI's saved settings. It takes the cookie file from `--cookie-file` (or auto-detects it) and the client SHA from the environment variable or a `client_sha.txt` (rules 1, 3, and 4 above).
+```
+── me (default, me@example.com) ──
+Claude usage  ·  Max
+
+5-hour           13.0%  resets in 1h 49m
+7-day all        11.0%  resets in 5d 9h
+...
+
+── work (claude-work, me@work.example) ──
+Claude usage  ·  Max
+...
+```
+
+It goes through the same code path as the GUI's poller: it appends to each profile's `history.jsonl` and rewrites its `latest.json`, so it also refreshes the data the MCP server reports. It reads the GUI's saved settings (which profiles are disabled, labels, Keychain overrides, the plan label) and exits non-zero if any profile failed; an unknown `--profile` lists the valid ids and exits with 2.
+
+`debug` prints a table with one row per profile (id, config dir, Keychain service, whether the credential is present, when it expires, email, account id, the newest session log, and the HTTP status of one request to the usage endpoint), then one recommendation per profile ("OK", or what to run, such as ``token expired or rejected — run `CLAUDE_CONFIG_DIR=/Users/me/.claude-work claude` once so Claude Code refreshes it``). It never prints a token. On macOS it reads the Keychain, so it can bring up the Keychain prompt.
 
 The poll interval is a GUI setting (Settings → Poll interval, default 60 s, minimum 5 s). It accepts plain seconds or a suffix: `30`, `30s`, `2m`, `1h`.
 
 ## MCP server (let Claude check its own usage)
 
-`claude-usage-cli mcp` is an [MCP](https://modelcontextprotocol.io) server on stdio that lets a Claude instance (Claude Code, Claude Desktop, …) read your current usage and throttle itself when you're near a cap. It does **no** network or auth of its own. It reports what the stats were at the most recent poll, read from `latest.json`, so **the GUI must be running** (or something must run `claude-usage-cli once` regularly) to keep the data fresh.
+`claude-usage-cli mcp` is an [MCP](https://modelcontextprotocol.io) server on stdio that lets a Claude instance (Claude Code, Claude Desktop, …) read your current usage and throttle itself when you're near a cap. It does **no** network or auth of its own. It reports what the stats were at the most recent poll, read from each profile's `latest.json`, so **the GUI must be running** (or something must run `claude-usage-cli once` regularly) to keep the data fresh.
 
 Tools:
 
-- **`get_usage()`**: non-blocking. Returns each window's utilization, reset time, and time to reset, plus the data's age, a `stale` flag (true if the monitor isn't updating), the extra-usage block, and a `recommendation`/`summary`.
-- **`wait(seconds, confirm)`**: throttle by sleeping. It blocks for at most ~50 s per call, then returns how much time remains until the 5-hour reset and whether to call again, so a long wait is done as several short cycles. Call with `confirm=false` first to preview (nothing sleeps); `confirm=true` waits one cycle. Loop until `done` is true.
+- **`get_usage()`**: non-blocking. Leads with the **calling profile** (the account this Claude Code session runs under, see below): each window's utilization, reset time, and time to reset, plus the data's age, a `stale` flag (true if the monitor isn't updating), the extra-usage block, the week's per-surface breakdown, and a `recommendation`/`summary`. Then:
+  - `profile`: which profile the top-level fields describe, `{"id", "label", "email", "config_dir"}`;
+  - `other_profiles`: every other known profile, each with its own `profile` and the same fields;
+  - `profile_note`: only when the server's `CLAUDE_CONFIG_DIR` matches no known profile; it says so, and the top-level fields are the default profile's.
+- **`wait(seconds, confirm)`**: throttle by sleeping. It blocks for at most ~50 s per call, then returns how much time remains until the calling profile's 5-hour reset and whether to call again, so a long wait is done as several short cycles. Call with `confirm=false` first to preview (nothing sleeps); `confirm=true` waits one cycle. Loop until `done` is true.
 - **`wait_test(seconds)`**: diagnostic only. Blocks for the full requested duration (up to a 600 s ceiling) and reports how long it actually slept, so you can find your client's real tool-call timeout. If it returns, the limit is at least that long; if the client kills it first, you've found the ceiling. Then set `CLAUDE_USAGE_MCP_MAX_BLOCK` just under it.
+
+**The calling profile.** Claude Code passes its environment to the MCP servers it starts, so the server sees the session's `CLAUDE_CONFIG_DIR`. The server matches it against the profiles the monitor knows (from `profiles.json`; trailing `/` ignored, `~` expanded, symlinks resolved); unset means the default profile. An agent in `CLAUDE_CONFIG_DIR=~/.claude-work claude` therefore gets the work account's usage first, and can see in `other_profiles` whether another account has headroom.
 
 Why the short cycles: most MCP clients inherit a ~60 s request timeout (Claude Desktop hard-codes it and silently drops later results), so a single multi-minute block would be killed. Bounded cycling is timeout-proof and never traps the agent.
 
@@ -184,8 +233,10 @@ Why the short cycles: most MCP clients inherit a ~60 s request timeout (Claude D
 **Claude Code (recommended).** Register the binary by absolute path so it works from any directory:
 
 ```bash
-claude mcp add --scope user claude-usage -- "C:\absolute\path\to\claude-usage-monitor\target\release\claude-usage-cli.exe" mcp
+claude mcp add --scope user claude-usage -- /absolute/path/to/claude-usage-monitor/target/release/claude-usage-cli mcp
 ```
+
+On Windows the path is `C:\absolute\path\to\claude-usage-monitor\target\release\claude-usage-cli.exe`. A user-scope server is stored in the profile's own config, so register it once per profile you use: `CLAUDE_CONFIG_DIR=~/.claude-work claude mcp add --scope user claude-usage -- ...`.
 
 **Claude Code, project scope.** The repo ships a `.mcp.json` that runs `target/release/claude-usage-cli mcp`. The path is relative, so it works only after `cargo build --release` and only when Claude Code runs from the repo root; started from a subdirectory, the server fails to launch. Approve the `claude-usage` server when asked and check it with `/mcp`.
 
@@ -216,33 +267,45 @@ A value that isn't a whole number does not stop the server: it falls back to the
 
 ## Recommended layout
 
-Snap the window to a corner of your screen and turn on **Always on top** in Settings, or switch to [pill mode](#pill-mode), which always stays on top. With close to tray on, the ✕ button tucks it away and the tray icon keeps showing the 5-hour percentage. Pair it with [`claude-monitor`](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) for a complete picture: `claude-monitor` shows local per-instance attribution from Claude Code logs; this widget shows the unified server-side meter that's actually about to gate you.
+Snap the window to a corner of your screen and turn on **Always on top** in Settings, or switch to [pill mode](#pill-mode), which always stays on top. With close to the menu bar (or tray) on, the close button tucks it away and the menu bar (or tray icon) keeps showing the 5-hour percentage. Pair it with [`claude-monitor`](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) for a complete picture: `claude-monitor` shows local per-instance attribution from Claude Code logs; this widget shows the unified server-side meter that's actually about to gate you.
 
 ## When it breaks
 
-Run `claude-usage-cli debug` first. It lists every browser profile it found with its `sessionKey` freshness, the cookies in the selected profile with their expiry status (values masked), where the client SHA came from, the response to one request with a sniff of the body, and a recommendation. You can probably have Claude Code fix things if you feed it this output.
+Run `claude-usage-cli debug` first. It shows every profile it found with its config dir, Keychain service, credential and token expiry, account, newest session log and the result of one request to the usage endpoint, then what to do for each (see [CLI](#cli)). You can probably have Claude Code fix things if you feed it this output; it contains no tokens.
 
 Common failure modes:
 
-- **`permission_error` / "Invalid authorization"**: most likely your `sessionKey` is stale (sign out of `claude.ai` and back in) or the wrong browser profile was picked (check the profiles table, or set the cookie file explicitly). Less commonly the client SHA has gone stale; refresh it.
-- **403 with an HTML body**: Cloudflare is blocking the request. Visit `claude.ai/settings/usage` in your browser to refresh the `__cf_bm` cookie, then retry.
-- **"No browser profile found"**: sign in to `claude.ai` in a supported Firefox-family browser, or set the cookie file explicitly.
-- **`__cf_bm` missing or expired**: visit `claude.ai/settings/usage` in your browser within 30 minutes before polling.
-- **"poller stopped — restart the app"** in the GUI: the background poller exited unexpectedly. Restart the app.
+- **"token expired — run Claude Code in ~/.claude-work to refresh"**: the profile's access token has run out (or the API rejected it) and the app does not refresh tokens. Run `claude` in that profile (`CLAUDE_CONFIG_DIR=~/.claude-work claude`; plain `claude` for `~/.claude`) and the next poll recovers.
+- **"no Claude Code login found in ~/.claude-work — run `claude` and sign in"**: no credential in the Keychain item or `.credentials.json`. Sign in with `/login` in that profile. On macOS the reason in parentheses may also say the Keychain read was denied or failed: allow it at the next prompt (choose **Always Allow**), or check that the item exists in Keychain Access (search "Claude Code-credentials").
+- **A profile is missing**: its folder has no `.claude.json` with a signed-in account yet (sign in there), or it is outside `~/.claude-*` (use **Add folder** in Settings → Accounts), or it was disabled (tick **Enabled** again).
+- **The Keychain prompt keeps coming back**: it was answered with **Allow** rather than **Always Allow**; answer **Always Allow** once.
+- **"rate limited"**: the usage endpoint answered 429. That profile waits as told (or two poll intervals) and tries again; raise the poll interval if it keeps happening.
+- **"poller stopped"** in the GUI: the background poller exited unexpectedly. Restart the app.
 - **The GUI closed or showed a "crashed" message box**: the details are in `crash.log` in the [data directory](#privacy--security), with a backtrace for a panic. Panics the poller recovers from are logged there too, without a message box. If the tray icon or the notification registration fails, the reason is logged there as well, as a plain entry without a backtrace.
-- **The window seems gone**: with close to tray on, ✕ only hides it. Left-click the tray icon (it may be in the taskbar's "^" overflow) to bring it back.
+- **The window seems gone**: with close to the menu bar or tray on, closing only hides it. On macOS click the Dock icon or use Show in the menu-bar item; on Windows left-click the tray icon (it may be in the taskbar's "^" overflow).
 
 ## Privacy & security
 
-The app reads session cookies from your browser's local cookie store. They include your `sessionKey`, which is effectively a password for your `claude.ai` account. The app never writes the cookies anywhere except a temporary copy of the cookie database (deleted after reading), never logs them, and never sends them anywhere except `claude.ai`. `debug` masks cookie values.
+The app reads Claude Code's OAuth access token for each profile, which is effectively a password for that account. It sends it only to `api.anthropic.com`, as the `Authorization` header of the usage request; it never writes it to disk, logs it, shows it, or puts it in an error message, and it does not keep the refresh token at all. It never refreshes, rotates or changes the stored credential. `debug` prints no token.
 
 A small amount of state is kept locally in the app's data directory:
 
-- `history.jsonl`: usage snapshots (percentages and timestamps; no conversation content). Used for the charts and the burn rate.
-- `latest.json`: the most recent full snapshot (every window's utilization and reset time, and the extra-usage block). Read by the MCP server.
-- `anonymous_id`: a random UUID generated per install, sent as a telemetry header to `claude.ai`, as the web client does. Nothing ties one install to another.
-- `crash.log` (GUI): panics (with a backtrace), startup failures, and tray icon or notification registration failures, each with a timestamp.
-- `app-icon.png` (GUI, Windows): the coral "%" icon that notifications show, rewritten only when it changes.
+```
+claude_usage_tui/
+├── profiles.json                 the known profiles: id, label, color, config dir, email, account id (no tokens). Read by the MCP server.
+├── profiles/
+│   ├── default/
+│   │   ├── history.jsonl         usage snapshots (percentages and timestamps; no conversation content), for the charts and the burn rate
+│   │   └── latest.json           the most recent full snapshot (every window's utilization and reset time, the extra-usage block, the weekly breakdown). Read by the MCP server.
+│   ├── claude-work/              the same, per profile
+│   └── .legacy-migrated          marks the one-time migration below as done
+├── history.jsonl, latest.json    from versions before profiles; left in place, no longer written
+├── crash.log                     (GUI) panics (with a backtrace), startup failures, and tray icon or notification registration failures, each with a timestamp
+└── app-icon.png                  (GUI, Windows) the coral "%" icon that notifications show, rewritten only when it changes
+```
+
+- **Migration**: on its first start, this version copies (not moves) the root `history.jsonl` and `latest.json` into `profiles/default/`, if that profile has none yet, and writes `profiles/.legacy-migrated`. The originals stay where they are and can be deleted once you are happy. An `anonymous_id` file from earlier versions is no longer used and can be deleted too.
+- **Account change**: if a config directory is signed in to a different account than before, its `history.jsonl` is renamed to `history.<first 8 characters of the old account id>.jsonl` and the profile starts a fresh history, so two accounts' usage never mix on one chart.
 
 The data directory is:
 
@@ -252,7 +315,7 @@ The data directory is:
 
 This is the same directory the Python version used with python.org (non-Store) Python, so that history carries over as is. If you ran the Python version with Microsoft Store Python, see [Migrating history from the Python version](#migrating-history-from-the-python-version).
 
-The GUI's settings (everything in the [Settings](#settings) panel, including the cookie file path and client SHA), its window state (full-window and pill positions, size, maximized, current mode, Details open or closed), the per-window alert state, and the theme are stored in eframe's `app.ron`:
+The GUI's settings (everything in the [Settings](#settings) panel, including the Accounts list: each profile's id, config dir, label, color, enabled flag and Keychain override), its window state (full-window and pill positions, size, maximized, current mode, Details open or closed), each profile's alert state, and the theme are stored in eframe's `app.ron`. Settings saved by a version from before profiles still load; their cookie-file and client-SHA entries are ignored and dropped on the next save. `app.ron` lives at:
 
 - Windows: `%APPDATA%\claude-usage\data\app.ron`
 - macOS: `~/Library/Application Support/claude-usage/app.ron`
@@ -264,17 +327,13 @@ On Windows the GUI also creates one per-user registry key, `HKCU\Software\Classe
 
 ## Changes from the Python version
 
-This project used to be a Python terminal dashboard (`claude_usage_tui.py`). The Rust port keeps the same endpoint, numbers, data files, and MCP tools, and drops:
+This project used to be a Python terminal dashboard (`claude_usage_tui.py`). The Rust port keeps the same numbers, history format and MCP tools. It no longer reads `claude.ai` browser cookies (nor needs the web client's build hash): it uses Claude Code's own sign-in and the OAuth usage endpoint, and polls every Claude Code profile instead of one browser session. It also drops `--no-fullscreen`, which only made sense for the terminal UI.
 
-- **Chromium and Safari cookie support.** Only Firefox-family browsers are read now.
-- **The TLS-impersonation profile sweep in debug.** The Python version used `curl_cffi` to mimic browser TLS fingerprints, and `--debug` retried with several profiles. The Rust app uses plain rustls with Firefox-like headers, which Cloudflare currently accepts, and `debug` sends one request.
-- **`--no-fullscreen`**, which only made sense for the terminal UI.
-
-Other differences: `--once` and `--debug` became the `once` and `debug` subcommands of `claude-usage-cli`; the poll interval, plan label, cookie file, and client SHA are set in the GUI's Settings instead of on the command line; and the GUI replaces the terminal's bar charts with the two timelines and the chips described in [What it shows](#what-it-shows).
+Other differences: `--once` and `--debug` became the `once` and `debug` subcommands of `claude-usage-cli`; the poll interval and plan label are set in the GUI's Settings instead of on the command line; and the GUI replaces the terminal's bar charts with the two timelines and the chips described in [What it shows](#what-it-shows).
 
 ### Migrating history from the Python version
 
-With python.org Python, the Python version wrote `history.jsonl` to `%APPDATA%\claude_usage_tui\`, the directory the Rust app uses, so there is nothing to do.
+With python.org Python, the Python version wrote `history.jsonl` to `%APPDATA%\claude_usage_tui\`, the directory the Rust app uses, and the app copies it into the default profile on its first start (see [Privacy & security](#privacy--security)), so there is nothing to do.
 
 Microsoft Store Python virtualizes `%APPDATA%`: the Python version's files actually landed in
 
@@ -282,13 +341,13 @@ Microsoft Store Python virtualizes `%APPDATA%`: the Python version's files actua
 %LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.<version>_<id>\LocalCache\Roaming\claude_usage_tui\
 ```
 
-and the Rust app does not see them. To keep your chart history, merge that `history.jsonl` into `%APPDATA%\claude_usage_tui\history.jsonl`. Both versions use the same one-JSON-object-per-line schema. Close the GUI and any Python monitor first, then run in PowerShell:
+and the Rust app does not see them. To keep your chart history, merge that `history.jsonl` into the default profile's, `%APPDATA%\claude_usage_tui\profiles\default\history.jsonl`. Both versions use the same one-JSON-object-per-line schema. Close the GUI and any Python monitor first, then run in PowerShell:
 
 ```powershell
 # The Store Python file (if you have several Python versions installed, set $old by hand).
 $old = Get-ChildItem "$env:LOCALAPPDATA\Packages\PythonSoftwareFoundation.Python.*\LocalCache\Roaming\claude_usage_tui\history.jsonl" |
     Select-Object -First 1 -ExpandProperty FullName
-$new = "$env:APPDATA\claude_usage_tui\history.jsonl"
+$new = "$env:APPDATA\claude_usage_tui\profiles\default\history.jsonl"
 
 New-Item -ItemType Directory -Force (Split-Path $new) | Out-Null
 if (Test-Path $new) { Copy-Item $new "$new.bak" }   # backup of the destination
@@ -304,11 +363,13 @@ It leaves the Store Python file untouched, and `history.jsonl.bak` holds the pre
 ## Known limitations
 
 - **Clicking a notification** is wired to bring the window forward, but this has not been confirmed on a real banner yet. It may not work from the notification center after the banner is gone, and Windows may show the window without focusing it.
-- **Windows only**: the tray icon, alerts and the rounded pill corners. Other platforms build without them (and are untested in general).
+- **Windows only**: alerts and the rounded pill corners. macOS has the menu-bar item instead of the tray icon; Linux builds without either (and is untested in general).
+- **This version was developed and checked live on macOS.** The Windows build compiles (it is cross-checked, including clippy), but the profile-based version has not yet been run on Windows.
+- **The screenshots** show a single account.
 
 ## Caveats
 
-This app polls an undocumented internal endpoint. Anthropic could change it at any time, and the app would stop working until updated. If Cloudflare starts rejecting non-browser TLS fingerprints, the plain rustls client may need replacing with one that impersonates a browser.
+This app polls an undocumented endpoint (the one Claude Code's `/usage` uses) with Claude Code's own credential. Anthropic could change either at any time, and the app would stop working until updated.
 
 This is a personal tool, not an Anthropic-supported integration. Use accordingly.
 
