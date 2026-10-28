@@ -244,21 +244,129 @@ pub fn pace_color(tone: PaceTone, palette: &Palette) -> Color32 {
     }
 }
 
-/// The accounts' stat chips. For now the first account with data is
-/// drawn, as one account always was (see [`show_chips`]); nothing before
-/// the first poll.
-pub fn show_account_chips(ui: &mut Ui, accounts: &[AccountView], now: DateTime<Utc>, pulse: f32) {
-    if let Some(d) = super::accounts::first_data(accounts) {
-        let chips = chips(&d.snapshot, d.window_start, d.window_end, now);
-        show_chips(ui, &chips, now, pulse);
-    }
+/// One account's chips in the header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChipGroup {
+    /// The account's index in the views.
+    pub account: usize,
+    /// Its chips; empty for an account with only an error.
+    pub chips: Vec<Chip>,
+    /// Draw the account's dot and label (and badge) over its chips: only
+    /// when two or more accounts are shown.
+    pub header: bool,
 }
 
-/// The chips, packed into as many rows as the width needs. Percentages
-/// and their state colors ease to each poll's values; the border and glow
-/// of the chip that [`Chip::pulses`] show `pulse` (a [`motion::Pulse`]
-/// level, 0 = none).
-fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
+/// The header's chip groups, in account order. With two or more accounts
+/// that have data or an error, each gets a group (one with only an error
+/// shows its header and badge alone); otherwise only an account with data
+/// is shown, headerless, as one account always was. Only the 5-hour chip
+/// of the [`accounts::hottest`] account pulses, the one the app's pulse
+/// follows.
+///
+/// [`accounts::hottest`]: super::accounts::hottest
+pub fn chip_groups(views: &[AccountView], now: DateTime<Utc>) -> Vec<ChipGroup> {
+    let hot = super::accounts::hottest(views, now);
+    let shown: Vec<usize> = (0..views.len())
+        .filter(|&i| views[i].data.is_some() || views[i].error.is_some())
+        .collect();
+    let header = shown.len() >= 2;
+    shown
+        .into_iter()
+        .filter(|&i| header || views[i].data.is_some())
+        .map(|i| {
+            let mut chips = views[i]
+                .data
+                .map(|d| chips(&d.snapshot, d.window_start, d.window_end, now))
+                .unwrap_or_default();
+            for c in &mut chips {
+                c.pulses &= hot == Some(i);
+            }
+            ChipGroup {
+                account: i,
+                chips,
+                header,
+            }
+        })
+        .collect()
+}
+
+/// The id of one eased value (`what`: "chip-pct", "chip-color") of an
+/// account's chip, keyed by [`timeline::series_key`] of its profile id.
+///
+/// [`timeline::series_key`]: super::timeline::series_key
+pub fn chip_id(what: &'static str, key: u64, label: &str) -> Id {
+    Id::new((what, key, label))
+}
+
+/// The badge after an account's label: "stale" over old data, else the
+/// error in brief; with the full error message as its hover text. `None`
+/// for a fresh account.
+pub fn badge(view: &AccountView) -> Option<(&'static str, String)> {
+    let error = view.error?;
+    let text = if view.data.is_some() {
+        "stale"
+    } else {
+        super::accounts::short_error(error.kind)
+    };
+    Some((text, error.message.clone()))
+}
+
+/// The accounts' stat chips (see [`chip_groups`]): each account's dot,
+/// label and badge over its chips when several are shown, a stale one
+/// dimmed; nothing before the first poll.
+pub fn show_account_chips(ui: &mut Ui, accounts: &[AccountView], now: DateTime<Utc>, pulse: f32) {
+    let groups = chip_groups(accounts, now);
+    if groups.is_empty() {
+        return;
+    }
+    let palette = Palette::for_visuals(ui.visuals());
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+        for g in &groups {
+            let view = &accounts[g.account];
+            let key = super::timeline::series_key(view.id);
+            ui.vertical(|ui| {
+                if g.header {
+                    if view.stale {
+                        ui.multiply_opacity(super::timeline::DIM_ALPHA);
+                    }
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    group_header(ui, palette, view);
+                }
+                if !g.chips.is_empty() {
+                    show_chips(ui, key, &g.chips, now, pulse);
+                }
+            });
+        }
+    });
+}
+
+/// An account's dot and name over its chips, and its [`badge`].
+fn group_header(ui: &mut Ui, palette: &Palette, view: &AccountView) {
+    use eframe::egui::{CornerRadius, Frame, Margin, RichText};
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new("●").small().color(view.color));
+        ui.label(RichText::new(view.label).small().color(palette.text_muted));
+        if let Some((text, hover)) = badge(view) {
+            Frame::NONE
+                .stroke(Stroke::new(1.0, palette.border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(4, 0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(text).small().color(palette.text_muted))
+                })
+                .response
+                .on_hover_text(hover);
+        }
+    });
+}
+
+/// One account's chips (ids keyed by `key`), packed into as many rows as
+/// the width needs. Percentages and their state colors ease to each poll's
+/// values; the border and glow of the chip that [`Chip::pulses`] show
+/// `pulse` (a [`motion::Pulse`] level, 0 = none).
+fn show_chips(ui: &mut Ui, key: u64, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
     let palette = Palette::for_visuals(ui.visuals());
     let ctx = ui.ctx().clone();
     let shown: Vec<(Option<f64>, Color32)> = chips
@@ -267,8 +375,8 @@ fn show_chips(ui: &mut Ui, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
             let color = palette.level(analytics::color_for(c.pct));
             (
                 c.pct
-                    .map(|p| motion::eased(&ctx, Id::new(("chip-pct", c.label)), p)),
-                motion::eased(&ctx, Id::new(("chip-color", c.label)), color),
+                    .map(|p| motion::eased(&ctx, chip_id("chip-pct", key, c.label), p)),
+                motion::eased(&ctx, chip_id("chip-color", key, c.label), color),
             )
         })
         .collect();
@@ -499,6 +607,148 @@ mod tests {
         let full = glow_stroke(1.0, red, palette);
         assert_eq!(full, Stroke::new(1.5, red));
         assert_eq!(glow_stroke(3.0, red, palette), full, "clamped");
+    }
+
+    fn dashboard(pct: f64) -> crate::poller::Dashboard {
+        let now = t(12, 0);
+        crate::poller::Dashboard {
+            snapshot: snap(vec![
+                window("5-hour", Some(pct), Some(t(14, 0))),
+                window("7-day all", Some(10.0), Some(now + Duration::days(3))),
+            ]),
+            history: Vec::new(),
+            fable_history: Vec::new(),
+            seven_day_recent: Vec::new(),
+            fable_recent: Vec::new(),
+            burners: Vec::new(),
+            window_start: t(9, 0),
+            window_end: t(14, 0),
+            window_samples: Vec::new(),
+            week_start: now,
+            week_end: now,
+            week_samples: Vec::new(),
+            persist_error: None,
+            plan: None,
+            token_expires_at: None,
+        }
+    }
+
+    fn error(message: &str) -> crate::poller::FetchErrorInfo {
+        crate::poller::FetchErrorInfo {
+            kind: crate::fetch::ErrorKind::TokenExpired,
+            message: message.to_owned(),
+        }
+    }
+
+    fn view<'a>(
+        id: &'a crate::profiles::ProfileId,
+        data: Option<&'a crate::poller::Dashboard>,
+        error: Option<&'a crate::poller::FetchErrorInfo>,
+    ) -> AccountView<'a> {
+        AccountView {
+            id,
+            label: id.as_str(),
+            color: Color32::RED,
+            data,
+            error,
+            stale: data.is_some() && error.is_some(),
+        }
+    }
+
+    fn summary(groups: &[ChipGroup]) -> Vec<(usize, usize, bool)> {
+        groups
+            .iter()
+            .map(|g| (g.account, g.chips.len(), g.header))
+            .collect()
+    }
+
+    #[test]
+    fn one_account_is_headerless_as_always() {
+        use crate::profiles::ProfileId;
+        let now = t(12, 0);
+        let (a, b) = (ProfileId::new("a"), ProfileId::new("b"));
+        let d = dashboard(40.0);
+        // B has not polled yet: only A, without a header.
+        let views = [view(&a, Some(&d), None), view(&b, None, None)];
+        let g = chip_groups(&views, now);
+        assert_eq!(summary(&g), [(0, 2, false)]);
+        assert!(
+            g[0].chips[0].pulses,
+            "the only account's 5-hour chip pulses"
+        );
+        // Nothing yet, or only an error with no data: nothing (the banner
+        // says why).
+        assert!(chip_groups(&[view(&a, None, None)], now).is_empty());
+        let e = error("expired");
+        assert!(chip_groups(&[view(&a, None, Some(&e))], now).is_empty());
+    }
+
+    #[test]
+    fn groups_in_account_order_with_error_only_accounts() {
+        use crate::profiles::ProfileId;
+        let now = t(12, 0);
+        let ids: Vec<ProfileId> = ["a", "b", "c", "d"].map(ProfileId::new).into();
+        let (cool, hot) = (dashboard(20.0), dashboard(70.0));
+        let e = error("HTTP 401: token expired");
+        let views = [
+            view(&ids[0], None, Some(&e)),
+            view(&ids[1], Some(&cool), None),
+            view(&ids[2], None, None),
+            view(&ids[3], Some(&hot), None),
+        ];
+        let g = chip_groups(&views, now);
+        // "c" (still polling) is left out; "a" shows its header alone.
+        assert_eq!(summary(&g), [(0, 0, true), (1, 2, true), (3, 2, true)]);
+        // Only the hottest account's 5-hour chip pulses.
+        let pulsing: Vec<_> = g
+            .iter()
+            .flat_map(|g| g.chips.iter().map(move |c| (g.account, c.label, c.pulses)))
+            .filter(|c| c.2)
+            .collect();
+        assert_eq!(pulsing, [(3, "5-hour", true)]);
+    }
+
+    #[test]
+    fn a_stale_hot_account_does_not_pulse() {
+        use crate::profiles::ProfileId;
+        let now = t(12, 0);
+        let (a, b) = (ProfileId::new("a"), ProfileId::new("b"));
+        let (cool, hot) = (dashboard(20.0), dashboard(90.0));
+        let e = error("HTTP 500: oops");
+        let views = [view(&a, Some(&cool), None), view(&b, Some(&hot), Some(&e))];
+        let g = chip_groups(&views, now);
+        assert!(g[0].chips[0].pulses);
+        assert!(
+            !g[1].chips[0].pulses,
+            "stale: its old figure is not followed"
+        );
+        assert_eq!(
+            badge(&views[1]),
+            Some(("stale", "HTTP 500: oops".to_owned()))
+        );
+        assert_eq!(badge(&views[0]), None);
+        let expired = view(&a, None, Some(&e));
+        assert_eq!(badge(&expired).unwrap().0, "token expired");
+    }
+
+    #[test]
+    fn chip_ids_unique_across_accounts() {
+        use crate::profiles::ProfileId;
+        let now = t(12, 0);
+        let (a, b) = (ProfileId::new("default"), ProfileId::new("claude-b"));
+        let (d1, d2) = (dashboard(20.0), dashboard(70.0));
+        let views = [view(&a, Some(&d1), None), view(&b, Some(&d2), None)];
+        let mut ids = Vec::new();
+        for g in chip_groups(&views, now) {
+            let key = crate::ui::timeline::series_key(views[g.account].id);
+            for c in &g.chips {
+                ids.push(chip_id("chip-pct", key, c.label));
+                ids.push(chip_id("chip-color", key, c.label));
+            }
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(unique.len(), ids.len());
     }
 
     #[test]

@@ -97,38 +97,61 @@ pub fn show_burn_row(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     super::show_runs(ui, &runs).on_hover_text(burn_hover(burn.as_ref()));
 }
 
-/// The footer strip for the accounts. For now the first account with data
-/// is drawn, as one account always was (see [`show_account_footer`]).
-pub fn show_footer(ui: &mut Ui, accounts: &[AccountView]) {
-    if let Some(d) = super::accounts::first_data(accounts) {
-        show_account_footer(ui, d);
+/// The extra-usage gauge's caption: "extra", or "{label} · extra" when
+/// several accounts' gauges share the strip.
+pub fn gauge_caption(label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!("{label} · extra"),
+        None => "extra".to_owned(),
     }
 }
 
-/// The footer strip on a card: the extra-usage gauge, when analytics says
-/// the block is visible; nothing otherwise.
-fn show_account_footer(ui: &mut Ui, d: &Dashboard) {
-    let Some(extra) = analytics::visible_extra(&d.snapshot) else {
+/// The footer strip on a card: one extra-usage gauge per account with data
+/// whose block analytics says is visible (captioned with the account's
+/// label when two or more accounts have data); nothing when none is.
+pub fn show_footer(ui: &mut Ui, accounts: &[AccountView]) {
+    let shown = super::timeline::with_data(accounts);
+    let several = shown.len() >= 2;
+    let gauges: Vec<(&AccountView, &ExtraUsage)> = shown
+        .into_iter()
+        .filter_map(|v| Some((v, analytics::visible_extra(&v.data?.snapshot)?)))
+        .collect();
+    if gauges.is_empty() {
         return;
-    };
+    }
     let palette = Palette::for_visuals(ui.visuals());
+    super::theme::card(palette).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        for (view, extra) in gauges {
+            let caption = gauge_caption(several.then_some(view.label));
+            extra_row(
+                ui,
+                palette,
+                super::timeline::series_key(view.id),
+                &caption,
+                extra,
+            );
+        }
+    });
+}
+
+/// One account's extra-usage gauge: caption, "$23 / $35", the bar; eased
+/// values keyed by `key` (its profile's).
+fn extra_row(ui: &mut Ui, palette: &Palette, key: u64, caption: &str, extra: &ExtraUsage) {
     let g = extra_gauge(extra);
     let painter = ui.painter().clone();
     let small = eframe::egui::TextStyle::Small.resolve(ui.style());
-    let caption = painter.layout_no_wrap("extra".to_owned(), small, palette.text_muted);
+    let caption = painter.layout_no_wrap(caption.to_owned(), small, palette.text_muted);
     let body = eframe::egui::TextStyle::Body.resolve(ui.style());
     let (galley, w) = digits::number_galley(&painter, &g.text, body, palette.level(g.level));
     let hover = super::plain_text(&rows::extra_runs(extra));
-    super::theme::card(palette).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = CAPTION_GAP;
-            centered_galley(ui, caption, palette.text_muted).on_hover_text(&hover);
-            let (r, resp) = ui.allocate_exact_size(vec2(w, galley.size().y), Sense::hover());
-            ui.painter().galley(r.min, galley, palette.text);
-            resp.on_hover_text(&hover);
-            gauge_bar(ui, &g, palette).on_hover_text(&hover);
-        });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = CAPTION_GAP;
+        centered_galley(ui, caption, palette.text_muted).on_hover_text(&hover);
+        let (r, resp) = ui.allocate_exact_size(vec2(w, galley.size().y), Sense::hover());
+        ui.painter().galley(r.min, galley, palette.text);
+        resp.on_hover_text(&hover);
+        gauge_bar(ui, key, &g, palette).on_hover_text(&hover);
     });
 }
 
@@ -147,12 +170,16 @@ fn centered_galley(
     response
 }
 
-fn gauge_bar(ui: &mut Ui, g: &ExtraGauge, palette: &Palette) -> eframe::egui::Response {
+fn gauge_bar(ui: &mut Ui, key: u64, g: &ExtraGauge, palette: &Palette) -> eframe::egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(GAUGE_W, GAUGE_H * 3.0), Sense::hover());
     let track = Rect::from_center_size(rect.center(), vec2(GAUGE_W, GAUGE_H));
     let ctx = ui.ctx();
-    let fraction = motion::eased(ctx, Id::new("extra-gauge-fraction"), g.fraction);
-    let color = motion::eased(ctx, Id::new("extra-gauge-color"), palette.level(g.level));
+    let fraction = motion::eased(ctx, Id::new(("extra-gauge-fraction", key)), g.fraction);
+    let color = motion::eased(
+        ctx,
+        Id::new(("extra-gauge-color", key)),
+        palette.level(g.level),
+    );
     let painter = ui.painter();
     painter.rect_filled(track, GAUGE_H / 2.0, palette.track);
     if fraction > 0.0 {
@@ -254,6 +281,12 @@ mod tests {
             currency: "USD".to_owned(),
             disabled_reason: None,
         }
+    }
+
+    #[test]
+    fn gauge_captions() {
+        assert_eq!(gauge_caption(None), "extra");
+        assert_eq!(gauge_caption(Some("work")), "work · extra");
     }
 
     #[test]

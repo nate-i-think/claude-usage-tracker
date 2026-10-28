@@ -1,14 +1,18 @@
 //! The collapsible "Details" card: the other windows as compact rows, the
-//! full ALL/FABLE burn lines and projected-use advice, the top burners as a
-//! ranked list with proportional bars, and when the data was polled. Its
-//! open state lives in [`Settings::details_open`].
+//! full ALL/FABLE burn lines and projected-use advice, the week's usage by
+//! surface, the top burners as a ranked list with proportional bars, and
+//! the plan, token validity and when the data was polled; one section per
+//! account when several have data. Its open state lives in
+//! [`Settings::details_open`].
 
-use chrono::{DateTime, Utc};
+use std::fmt::Display;
+
+use chrono::{DateTime, Local, TimeZone, Utc};
 use eframe::egui::{self, vec2, Align, CollapsingHeader, Rect, RichText, Sense, TextStyle, Ui};
 
-use crate::analytics;
+use crate::analytics::{self, alerts::fmt_clock_in};
 use crate::config::Settings;
-use crate::poller::Dashboard;
+use crate::model::WeekBreakdown;
 use crate::storage::InstanceUsage;
 
 use super::accounts::AccountView;
@@ -71,22 +75,67 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// The Details card for the accounts. For now the first account with data
-/// is drawn, as one account always was (see [`show_account_details`]).
+/// The plan's name: the credential's `subscriptionType` ("max" → "Max"),
+/// else `fallback` (the settings' plan).
+pub fn plan_name(plan: Option<&str>, fallback: &str) -> String {
+    let Some(plan) = plan.map(str::trim).filter(|p| !p.is_empty()) else {
+        return fallback.to_owned();
+    };
+    let mut chars = plan.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// "token valid 3h 12m" or "token expired"; `None` when the expiry is
+/// unknown.
+pub fn token_validity(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
+    let at = expires_at?;
+    Some(if at <= now {
+        "token expired".to_owned()
+    } else {
+        format!("token valid {}", analytics::humanize_until(Some(at), now))
+    })
+}
+
+/// The week's usage by surface: "Claude Code 72% · Chats 11% · Cowork 17%
+/// · Other 0% · as of 1:35 PM" (whole percents; the time in `tz`, when
+/// known). `None` without rows.
+pub fn breakdown_text_in<Tz: TimeZone>(b: &WeekBreakdown, tz: &Tz) -> Option<String>
+where
+    Tz::Offset: Display,
+{
+    if b.rows.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = b
+        .rows
+        .iter()
+        .map(|r| format!("{} {:.0}%", r.display_name, r.percent))
+        .collect();
+    if let Some(at) = b.as_of {
+        parts.push(format!("as of {}", fmt_clock_in(at, tz)));
+    }
+    Some(parts.join(" · "))
+}
+
+/// The breakdown row's hover text.
+const BREAKDOWN_HOVER: &str = "share of this week's usage by surface";
+
+/// The Details card: one account with data as it always was; several each
+/// in a collapsible section under its dot and name (open by default).
+/// Clicking the card's header flips (and so persists) its open state.
 pub fn show_details(
     ui: &mut Ui,
     accounts: &[AccountView],
     settings: &mut Settings,
     now: DateTime<Utc>,
 ) {
-    if let Some(d) = super::accounts::first_data(accounts) {
-        show_account_details(ui, d, settings, now);
+    let shown = super::timeline::with_data(accounts);
+    if shown.is_empty() {
+        return;
     }
-}
-
-/// The Details card. Clicking the header flips (and so persists) the open
-/// state.
-fn show_account_details(ui: &mut Ui, d: &Dashboard, settings: &mut Settings, now: DateTime<Utc>) {
     let palette = Palette::for_visuals(ui.visuals());
     theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -97,14 +146,52 @@ fn show_account_details(ui: &mut Ui, d: &Dashboard, settings: &mut Settings, now
         let response = CollapsingHeader::new(title)
             .id_salt("details")
             .open(Some(settings.details_open))
-            .show(ui, |ui| contents(ui, d, settings, now));
+            .show(ui, |ui| match shown[..] {
+                [v] => contents(ui, v, settings, now),
+                ref several => {
+                    for v in several {
+                        account_section(ui, v, settings, now, palette);
+                    }
+                }
+            });
         if response.header_response.clicked() {
             settings.details_open = !settings.details_open;
         }
     });
 }
 
-fn contents(ui: &mut Ui, d: &Dashboard, settings: &Settings, now: DateTime<Utc>) {
+/// One account's collapsible section: its dot and name ("· stale" after a
+/// failed poll), then its [`contents`].
+fn account_section(
+    ui: &mut Ui,
+    v: &AccountView,
+    settings: &Settings,
+    now: DateTime<Utc>,
+    palette: &Palette,
+) {
+    let mut title = egui::text::LayoutJob::default();
+    let small = TextStyle::Small.resolve(ui.style());
+    let body = TextStyle::Body.resolve(ui.style());
+    title.append("● ", 0.0, egui::TextFormat::simple(small, v.color));
+    let name = theme::semibold(body.size);
+    title.append(v.label, 0.0, egui::TextFormat::simple(name, palette.text));
+    if v.stale {
+        let muted = egui::TextFormat::simple(body, palette.text_muted);
+        title.append(" · stale", 0.0, muted);
+    }
+    let key = super::timeline::series_key(v.id);
+    let response = CollapsingHeader::new(title)
+        .id_salt(("details-account", key))
+        .default_open(true)
+        .show(ui, |ui| contents(ui, v, settings, now));
+    if let Some(e) = v.error {
+        response.header_response.on_hover_text(&e.message);
+    }
+}
+
+fn contents(ui: &mut Ui, v: &AccountView, settings: &Settings, now: DateTime<Utc>) {
+    let Some(d) = v.data else { return };
+    let key = super::timeline::series_key(v.id);
     let palette = Palette::for_visuals(ui.visuals());
     let snap = &d.snapshot;
     let order = analytics::ordered_windows(snap);
@@ -115,7 +202,7 @@ fn contents(ui: &mut Ui, d: &Dashboard, settings: &Settings, now: DateTime<Utc>)
         .collect();
     if !others.is_empty() {
         for w in others {
-            rows::show_window_row(ui, &rows::window_row(w, now));
+            rows::show_window_row(ui, key, &rows::window_row(w, now));
         }
         ui.add_space(GAP);
     }
@@ -140,6 +227,14 @@ fn contents(ui: &mut Ui, d: &Dashboard, settings: &Settings, now: DateTime<Utc>)
     if let Some(h) = headroom {
         show_runs(ui, &rows::headroom_runs(&h));
     }
+    if let Some(text) = snap
+        .breakdown
+        .as_ref()
+        .and_then(|b| breakdown_text_in(b, &Local))
+    {
+        ui.colored_label(palette.text_muted, text)
+            .on_hover_text(BREAKDOWN_HOVER);
+    }
     ui.add_space(GAP);
 
     let body = TextStyle::Body.resolve(ui.style());
@@ -153,23 +248,26 @@ fn contents(ui: &mut Ui, d: &Dashboard, settings: &Settings, now: DateTime<Utc>)
         ui.weak("no local activity yet");
     }
     for row in &burners {
-        burner_line(ui, row, palette);
+        burner_line(ui, key, row, palette);
     }
     ui.add_space(GAP);
     ui.colored_label(
         palette.text_muted,
         format!(
             "{} plan · {}",
-            settings.plan,
+            plan_name(d.plan.as_deref(), &settings.plan),
             rows::last_polled(snap.fetched_at, now)
         ),
     );
+    if let Some(text) = token_validity(d.token_expires_at, now) {
+        ui.colored_label(palette.text_muted, text);
+    }
 }
 
 /// "1  name ······ ▬▬▬  191k": rank and name on the left (the name is cut
 /// short in what the bar and count leave), bar and count on the right, the
 /// count in a fixed-width column so the bars line up.
-fn burner_line(ui: &mut Ui, row: &BurnerRow, palette: &Palette) {
+fn burner_line(ui: &mut Ui, key: u64, row: &BurnerRow, palette: &Palette) {
     right_then_left(
         ui,
         Align::Center,
@@ -189,7 +287,7 @@ fn burner_line(ui: &mut Ui, row: &BurnerRow, palette: &Palette) {
             let track = Rect::from_center_size(rect.center(), vec2(BURNER_BAR_W, BURNER_BAR_H));
             ui.painter()
                 .rect_filled(track, BURNER_BAR_H / 2.0, palette.track);
-            let id = egui::Id::new(("burner-bar", &row.name));
+            let id = egui::Id::new(("burner-bar", key, &row.name));
             let fraction = motion::eased(ui.ctx(), id, row.fraction);
             if fraction > 0.0 {
                 let mut fill = track;
@@ -217,6 +315,78 @@ mod tests {
             tokens,
             last_active: DateTime::from_timestamp(1_791_000_000, 0).unwrap(),
         }
+    }
+
+    #[test]
+    fn plan_names() {
+        assert_eq!(plan_name(Some("max"), "Pro"), "Max");
+        assert_eq!(plan_name(Some("team"), "Max"), "Team");
+        assert_eq!(plan_name(None, "Max 5x"), "Max 5x");
+        assert_eq!(plan_name(Some("  "), "Max"), "Max");
+    }
+
+    #[test]
+    fn token_validity_text() {
+        let now = DateTime::from_timestamp(1_791_000_000, 0).unwrap();
+        let later = now + chrono::Duration::minutes(3 * 60 + 12) + chrono::Duration::seconds(30);
+        assert_eq!(
+            token_validity(Some(later), now).as_deref(),
+            Some("token valid 3h 12m")
+        );
+        assert_eq!(
+            token_validity(Some(now), now).as_deref(),
+            Some("token expired")
+        );
+        let earlier = now - chrono::Duration::minutes(1);
+        assert_eq!(
+            token_validity(Some(earlier), now).as_deref(),
+            Some("token expired")
+        );
+        assert_eq!(token_validity(None, now), None);
+    }
+
+    fn breakdown(as_of: Option<DateTime<Utc>>, rows: &[(&str, f64)]) -> WeekBreakdown {
+        WeekBreakdown {
+            as_of,
+            window_started_at: None,
+            rows: rows
+                .iter()
+                .map(|&(name, percent)| crate::model::BreakdownRow {
+                    key: name.to_lowercase(),
+                    display_name: name.to_owned(),
+                    percent,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn breakdown_text() {
+        use chrono::{FixedOffset, TimeZone};
+        // 20:35 UTC is 1:35 PM at UTC-7.
+        let at = Utc.with_ymd_and_hms(2026, 10, 11, 20, 35, 0).unwrap();
+        let pdt = FixedOffset::west_opt(7 * 3600).unwrap();
+        let b = breakdown(
+            Some(at),
+            &[
+                ("Claude Code", 72.4),
+                ("Chats", 10.6),
+                ("Cowork", 17.0),
+                ("Other", 0.0),
+            ],
+        );
+        assert_eq!(
+            breakdown_text_in(&b, &pdt).as_deref(),
+            Some("Claude Code 72% · Chats 11% · Cowork 17% · Other 0% · as of 1:35 PM")
+        );
+        let utc = FixedOffset::east_opt(0).unwrap();
+        assert!(breakdown_text_in(&b, &utc)
+            .unwrap()
+            .ends_with("as of 8:35 PM"));
+        // No time: no "as of"; no rows: no row at all.
+        let b = breakdown(None, &[("Chats", 100.0)]);
+        assert_eq!(breakdown_text_in(&b, &utc).as_deref(), Some("Chats 100%"));
+        assert_eq!(breakdown_text_in(&breakdown(Some(at), &[]), &utc), None);
     }
 
     #[test]

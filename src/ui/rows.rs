@@ -209,7 +209,9 @@ fn right() -> Layout {
 }
 
 /// One window row: label, percentage, bar, countdown, aligned as a grid.
-pub fn show_window_row(ui: &mut Ui, row: &WindowRow) {
+/// The bar's eased values are keyed by `key` (the account's
+/// [`super::timeline::series_key`]) and the label.
+pub fn show_window_row(ui: &mut Ui, key: u64, row: &WindowRow) {
     ui.horizontal(|ui| {
         cell(ui, LABEL_WIDTH, left(), |ui| {
             let body = TextStyle::Body.resolve(ui.style());
@@ -224,9 +226,9 @@ pub fn show_window_row(ui: &mut Ui, row: &WindowRow) {
         let bar_width = (ui.available_width() - RESET_WIDTH - gap).max(0.0);
         // The bar's fill and color ease to each poll's values.
         let ctx = ui.ctx().clone();
-        let fraction = motion::eased(&ctx, Id::new(("window-bar", &row.label)), row.fraction);
+        let fraction = motion::eased(&ctx, Id::new(("window-bar", key, &row.label)), row.fraction);
         let fill = tone_color(row.fill, ui.visuals());
-        let fill = motion::eased(&ctx, Id::new(("window-bar-color", &row.label)), fill);
+        let fill = motion::eased(&ctx, Id::new(("window-bar-color", key, &row.label)), fill);
         paint_bar(ui, bar_width, fraction, fill);
         cell(ui, RESET_WIDTH, right(), |ui| number(ui, &row.reset));
     });
