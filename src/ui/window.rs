@@ -287,6 +287,43 @@ pub fn keep_visible(window: PxRect, work: PxRect, visible: (i32, i32)) -> Pos {
     }
 }
 
+/// The left edge (pixels) for a window at `left` that is `width` wide, so
+/// its right edge stays on `monitor`: shifted left by just the overflow,
+/// never past the monitor's left edge. `None` when it already fits (or
+/// overflows only on the left, which a widening can't cause).
+pub fn left_to_fit(left: i32, width: i32, monitor: PxRect) -> Option<i32> {
+    if left.saturating_add(width) <= monitor.right {
+        return None;
+    }
+    let target = monitor.right.saturating_sub(width).max(monitor.left);
+    (target != left).then_some(target)
+}
+
+/// Off Windows (which has [`keep_on_screen`]), where the window should
+/// move so its right edge stays on its monitor once it is `width_px` wide
+/// (its current outer width if `None`): its outer top-left in pixels, or
+/// `None` to stay. A widened pill otherwise grows past the monitor's
+/// right edge (macOS doesn't pull a borderless window back).
+#[cfg(not(windows))]
+pub fn keep_right_edge_on_monitor(frame: &eframe::Frame, width_px: Option<i32>) -> Option<Pos> {
+    let window = frame.winit_window()?;
+    let monitor = window.current_monitor()?;
+    let (origin, size) = (monitor.position(), monitor.size());
+    let monitor = PxRect {
+        left: origin.x,
+        top: origin.y,
+        right: origin.x.saturating_add(i32::try_from(size.width).ok()?),
+        bottom: origin.y.saturating_add(i32::try_from(size.height).ok()?),
+    };
+    let at = window.outer_position().ok()?;
+    let width = match width_px {
+        Some(w) => w,
+        None => i32::try_from(window.outer_size().width).ok()?,
+    };
+    let x = left_to_fit(at.x, width, monitor)?;
+    Some(Pos { x, y: at.y })
+}
+
 /// `visible` (width, height) no larger than `window` itself.
 pub fn capped_visible(window: PxRect, visible: (i32, i32)) -> (i32, i32) {
     (
@@ -916,6 +953,23 @@ mod tests {
             keep_visible(px(-1800, -100, -1380, 400), work, (120, 48)),
             Pos { x: -1800, y: -100 }
         );
+    }
+
+    #[test]
+    fn a_widened_window_shifts_left_by_its_overflow() {
+        let monitor = px(0, 0, 1920, 1080);
+        // Fits: stays.
+        assert_eq!(left_to_fit(1000, 600, monitor), None);
+        assert_eq!(left_to_fit(1320, 600, monitor), None, "flush right");
+        // Pinned to the right edge (a one-account pill at 1600, 300 wide)
+        // now three segments wide: moved left by just the overflow.
+        assert_eq!(left_to_fit(1600, 720, monitor), Some(1200));
+        // Wider than the monitor: its left edge on the monitor's.
+        assert_eq!(left_to_fit(100, 2500, monitor), Some(0));
+        // A monitor left of the primary (negative coordinates).
+        let left_of = px(-2560, 0, 0, 1440);
+        assert_eq!(left_to_fit(-500, 720, left_of), Some(-720));
+        assert_eq!(left_to_fit(-1000, 720, left_of), None);
     }
 
     #[test]

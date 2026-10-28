@@ -49,6 +49,18 @@ pub fn refresh_ready(last_click: Option<Instant>, now: Instant) -> bool {
     last_click.is_none_or(|t| now.saturating_duration_since(t) >= REFRESH_COOLDOWN)
 }
 
+/// The settle state the window opens with. Off Windows, a started one, so
+/// the first frames' Fixup keeps a pill opened at a saved position (sized
+/// for fewer accounts then) from passing its monitor's right edge; Windows
+/// already did that in `window::apply_placement`.
+fn startup_settle() -> Settle {
+    let mut settle = Settle::default();
+    if cfg!(not(windows)) {
+        settle.start();
+    }
+    settle
+}
+
 /// What one logic pass must do with the settings.
 #[derive(Debug)]
 pub struct SettingsSync {
@@ -182,7 +194,7 @@ impl App {
             settings,
             tracked: TrackedWindow::default(),
             pill_seen: None,
-            settle: Settle::default(),
+            settle: startup_settle(),
             pill: PillState::default(),
             pill_accounts,
             storage_cleaned: false,
@@ -233,6 +245,10 @@ impl App {
             SettleStep::Fixup => {
                 #[cfg(windows)]
                 window::keep_on_screen(_frame);
+                #[cfg(not(windows))]
+                if self.settings.ui_mode == UiMode::Pill {
+                    self.pill_right_edge_on_monitor(ctx, _frame, None);
+                }
                 ctx.request_repaint();
             }
             SettleStep::Track => match self.settings.ui_mode {
@@ -286,16 +302,41 @@ impl App {
     }
 
     /// Resize the pill when its account count changed (the window is kept
-    /// on a monitor afterwards, as after a switch).
-    fn fit_pill(&mut self, ctx: &egui::Context) {
+    /// on a monitor afterwards, as after a switch; off Windows a widened
+    /// pill also moves left as it grows, if it would pass the monitor's
+    /// right edge).
+    fn fit_pill(&mut self, ctx: &egui::Context, _frame: &eframe::Frame) {
         let accounts = self.pill_accounts_now();
         if self.settings.ui_mode != UiMode::Pill || accounts == self.pill_accounts {
             return;
         }
         self.pill_accounts = accounts;
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(window::pill_size(accounts)));
+        let size = window::pill_size(accounts);
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        #[cfg(not(windows))]
+        {
+            let width_px = (size.x * ctx.pixels_per_point()).round() as i32;
+            self.pill_right_edge_on_monitor(ctx, _frame, Some(width_px));
+        }
         self.settle.start();
         ctx.request_repaint();
+    }
+
+    /// Move the pill left if its right edge would pass its monitor's at
+    /// `width_px` wide (its current width if `None`). Off Windows only:
+    /// Windows keeps it on screen natively ([`window::keep_on_screen`]).
+    #[cfg(not(windows))]
+    fn pill_right_edge_on_monitor(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        width_px: Option<i32>,
+    ) {
+        if let Some(p) = window::keep_right_edge_on_monitor(frame, width_px) {
+            let at = mode::to_points(p, ctx.pixels_per_point());
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(at));
+            self.pill_seen = Some(p);
+        }
     }
 
     /// Full ↔ pill.
@@ -650,7 +691,7 @@ impl eframe::App for App {
         self.track_window(ctx, frame);
         self.handle_close_request(ctx);
         self.drain_events();
-        self.fit_pill(ctx);
+        self.fit_pill(ctx, frame);
         self.sync_tray(ctx);
         self.background_hooks(ctx);
         self.sync_settings(frame);
