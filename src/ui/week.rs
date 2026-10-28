@@ -459,7 +459,9 @@ pub fn account_rows<'a>(
 
 /// The weekly chart of several accounts (see [`timeline::overlay_charts`]):
 /// each account's 7-day-all line solid and its Fable line dashed, in its
-/// color, its projections cut at its own window end.
+/// color, its projections cut at its own window end. An account whose
+/// week is already over (stale data from before its reset) adds no window
+/// and draws no now dot or projection.
 pub fn week_series_chart(
     accounts: &[AccountRows],
     now: DateTime<Utc>,
@@ -469,11 +471,18 @@ pub fn week_series_chart(
         .iter()
         .filter_map(|a| {
             let d = a.view.data?;
+            let mut chart = week_chart(d, now, palette, &a.rows);
+            // A stale account still errored past its reset: its week is
+            // over, so it adds no window, no end mark, no now dot.
+            let live = d.week_end > now;
+            if !live {
+                chart.series.iter_mut().for_each(|s| s.lines.clear());
+            }
             Some(timeline::Part {
-                chart: week_chart(d, now, palette, &a.rows),
+                chart,
                 view: a.view,
-                window: Some((d.week_start, d.week_end)),
-                reset_known: d.snapshot.seven_day_resets_at().is_some(),
+                window: live.then_some((d.week_start, d.week_end)),
+                reset_known: live && d.snapshot.seven_day_resets_at().is_some(),
             })
         })
         .collect();
@@ -927,8 +936,30 @@ mod tests {
             age: Duration::zero(),
             stale: false,
         };
-        let accounts = account_rows(&[&va, &vb], now, fresh);
+        let mut accounts = account_rows(&[&va, &vb], now, fresh);
         assert_eq!(accounts[0].rows.len(), 2, "7d all and Fable");
+        // Outlooks with lines: "default" caps inside its week, its Fable
+        // (resetting two days after) runs past it; "work" is safe.
+        accounts[0].rows = vec![
+            (
+                Meter::All,
+                WeeklyOutlook::Cap {
+                    rate: rate(30.0),
+                    at: t(13, 12),
+                    minutes: 24.0 * 60.0,
+                    level: Level::Red,
+                },
+            ),
+            (Meter::Fable, WeeklyOutlook::RateOnly { rate: rate(10.0) }),
+        ];
+        accounts[1].rows = vec![(
+            Meter::All,
+            WeeklyOutlook::Safe {
+                rate: rate(2.0),
+                at_reset: 28.0,
+                reset: t(16, 0),
+            },
+        )];
         assert_eq!(accounts[1].rows.len(), 1);
         assert!(
             !accounts[0].stale && accounts[1].stale,
@@ -948,10 +979,19 @@ mod tests {
         assert!(c.series[1].dimmed);
         assert!(c.series[0].points.iter().all(|p| p.overlay == Some(30.0)));
         assert!(c.series[1].points.iter().all(|p| p.overlay.is_none()));
-        // Each projection stays within its own account's window.
+        // Each projection stays within its own account's window: the
+        // cap and "safe" as projected, Fable's cut at "default"'s end.
+        let ends = |s: &SeriesData| -> Vec<Option<DateTime<Utc>>> {
+            s.lines
+                .iter()
+                .map(|l| l.projection.map(|p| p.end_t))
+                .collect()
+        };
+        assert_eq!(ends(&c.series[0]), [Some(t(13, 12)), Some(a.week_end)]);
+        assert_eq!(ends(&c.series[1]), [Some(b.week_end)]);
         for (s, end) in c.series.iter().zip([a.week_end, b.week_end]) {
             for l in &s.lines {
-                assert!(l.projection.is_none_or(|p| p.end_t <= end));
+                assert!(l.projection.is_some_and(|p| p.end_t <= end));
             }
         }
         let legend: Vec<_> = c
@@ -963,6 +1003,28 @@ mod tests {
             legend,
             [("default", false), ("work", false), ("Fable", true)]
         );
+    }
+
+    #[test]
+    fn an_account_past_its_reset_adds_no_window() {
+        let now = t(12, 12);
+        let palette = &crate::ui::theme::DARK;
+        // "old" errored since before its reset on the 10th.
+        let old = week_dash(t(9, 0), 60.0, t(10, 0), None);
+        let live = week_dash(now, 20.0, t(16, 0), None);
+        let (io, il) = (ProfileId::new("old"), ProfileId::new("live"));
+        let (vo, vl) = (view(&io, &old, true), view(&il, &live, false));
+        let fresh = Freshness {
+            age: Duration::zero(),
+            stale: false,
+        };
+        let mut accounts = account_rows(&[&vo, &vl], now, fresh);
+        accounts[0].rows = vec![(Meter::All, WeeklyOutlook::Steady { rate: rate(0.1) })];
+        let c = week_series_chart(&accounts, now, palette).unwrap();
+        assert_eq!((c.start, c.end), (live.week_start, live.week_end));
+        assert_eq!(c.end_marks, vec![(live.week_end, vl.color)]);
+        assert!(c.series[0].lines.is_empty(), "no now dot or projection");
+        assert_eq!(c.series.len(), 2, "still in the legend");
     }
 
     #[test]
