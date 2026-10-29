@@ -9,8 +9,7 @@
 //!
 //! With several accounts the chart overlays them (see
 //! [`week_series_chart`]): each account's 7-day-all line solid and its
-//! Fable line dashed in its series color. Each account's outlooks are
-//! aged by its own snapshot's age.
+//! Fable line dashed in its series color.
 
 use chrono::{DateTime, Duration, Local, Utc};
 use eframe::egui::Ui;
@@ -51,26 +50,6 @@ pub fn fable_row_shown(pct: Option<f64>, resets_at: Option<DateTime<Utc>>) -> bo
     }
 }
 
-/// `o` (projected at the snapshot's fetch time) as seen `age` later: a cap
-/// "in 16h" then is that much nearer now, never below 0. Absolute times
-/// and the % at reset don't change.
-pub fn aged(o: WeeklyOutlook, age: Duration) -> WeeklyOutlook {
-    match o {
-        WeeklyOutlook::Cap {
-            rate,
-            at,
-            minutes,
-            level,
-        } => WeeklyOutlook::Cap {
-            rate,
-            at,
-            minutes: (minutes - age.as_seconds_f64().max(0.0) / 60.0).max(0.0),
-            level,
-        },
-        other => other,
-    }
-}
-
 /// The meters on the chart: 7-day all always, Fable when
 /// [`fable_row_shown`].
 pub fn meters(has_fable: bool) -> Vec<Meter> {
@@ -87,7 +66,7 @@ pub fn meters(has_fable: bool) -> Vec<Meter> {
 /// - safe: a line to the % at the reset, "safe";
 /// - steady: a flat line to the window end, "safe" when the reset is known;
 /// - the rate alone: a line to the window end (at most 100%), no label;
-/// - at the cap, or a cap time already passed (an aged outlook): no line,
+/// - at the cap, or a cap time already passed (a stale snapshot): no line,
 ///   "at cap"; no history or no %: nothing.
 pub fn weekly_line(
     o: &WeeklyOutlook,
@@ -170,12 +149,10 @@ pub fn clamp_to_chart(
 }
 
 /// The weekly outlooks of the chart: 7-day all, and Fable when
-/// [`fable_row_shown`], projected at the snapshot's fetch time and aged to
-/// `now` (see [`aged`]).
-pub fn outlooks(d: &Dashboard, now: DateTime<Utc>) -> Vec<(Meter, WeeklyOutlook)> {
+/// [`fable_row_shown`], projected at the snapshot's fetch time.
+pub fn outlooks(d: &Dashboard) -> Vec<(Meter, WeeklyOutlook)> {
     let snap = &d.snapshot;
     let at = snap.fetched_at;
-    let age = now - at;
     meters(fable_row_shown(snap.fable_pct(), snap.fable_resets_at()))
         .into_iter()
         .map(|m| {
@@ -193,24 +170,24 @@ pub fn outlooks(d: &Dashboard, now: DateTime<Utc>) -> Vec<(Meter, WeeklyOutlook)
                     at,
                 ),
             };
-            (m, aged(o, age))
+            (m, o)
         })
         .collect()
 }
 
-/// The weekly chart for `d` at `now`, with `rows` from [`outlooks`].
+/// The weekly chart for `d` at `now`, with `outlooks` from [`outlooks()`].
 pub fn week_chart(
     d: &Dashboard,
     now: DateTime<Utc>,
     palette: &Palette,
-    rows: &[(Meter, WeeklyOutlook)],
+    outlooks: &[(Meter, WeeklyOutlook)],
 ) -> Chart {
     let snap = &d.snapshot;
     let pct = snap.seven_day_pct();
     let state = palette.level(analytics::color_for(pct));
     let reset_known = snap.seven_day_resets_at().is_some();
-    let show_fable = rows.iter().any(|(m, _)| *m == Meter::Fable);
-    let lines = rows
+    let show_fable = outlooks.iter().any(|(m, _)| *m == Meter::Fable);
+    let lines = outlooks
         .iter()
         .filter_map(|(m, o)| {
             let (pct, resets, color, cap_color) = match m {
@@ -288,20 +265,19 @@ pub fn week_chart(
 }
 
 /// One account's weekly outlooks on an overlaid card.
-pub struct AccountRows<'a> {
+pub struct AccountOutlooks<'a> {
     pub view: &'a AccountView<'a>,
-    pub rows: Vec<(Meter, WeeklyOutlook)>,
+    pub outlooks: Vec<(Meter, WeeklyOutlook)>,
 }
 
-/// The weekly outlooks of every account with data, each aged by its own
-/// snapshot's age (see [`outlooks`]).
-pub fn account_rows<'a>(views: &[&'a AccountView<'a>], now: DateTime<Utc>) -> Vec<AccountRows<'a>> {
+/// The weekly outlooks of every account with data (see [`outlooks()`]).
+pub fn account_outlooks<'a>(views: &[&'a AccountView<'a>]) -> Vec<AccountOutlooks<'a>> {
     views
         .iter()
         .filter_map(|v| {
-            Some(AccountRows {
+            Some(AccountOutlooks {
                 view: v,
-                rows: outlooks(v.data?, now),
+                outlooks: outlooks(v.data?),
             })
         })
         .collect()
@@ -313,7 +289,7 @@ pub fn account_rows<'a>(views: &[&'a AccountView<'a>], now: DateTime<Utc>) -> Ve
 /// week is already over (stale data from before its reset) adds no window
 /// and draws no now dot or projection.
 pub fn week_series_chart(
-    accounts: &[AccountRows],
+    accounts: &[AccountOutlooks],
     now: DateTime<Utc>,
     palette: &Palette,
 ) -> Option<Chart> {
@@ -321,7 +297,7 @@ pub fn week_series_chart(
         .iter()
         .filter_map(|a| {
             let d = a.view.data?;
-            let mut chart = week_chart(d, now, palette, &a.rows);
+            let mut chart = week_chart(d, now, palette, &a.outlooks);
             // A stale account still errored past its reset: its week is
             // over, so it adds no window, no end mark, no now dot.
             let live = d.week_end > now;
@@ -365,7 +341,7 @@ fn show_series_card(
     palette: &Palette,
     size: CardSize,
 ) -> f32 {
-    let accounts = account_rows(views, now);
+    let accounts = account_outlooks(views);
     let Some(chart) = week_series_chart(&accounts, now, palette) else {
         return 0.0;
     };
@@ -392,8 +368,8 @@ fn show_account_card(
     size: CardSize,
 ) -> f32 {
     let Some(d) = view.data else { return 0.0 };
-    let rows = outlooks(d, now);
-    let mut chart = week_chart(d, now, palette, &rows);
+    let outlooks = outlooks(d);
+    let mut chart = week_chart(d, now, palette, &outlooks);
     chart.series[0].key = timeline::series_key(view.id);
     let reset_known = d.snapshot.seven_day_resets_at().is_some();
     let span = timeline::week_span_in(d.week_start, d.week_end, reset_known, &Local);
@@ -637,11 +613,11 @@ mod tests {
         let b = week_dash(now, 20.0, t(16, 0), None);
         let (ia, ib) = (ProfileId::new("default"), ProfileId::new("work"));
         let (va, vb) = (view(&ia, &a, false), view(&ib, &b, true));
-        let mut accounts = account_rows(&[&va, &vb], now);
-        assert_eq!(accounts[0].rows.len(), 2, "7d all and Fable");
+        let mut accounts = account_outlooks(&[&va, &vb]);
+        assert_eq!(accounts[0].outlooks.len(), 2, "7d all and Fable");
         // Outlooks with lines: "default" caps inside its week, its Fable
         // (resetting two days after) runs past it; "work" is safe.
-        accounts[0].rows = vec![
+        accounts[0].outlooks = vec![
             (
                 Meter::All,
                 WeeklyOutlook::Cap {
@@ -653,7 +629,7 @@ mod tests {
             ),
             (Meter::Fable, WeeklyOutlook::RateOnly { rate: rate(10.0) }),
         ];
-        accounts[1].rows = vec![(
+        accounts[1].outlooks = vec![(
             Meter::All,
             WeeklyOutlook::Safe {
                 rate: rate(2.0),
@@ -661,7 +637,7 @@ mod tests {
                 reset: t(16, 0),
             },
         )];
-        assert_eq!(accounts[1].rows.len(), 1);
+        assert_eq!(accounts[1].outlooks.len(), 1);
         let c = week_series_chart(&accounts, now, palette).unwrap();
         assert_eq!((c.start, c.end), (t(7, 0), t(16, 0)));
         assert_eq!(c.end_marks.len(), 2);
@@ -711,8 +687,8 @@ mod tests {
         let live = week_dash(now, 20.0, t(16, 0), None);
         let (io, il) = (ProfileId::new("old"), ProfileId::new("live"));
         let (vo, vl) = (view(&io, &old, true), view(&il, &live, false));
-        let mut accounts = account_rows(&[&vo, &vl], now);
-        accounts[0].rows = vec![(Meter::All, WeeklyOutlook::Steady { rate: rate(0.1) })];
+        let mut accounts = account_outlooks(&[&vo, &vl]);
+        accounts[0].outlooks = vec![(Meter::All, WeeklyOutlook::Steady { rate: rate(0.1) })];
         let c = week_series_chart(&accounts, now, palette).unwrap();
         assert_eq!((c.start, c.end), (live.week_start, live.week_end));
         assert_eq!(c.end_marks, vec![(live.week_end, vl.color)]);
@@ -725,7 +701,7 @@ mod tests {
         let now = t(12, 12);
         let palette = &crate::ui::theme::DARK;
         let d = week_dash(now, 40.0, t(14, 0), Some(30.0));
-        let c = week_chart(&d, now, palette, &outlooks(&d, now));
+        let c = week_chart(&d, now, palette, &outlooks(&d));
         let s = &c.series[0];
         assert_eq!(
             s.overlay,
@@ -752,32 +728,5 @@ mod tests {
         assert!(!fable_row_shown(Some(0.0), None));
         assert!(fable_row_shown(Some(0.0), Some(reset)));
         assert!(fable_row_shown(Some(12.0), None));
-    }
-
-    #[test]
-    fn cap_in_is_aged_to_now() {
-        let at = Utc.with_ymd_and_hms(2026, 10, 12, 15, 0, 0).unwrap();
-        let cap = WeeklyOutlook::Cap {
-            rate: rate(51.0),
-            at,
-            minutes: 16.0 * 60.0,
-            level: Level::Red,
-        };
-        let WeeklyOutlook::Cap { minutes, at: a, .. } = aged(cap, Duration::minutes(90)) else {
-            panic!("still a cap");
-        };
-        assert_eq!(minutes, 14.5 * 60.0);
-        assert_eq!(a, at);
-        let WeeklyOutlook::Cap { minutes, .. } = aged(cap, Duration::days(2)) else {
-            panic!("still a cap");
-        };
-        assert_eq!(minutes, 0.0);
-        // Other outlooks are untouched.
-        let safe = WeeklyOutlook::Safe {
-            rate: rate(6.0),
-            at_reset: 70.0,
-            reset: at,
-        };
-        assert_eq!(aged(safe, Duration::hours(3)), safe);
     }
 }
