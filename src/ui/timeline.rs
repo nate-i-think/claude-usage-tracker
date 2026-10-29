@@ -2022,12 +2022,11 @@ where
 }
 
 /// Whether an end label's text goes in the plot. "At cap" never does (a ✕
-/// on the 100% line marks it; the row under the chart has the words), and
+/// on the 100% line marks it, and the chip reads 100%), and
 /// a "cap …" or "safe" label only when the projection runs far enough
 /// right to hold it (`run` from now to its end, `room` the label's width
 /// plus its clearance); otherwise only the ✕ (or nothing, for "safe")
-/// shows, so an end minutes away doesn't crowd the plot's corner. The row
-/// under the chart carries the words either way.
+/// shows, so an end minutes away doesn't crowd the plot's corner.
 pub fn label_shown(label: EndLabel, run: f32, room: f32) -> bool {
     match label {
         EndLabel::AtCap => false,

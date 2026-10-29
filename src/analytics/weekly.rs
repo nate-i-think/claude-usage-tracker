@@ -232,55 +232,6 @@ pub fn weekly_outlook(
     }
 }
 
-/// What the rate was measured over, for a tooltip: "over last 24h",
-/// "over last 3d (app was closed)", "over last 8h" (a recent burst), "over
-/// last 3h (app was closed)", "over last 5h (since the weekly reset)", plus
-/// ", spread over 6h" when the floor applied.
-pub fn rate_basis_text(rate: &WeeklyRate) -> String {
-    let why = match (rate.basis, rate.since_reset) {
-        (_, true) => " (since the weekly reset)",
-        (RateBasis::Anchored { gap: true } | RateBasis::Partial, false) => " (app was closed)",
-        (RateBasis::Anchored { gap: false } | RateBasis::Recent, false) => "",
-    };
-    let floor = if rate.floored {
-        format!(", spread over {WEEKLY_FLOOR_HOURS}h")
-    } else {
-        String::new()
-    };
-    format!("over last {}{why}{floor}", fmt_span(rate.span))
-}
-
-/// A rate's span: whole days from 48 h ("3d"), else whole hours ("24h"),
-/// at least "1h".
-pub fn fmt_span(span: Duration) -> String {
-    let hours = span.num_minutes() as f64 / 60.0;
-    if hours >= 48.0 {
-        format!("{:.0}d", (hours / 24.0).round())
-    } else {
-        format!("{:.0}h", hours.round().max(1.0))
-    }
-}
-
-/// A %/day rate: "+21%/day", "+0.4%/day" under 1, "-3%/day".
-pub fn fmt_rate_per_day(rate: f64) -> String {
-    let sign = if rate >= 0.0 { "+" } else { "" };
-    if rate.abs() < 1.0 {
-        format!("{sign}{rate:.1}%/day")
-    } else {
-        format!("{sign}{rate:.0}%/day")
-    }
-}
-
-/// A span of minutes in days and hours, "2d 5h", or as [`super::fmt_min`]
-/// ("5h 12m") under a day.
-pub fn fmt_days(minutes: f64) -> String {
-    let m = minutes.max(0.0) as i64;
-    if m < 1440 {
-        return super::fmt_min(m as f64);
-    }
-    format!("{}d {}h", m / 1440, (m % 1440) / 60)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,7 +290,6 @@ mod tests {
         assert_eq!(r.span, Duration::minutes(24 * 60 + 20));
         assert_eq!(r.basis, RateBasis::Anchored { gap: false });
         assert!(close(r.per_day, 12.0));
-        assert_eq!(rate_basis_text(&r), "over last 24h");
     }
 
     #[test]
@@ -355,7 +305,6 @@ mod tests {
         assert_eq!(r.basis, RateBasis::Anchored { gap: true });
         assert_eq!(r.span, Duration::hours(96));
         assert!(close(r.per_day, 7.5));
-        assert_eq!(rate_basis_text(&r), "over last 4d (app was closed)");
         // The controller's example: anchor 72 h ago: +30 over 3 days.
         let s = vec![(h(-72.0), Some(20.0)), (h(0.0), Some(50.0))];
         let r = weekly_rate(&s, None, now()).unwrap();
@@ -364,8 +313,8 @@ mod tests {
         let s = vec![(h(-26.0), Some(48.0)), (h(0.0), Some(56.0))];
         let r = weekly_rate(&s, None, now()).unwrap();
         assert_eq!(r.basis, RateBasis::Anchored { gap: true });
+        assert_eq!(r.span, Duration::hours(26));
         assert!(close(r.per_day, 8.0 * 24.0 / 26.0));
-        assert_eq!(rate_basis_text(&r), "over last 26h (app was closed)");
     }
 
     #[test]
@@ -382,7 +331,6 @@ mod tests {
         assert_eq!(r.basis, RateBasis::Recent);
         assert_eq!(r.span, Duration::hours(8));
         assert!(close(r.per_day, 60.0));
-        assert_eq!(rate_basis_text(&r), "over last 8h");
         // A burst under the 6 h floor doesn't count: the anchored rate.
         let s = vec![
             (h(-72.0), Some(20.0)),
@@ -566,59 +514,5 @@ mod tests {
             weekly_outlook(&[], Some(103.0), None, now()),
             WeeklyOutlook::AtCap { reset: None }
         );
-    }
-
-    #[test]
-    fn spans() {
-        assert_eq!(fmt_span(Duration::minutes(24 * 60 + 20)), "24h");
-        assert_eq!(fmt_span(Duration::hours(47)), "47h");
-        assert_eq!(fmt_span(Duration::hours(48)), "2d");
-        assert_eq!(fmt_span(Duration::hours(84)), "4d");
-        assert_eq!(fmt_span(Duration::minutes(10)), "1h");
-    }
-
-    #[test]
-    fn basis_texts() {
-        let r = |span_h: i64, basis, since_reset| WeeklyRate {
-            per_day: 1.0,
-            span: Duration::hours(span_h),
-            basis,
-            floored: span_h < WEEKLY_FLOOR_HOURS,
-            since_reset,
-        };
-        assert_eq!(
-            rate_basis_text(&r(24, RateBasis::Anchored { gap: false }, false)),
-            "over last 24h"
-        );
-        assert_eq!(
-            rate_basis_text(&r(72, RateBasis::Anchored { gap: true }, false)),
-            "over last 3d (app was closed)"
-        );
-        assert_eq!(
-            rate_basis_text(&r(8, RateBasis::Recent, false)),
-            "over last 8h"
-        );
-        assert_eq!(
-            rate_basis_text(&r(10, RateBasis::Partial, false)),
-            "over last 10h (app was closed)"
-        );
-        assert_eq!(
-            rate_basis_text(&r(3, RateBasis::Partial, false)),
-            "over last 3h (app was closed), spread over 6h"
-        );
-        assert_eq!(
-            rate_basis_text(&r(5, RateBasis::Partial, true)),
-            "over last 5h (since the weekly reset), spread over 6h"
-        );
-    }
-
-    #[test]
-    fn formats() {
-        assert_eq!(fmt_rate_per_day(21.4), "+21%/day");
-        assert_eq!(fmt_rate_per_day(0.42), "+0.4%/day");
-        assert_eq!(fmt_rate_per_day(-3.2), "-3%/day");
-        assert_eq!(fmt_days(2.0 * 1440.0 + 5.0 * 60.0 + 59.0), "2d 5h");
-        assert_eq!(fmt_days(1440.0), "1d 0h");
-        assert_eq!(fmt_days(312.0), "5h 12m");
     }
 }

@@ -606,15 +606,11 @@ fn pill_segments(views: &[AccountView], now: DateTime<Utc>) -> Vec<PillSegment> 
 /// The dashboard body once some account has data: the charts, footer
 /// strip, Details.
 fn dashboard(ui: &mut Ui, views: &[AccountView], settings: &mut Settings) {
-    let Some(d) = accounts::first_data(views) else {
+    if accounts::first_data(views).is_none() {
         return;
-    };
+    }
     let now = Utc::now();
-    let fresh = week::Freshness {
-        age: now - d.snapshot.fetched_at,
-        stale: snapshot_stale(d.snapshot.fetched_at, now, settings),
-    };
-    charts(ui, views, now, fresh);
+    charts(ui, views, now);
     footer::show_footer(ui, views);
     details::show_details(ui, views, settings, now);
 }
@@ -622,10 +618,8 @@ fn dashboard(ui: &mut Ui, views: &[AccountView], settings: &mut Settings) {
 /// The 5-hour and the 7-day timelines, each on its titled card, both
 /// [`timeline::FULL_HEIGHT`] tall: side by side when the column is wide
 /// enough (see [`layout::chart_widths`]), levelled to the taller card's
-/// content (measured the frame before); else stacked, 5-hour first. The
-/// weekly rows are muted when the snapshot is stale (see
-/// [`week::Freshness`]).
-fn charts(ui: &mut Ui, views: &[AccountView], now: DateTime<Utc>, fresh: week::Freshness) {
+/// content (measured the frame before); else stacked, 5-hour first.
+fn charts(ui: &mut Ui, views: &[AccountView], now: DateTime<Utc>) {
     let palette = theme::Palette::for_visuals(ui.visuals());
     let Some((left, right)) = layout::chart_widths(ui.available_width()) else {
         let size = layout::CardSize {
@@ -633,7 +627,7 @@ fn charts(ui: &mut Ui, views: &[AccountView], now: DateTime<Utc>, fresh: week::F
             min_content: 0.0,
         };
         timeline::show_timeline_card(ui, views, now, palette, size);
-        week::show_week_card(ui, views, now, palette, size, fresh);
+        week::show_week_card(ui, views, now, palette, size);
         return;
     };
     let id = egui::Id::new("charts-level-height");
@@ -650,7 +644,7 @@ fn charts(ui: &mut Ui, views: &[AccountView], now: DateTime<Utc>, fresh: week::F
                 timeline::show_timeline_card(ui, views, now, palette, size)
             });
             let b = ui.allocate_ui_with_layout(egui::vec2(right, 0.0), column, |ui| {
-                week::show_week_card(ui, views, now, palette, size, fresh)
+                week::show_week_card(ui, views, now, palette, size)
             });
             [a.inner, b.inner]
         })
@@ -660,14 +654,6 @@ fn charts(ui: &mut Ui, views: &[AccountView], now: DateTime<Utc>, fresh: week::F
         ui.ctx().data_mut(|m| m.insert_temp(id, next));
         ui.ctx().request_repaint();
     }
-}
-
-/// Whether a snapshot fetched at `fetched` is stale at `now`: older than
-/// two poll intervals (polls are failing, or the machine slept).
-fn snapshot_stale(fetched: DateTime<Utc>, now: DateTime<Utc>, settings: &Settings) -> bool {
-    let interval = crate::poller::poll_interval(settings);
-    let limit = chrono::Duration::from_std(interval * 2).unwrap_or(chrono::Duration::MAX);
-    now - fetched > limit
 }
 
 /// Lay `add` out in the content column: at most
@@ -738,21 +724,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::DateTime;
     use eframe::Storage;
-
-    #[test]
-    fn snapshot_stale_after_two_poll_intervals() {
-        let t = DateTime::from_timestamp(1_791_000_000, 0).unwrap();
-        let settings = Settings {
-            interval_secs: 60,
-            ..Settings::default()
-        };
-        let at = |s: i64| t + chrono::Duration::seconds(s);
-        assert!(!snapshot_stale(t, at(0), &settings));
-        assert!(!snapshot_stale(t, at(120), &settings));
-        assert!(snapshot_stale(t, at(121), &settings));
-    }
 
     #[derive(Default)]
     struct FakeStorage(std::collections::HashMap<String, String>);
