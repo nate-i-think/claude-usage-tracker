@@ -47,7 +47,7 @@ Switch between them (or follow the system) with **Theme** in [Settings](#setting
 
 With two or more profiles polled, everything above shows all of them at once, in the order set in Settings → Accounts, each in its own series color (blue, violet, teal, ...; also chosen there):
 
-- **Chips** are grouped per account: a colored dot and the account's label over its 5-hour, 7-day and Fable chips. The chips keep their state colors, so the account color and the level never compete. Only the 5-hour chip of the account nearest its cap pulses.
+- **Chips** are grouped per account: a colored dot and the account's label over its 5-hour, 7-day and Fable chips. The groups sit side by side when they all fit in one row, else they stack. The chips keep their state colors, so the account color and the level never compete. Only the 5-hour chip of the account nearest its cap pulses.
 - **Both timelines** overlay the accounts over the union of their windows: each account's line in its color with a light tint under it, a legend in the card's title row, and each account's reset as a colored mark on the time axis. Hover lists every account's value at that moment. The 5-hour Fable share layer is left out; on the 7-day chart each account's Fable line is dashed in its color. The 5-hour burn rows are grouped under each account's name.
 - An account whose last poll failed keeps its last good data, dimmed and badged "stale".
 

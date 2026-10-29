@@ -33,6 +33,12 @@ const LINE_GAP: f32 = 1.0;
 const DELTA_GAP: f32 = 4.0;
 /// A pace delta this far from even (in points, either way) gets a color.
 pub const PACE_NOTABLE: f64 = 10.0;
+/// Space between the dot, the name and the badge of a group header.
+const HEADER_SPACING: f32 = 4.0;
+/// The badge's inner margin, left and right.
+const BADGE_MARGIN_X: i8 = 4;
+/// The badge's border width.
+const BADGE_STROKE: f32 = 1.0;
 
 /// One stat chip's data.
 #[derive(Debug, Clone, PartialEq)]
@@ -313,46 +319,74 @@ pub fn badge(view: &AccountView) -> Option<(&'static str, String)> {
 
 /// The accounts' stat chips (see [`chip_groups`]): each account's dot,
 /// label and badge over its chips when several are shown, a stale one
-/// dimmed; nothing before the first poll.
+/// dimmed; nothing before the first poll. The groups sit side by side when
+/// all of them fit in one row on their own one-row widths (see
+/// [`layout::groups_side_by_side`]), else they stack and each packs its
+/// chips into as many rows as the width needs.
 pub fn show_account_chips(ui: &mut Ui, accounts: &[AccountView], now: DateTime<Utc>, pulse: f32) {
     let groups = chip_groups(accounts, now);
     if groups.is_empty() {
         return;
     }
     let palette = Palette::for_visuals(ui.visuals());
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing = vec2(GAP, GAP);
-        for g in &groups {
+    let prepared: Vec<Vec<Prepared>> = groups
+        .iter()
+        .map(|g| {
+            let key = super::timeline::series_key(accounts[g.account].id);
+            prepare(ui, key, &g.chips, palette)
+        })
+        .collect();
+    let widths: Vec<f32> = groups
+        .iter()
+        .zip(&prepared)
+        .map(|(g, p)| {
+            let chips = layout::row_width(p.iter().map(|p| p.measured.size.x), GAP);
+            if g.header {
+                chips.max(group_header_width(ui, &accounts[g.account]))
+            } else {
+                chips
+            }
+        })
+        .collect();
+    let side_by_side = layout::groups_side_by_side(ui, Id::new("chips-side-by-side"), &widths);
+    layout::show_groups(
+        ui,
+        side_by_side,
+        groups.iter().zip(prepared),
+        |ui, (g, p)| {
             let view = &accounts[g.account];
-            let key = super::timeline::series_key(view.id);
-            ui.vertical(|ui| {
-                if g.header {
-                    if view.stale {
-                        ui.multiply_opacity(super::timeline::DIM_ALPHA);
-                    }
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    group_header(ui, palette, view);
+            if g.header {
+                if view.stale {
+                    ui.multiply_opacity(super::timeline::DIM_ALPHA);
                 }
-                if !g.chips.is_empty() {
-                    show_chips(ui, key, &g.chips, now, pulse);
-                }
-            });
-        }
-    });
+                ui.spacing_mut().item_spacing.y = 2.0;
+                group_header(ui, palette, view);
+            }
+            if !g.chips.is_empty() {
+                let wrap = if side_by_side {
+                    f32::INFINITY
+                } else {
+                    ui.available_width()
+                };
+                show_chips(ui, &g.chips, p, wrap, now, pulse);
+            }
+        },
+    );
 }
 
-/// An account's dot and name over its chips, and its [`badge`].
-fn group_header(ui: &mut Ui, palette: &Palette, view: &AccountView) {
+/// An account's dot and name over its chips (or its strip below the
+/// charts), and its [`badge`].
+pub(super) fn group_header(ui: &mut Ui, palette: &Palette, view: &AccountView) {
     use eframe::egui::{CornerRadius, Frame, Margin, RichText};
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = HEADER_SPACING;
         ui.label(RichText::new("●").small().color(view.color));
         ui.label(RichText::new(view.label).small().color(palette.text_muted));
         if let Some((text, hover)) = badge(view) {
             Frame::NONE
-                .stroke(Stroke::new(1.0, palette.border))
+                .stroke(Stroke::new(BADGE_STROKE, palette.border))
                 .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::symmetric(4, 0))
+                .inner_margin(Margin::symmetric(BADGE_MARGIN_X, 0))
                 .show(ui, |ui| {
                     ui.label(RichText::new(text).small().color(palette.text_muted))
                 })
@@ -362,39 +396,73 @@ fn group_header(ui: &mut Ui, palette: &Palette, view: &AccountView) {
     });
 }
 
-/// One account's chips (ids keyed by `key`), packed into as many rows as
-/// the width needs. Percentages and their state colors ease to each poll's
-/// values; the border and glow of the chip that [`Chip::pulses`] show
-/// `pulse` (a [`motion::Pulse`] level, 0 = none).
-fn show_chips(ui: &mut Ui, key: u64, chips: &[Chip], now: DateTime<Utc>, pulse: f32) {
-    let palette = Palette::for_visuals(ui.visuals());
+/// The width of [`group_header`] for `view`, from its text, so the groups'
+/// layout is decided before any of them is drawn.
+pub(super) fn group_header_width(ui: &Ui, view: &AccountView) -> f32 {
+    let small = TextStyle::Small.resolve(ui.style());
+    let text_w = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), small.clone(), Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    let mut width = text_w("●") + HEADER_SPACING + text_w(view.label);
+    if let Some((text, _)) = badge(view) {
+        let frame = 2.0 * (f32::from(BADGE_MARGIN_X) + BADGE_STROKE);
+        width += HEADER_SPACING + text_w(text) + frame;
+    }
+    width
+}
+
+/// A chip measured for this frame, with its eased state color.
+struct Prepared {
+    measured: Measured,
+    color: Color32,
+}
+
+/// One account's chips (ids keyed by `key`) measured with their eased
+/// percentages and state colors.
+fn prepare(ui: &Ui, key: u64, chips: &[Chip], palette: &Palette) -> Vec<Prepared> {
     let ctx = ui.ctx().clone();
-    let shown: Vec<(Option<f64>, Color32)> = chips
+    chips
         .iter()
         .map(|c| {
             let color = palette.level(analytics::color_for(c.pct));
-            (
-                c.pct
-                    .map(|p| motion::eased(&ctx, chip_id("chip-pct", key, c.label), p)),
-                motion::eased(&ctx, chip_id("chip-color", key, c.label), color),
-            )
+            let pct = c
+                .pct
+                .map(|p| motion::eased(&ctx, chip_id("chip-pct", key, c.label), p));
+            let color = motion::eased(&ctx, chip_id("chip-color", key, c.label), color);
+            Prepared {
+                measured: measure(ui, c, pct, color, palette),
+                color,
+            }
         })
-        .collect();
-    let measured: Vec<Measured> = chips
-        .iter()
-        .zip(&shown)
-        .map(|(c, &(pct, color))| measure(ui, c, pct, color, palette))
-        .collect();
-    let widths: Vec<f32> = measured.iter().map(|m| m.size.x).collect();
-    let rows = layout::pack_rows(&widths, ui.available_width(), GAP);
-    let mut items = chips.iter().zip(measured).zip(shown);
+        .collect()
+}
+
+/// One account's chips, as [`prepare`]d, packed into as many rows of
+/// `wrap` width as they need. Percentages and their state colors ease to
+/// each poll's values; the border and glow of the chip that
+/// [`Chip::pulses`] show `pulse` (a [`motion::Pulse`] level, 0 = none).
+fn show_chips(
+    ui: &mut Ui,
+    chips: &[Chip],
+    prepared: Vec<Prepared>,
+    wrap: f32,
+    now: DateTime<Utc>,
+    pulse: f32,
+) {
+    let palette = Palette::for_visuals(ui.visuals());
+    let widths: Vec<f32> = prepared.iter().map(|p| p.measured.size.x).collect();
+    let rows = layout::pack_rows(&widths, wrap, GAP);
+    let mut items = chips.iter().zip(prepared);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = vec2(GAP, GAP);
         for count in rows {
             ui.horizontal(|ui| {
-                for ((chip, m), (_, color)) in items.by_ref().take(count) {
+                for (chip, p) in items.by_ref().take(count) {
                     let glow = if chip.pulses { pulse } else { 0.0 };
-                    paint_chip(ui, m, palette, glow, color)
+                    paint_chip(ui, p.measured, palette, glow, p.color)
                         .on_hover_text(tooltip_in(chip, now, &Local));
                 }
             });

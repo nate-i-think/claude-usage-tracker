@@ -1,9 +1,10 @@
 //! Layout rules shared by the dashboard sections: outer padding, gaps, the
 //! capped and centered content column, the charts' side-by-side split,
-//! greedy row packing for things that wrap (stat chips, footer items), and
-//! the right-then-left row helper.
+//! greedy row packing for things that wrap (stat chips, footer items),
+//! account groups side by side when they fit, and the right-then-left row
+//! helper.
 
-use eframe::egui::{Align, Layout, Ui};
+use eframe::egui::{vec2, Align, Id, Layout, Ui};
 
 /// Padding between the window edge and the content, in points.
 pub const OUTER_PAD: i8 = 12;
@@ -18,6 +19,15 @@ pub const CHARTS_SIDE_BY_SIDE_MIN: f32 = 640.0;
 /// The 5-hour timeline's share of the row when the charts sit side by
 /// side: half, now the weekly chart is a timeline too.
 const TIMELINE_SHARE: f32 = 0.5;
+/// Horizontal gap between account groups sitting side by side: wider than
+/// the gap between the chips inside a group, so the groups read apart.
+pub const GROUP_GAP: f32 = 3.0 * GAP;
+/// Stacked groups move side by side only with this much width to spare;
+/// once side by side they stay until they no longer fit. So a width right
+/// at the boundary (a percentage easing from 9% to 10%, a scrollbar coming
+/// and going with the stacked layout's height) can't flip the layout frame
+/// to frame.
+pub const SIDE_BY_SIDE_SLACK: f32 = 24.0;
 
 /// Width of the content column for `available` width.
 pub fn content_width(available: f32) -> f32 {
@@ -78,6 +88,70 @@ pub fn pack_rows(widths: &[f32], available: f32, gap: f32) -> Vec<usize> {
     rows
 }
 
+/// Whether groups of these natural widths sit side by side, `gap` apart, in
+/// `available` width, given whether they did last frame
+/// (`was_side_by_side`): they stay while they fit, and move there from
+/// stacked only with [`SIDE_BY_SIDE_SLACK`] to spare. Fewer than two
+/// groups never do: there is nothing to put beside them.
+pub fn fits_side_by_side(widths: &[f32], gap: f32, available: f32, was_side_by_side: bool) -> bool {
+    if widths.len() < 2 {
+        return false;
+    }
+    let total = widths.iter().sum::<f32>() + gap * (widths.len() - 1) as f32;
+    let room = if was_side_by_side {
+        available
+    } else {
+        available - SIDE_BY_SIDE_SLACK
+    };
+    total <= room
+}
+
+/// [`fits_side_by_side`] in the available width, given [`GROUP_GAP`]
+/// between groups, with last frame's decision kept in temp memory under
+/// `id` (one id per strip of groups).
+pub fn groups_side_by_side(ui: &Ui, id: Id, widths: &[f32]) -> bool {
+    let was = ui.ctx().data(|m| m.get_temp::<bool>(id)).unwrap_or(false);
+    let now = fits_side_by_side(widths, GROUP_GAP, ui.available_width(), was);
+    if now != was {
+        ui.ctx().data_mut(|m| m.insert_temp(id, now));
+    }
+    now
+}
+
+/// Lay out one group per item: side by side in one row, [`GROUP_GAP`]
+/// apart, top-aligned, when `side_by_side`; else stacked, [`GAP`] apart.
+/// Each group is its own vertical column.
+pub fn show_groups<T>(
+    ui: &mut Ui,
+    side_by_side: bool,
+    items: impl IntoIterator<Item = T>,
+    mut add: impl FnMut(&mut Ui, T),
+) {
+    let mut column = |ui: &mut Ui, item| {
+        ui.vertical(|ui| add(ui, item));
+    };
+    if side_by_side {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = vec2(GROUP_GAP, GAP);
+            items.into_iter().for_each(|item| column(ui, item));
+        });
+    } else {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+            items.into_iter().for_each(|item| column(ui, item));
+        });
+    }
+}
+
+/// The width of items laid out in one row, `gap` apart; 0 for none.
+pub fn row_width(widths: impl IntoIterator<Item = f32>, gap: f32) -> f32 {
+    widths
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| if i == 0 { w } else { gap + w })
+        .sum()
+}
+
 /// One row: `right` laid out first from the right edge, then `left` from the
 /// left edge in the remaining width, so wrapping content on the left never
 /// runs under the right-hand widgets.
@@ -136,6 +210,57 @@ mod tests {
         assert_eq!(pack_rows(&[90.0; 3], 285.9, 8.0), vec![2, 1]);
         assert_eq!(pack_rows(&[90.0; 3], 187.9, 8.0), vec![1, 1, 1]);
         assert_eq!(pack_rows(&[50.0, 200.0, 30.0], 240.0, 8.0), vec![1, 2]);
+    }
+
+    #[test]
+    fn groups_side_by_side_only_when_all_fit() {
+        // 120 + 24 + 150 = 294.
+        let widths = [120.0, 150.0];
+        assert!(fits_side_by_side(&widths, 24.0, 294.0, true));
+        assert!(!fits_side_by_side(&widths, 24.0, 293.9, true));
+        // Three groups: all in one row or none.
+        assert!(fits_side_by_side(&[50.0; 3], 10.0, 170.0, true));
+        assert!(!fits_side_by_side(&[50.0; 3], 10.0, 169.0, true));
+    }
+
+    #[test]
+    fn groups_need_slack_to_leave_the_stack() {
+        let widths = [120.0, 150.0];
+        let edge = 294.0;
+        // Stacked: at the edge it stays stacked, with the slack it moves.
+        assert!(!fits_side_by_side(&widths, 24.0, edge, false));
+        assert!(!fits_side_by_side(
+            &widths,
+            24.0,
+            edge + SIDE_BY_SIDE_SLACK - 0.1,
+            false
+        ));
+        assert!(fits_side_by_side(
+            &widths,
+            24.0,
+            edge + SIDE_BY_SIDE_SLACK,
+            false
+        ));
+        // Inside the slack band each layout keeps itself: no width flips
+        // between the two frame to frame.
+        for w in [edge, edge + 10.0, edge + SIDE_BY_SIDE_SLACK - 1.0] {
+            for was in [false, true] {
+                assert_eq!(fits_side_by_side(&widths, 24.0, w, was), was, "{w} {was}");
+            }
+        }
+    }
+
+    #[test]
+    fn row_widths() {
+        assert_eq!(row_width([90.0; 3], 8.0), 286.0);
+        assert_eq!(row_width([40.0], 8.0), 40.0);
+        assert_eq!(row_width([], 8.0), 0.0);
+    }
+
+    #[test]
+    fn one_group_never_sits_side_by_side() {
+        assert!(!fits_side_by_side(&[10.0], 24.0, 1000.0, true));
+        assert!(!fits_side_by_side(&[], 24.0, 1000.0, true));
     }
 
     #[test]
