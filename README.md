@@ -31,17 +31,11 @@ The window opens at 420x760 (minimum 360x320) in a warm dark theme. With one acc
   - **Weekly projections**: each limit's dashed line comes from its rate per day over the last 24 hours, measured from the latest sample at or before then (when that sample is older because the app was closed, the rise is spread over the whole gap; if the samples since then span 6 hours or more and rise faster, that faster rate is used instead), only since the weekly reset if that is later, and projected to that limit's reset. A short stretch of samples is never spread over less than 6 hours. With too little history there is no projection. The cap time counts from the last good poll.
 - When the window is wide (a content column of 640 pt or more; the column grows to 1000 pt), the two timelines sit side by side, half each, and both cards end level. Narrower, they stack.
 - **Extra**: credits used against your monthly limit as a small gauge ("$23 / $35"), when extra usage is set up. Hover for the details, including why extra usage is disabled if it is.
-- **Details** (click to expand; it stays open or closed across restarts):
-  - The other usage windows (per-model caps beyond Fable). Windows at 0% are hidden unless "Show all buckets" is on.
-  - The ALL and FABLE burn lines in full, and the projected-use advice ("safe to spin up another agent").
-  - The week's usage by surface (Claude Code, Cowork, chat, ...), when the API reports the breakdown.
-  - **Top burners**: the projects using the most tokens in the current 5-hour window, attributed from the profile's local Claude Code session logs (`<config dir>/projects/`) and Cowork's (`~/Library/Application Support/Claude/local-agent-mode-sessions/` on macOS, `%APPDATA%\Claude\local-agent-mode-sessions\` on Windows). Cowork files its sessions under the account's id, so they count for the profile signed in to that account (sessions of no known account count for the default profile). A project is named after the last folder of the working directory recorded in its session log.
-  - The plan label, how long the account's token is still valid, and how long ago the last poll was.
 - **Errors**: a failed poll shows a banner above the last good data, which stays visible: "work — token expired" with the fix underneath ("token expired — run Claude Code in ~/.claude to refresh"). That account's data is dimmed with a "stale" badge until a poll succeeds again; hover the badge for the error. See [Accounts](#accounts-claude-code-profiles).
 
 Numbers and bars glide to their new values on each poll, and the projection draws itself in. When the 5-hour window reaches 90%, its chip breathes three times and then holds a red outline and glow; it re-arms once usage drops below 88% or a new window starts.
 
-The window's size, position, maximized state and mode (full or pill), the theme, the Details state, and your settings persist across restarts.
+The window's size, position, maximized state and mode (full or pill), the theme, and your settings persist across restarts.
 
 The theme is dark by default, and a light "cream" theme is built in:
 
@@ -55,7 +49,6 @@ With two or more profiles polled, everything above shows all of them at once, in
 
 - **Chips** are grouped per account: a colored dot and the account's label over its 5-hour, 7-day and Fable chips. The chips keep their state colors, so the account color and the level never compete. Only the 5-hour chip of the account nearest its cap pulses.
 - **Both timelines** overlay the accounts over the union of their windows: each account's line in its color with a light tint under it, a legend in the card's title row, and each account's reset as a colored mark on the time axis. Hover lists every account's value at that moment. The 5-hour Fable share layer is left out; on the 7-day chart each account's Fable line is dashed in its color. The 5-hour burn rows are grouped under each account's name.
-- **Details** has one section per account.
 - An account whose last poll failed keeps its last good data, dimmed and badged "stale".
 
 Labels default to the email's local part (at most 16 characters) or, without one, the config directory's name; rename them in Settings → Accounts.
@@ -108,9 +101,9 @@ Clicking a notification is meant to bring the window forward, but this has not b
 
 Open Settings with ⚙. Changes take effect on **Apply**, except **Always on top** and **Theme**, which apply at once.
 
-- **Plan label**: shown in the Details footer line (default "Max").
+- **Plan label** (default "Max"): not shown anywhere since the Details card was removed.
 - **Poll interval**: default 60 s, minimum 5 s. It accepts plain seconds or a suffix: `30`, `30s`, `2m`, `1h`.
-- **Show all buckets**: list usage windows at 0% in Details too.
+- **Show all buckets**: not used anywhere since the Details card was removed.
 - **Always on top**: keep the full window above other windows. (The pill is always on top.)
 - **Theme**: **System**, **Dark** (the default) or **Light**.
 - **Accounts**: one card per profile, in display (and poll) order:
@@ -315,7 +308,7 @@ The data directory is:
 
 This is the same directory the Python version used with python.org (non-Store) Python, so that history carries over as is. If you ran the Python version with Microsoft Store Python, see [Migrating history from the Python version](#migrating-history-from-the-python-version).
 
-The GUI's settings (everything in the [Settings](#settings) panel, including the Accounts list: each profile's id, config dir, label, color, enabled flag and Keychain override), its window state (full-window and pill positions, size, maximized, current mode, Details open or closed), each profile's alert state, and the theme are stored in eframe's `app.ron`. Settings saved by a version from before profiles still load; their cookie-file and client-SHA entries are ignored and dropped on the next save. `app.ron` lives at:
+The GUI's settings (everything in the [Settings](#settings) panel, including the Accounts list: each profile's id, config dir, label, color, enabled flag and Keychain override), its window state (full-window and pill positions, size, maximized, current mode), each profile's alert state, and the theme are stored in eframe's `app.ron`. Settings saved by a version from before profiles still load; their cookie-file and client-SHA entries are ignored and dropped on the next save. `app.ron` lives at:
 
 - Windows: `%APPDATA%\claude-usage\data\app.ron`
 - macOS: `~/Library/Application Support/claude-usage/app.ron`

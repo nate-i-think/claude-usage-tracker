@@ -1,5 +1,5 @@
-//! Dashboard rows: testable formatters from analytics data to [`Run`]s, and
-//! the small egui functions that lay them out.
+//! Dashboard rows: testable formatters from analytics data to [`Run`]s,
+//! shared by the text report and the GUI's tooltips and strips.
 //!
 //! Copy and ordering follow `render_dashboard` and its helpers in the Python
 //! ui.py (removed; see git history).
@@ -10,9 +10,7 @@ use crate::analytics::{self, BurnLine, Eta, Headroom, BURN_WINDOW_MINUTES};
 use crate::model::{ExtraUsage, UsageWindow};
 use crate::storage::InstanceUsage;
 
-use eframe::egui::{vec2, Align, Color32, Id, Layout, Rect, RichText, Sense, TextStyle, Ui};
-
-use super::{bar_track_color, digits, motion, show_runs, theme, tone_color, Run, Tone};
+use super::{Run, Tone};
 
 /// One window's summary row, ready to lay out.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,109 +167,6 @@ pub fn header_runs(plan: &str) -> Vec<Run> {
         Run::new("  ·  ", Tone::Dim),
         Run::new(plan, Tone::Strong),
     ]
-}
-
-/// "last polled {secs}s ago", never negative.
-pub fn last_polled(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let secs = (now - fetched_at).num_seconds().max(0);
-    format!("last polled {secs}s ago")
-}
-
-// --- Layout -------------------------------------------------------------------
-
-/// Label column: fits the longest window label ("Omelette promo").
-const LABEL_WIDTH: f32 = 104.0;
-/// Percentage column ("100.0%" with fixed-width digits).
-const PCT_WIDTH: f32 = 56.0;
-/// Reset countdown column ("23h 59m").
-const RESET_WIDTH: f32 = 64.0;
-/// Burn-line tag column: fits "FABLE:".
-const TAG_WIDTH: f32 = 52.0;
-/// Progress bar thickness.
-const BAR_HEIGHT: f32 = 6.0;
-
-/// A fixed-width, row-height cell with the given layout.
-fn cell<R>(ui: &mut Ui, width: f32, layout: Layout, add: impl FnOnce(&mut Ui) -> R) -> R {
-    let size = vec2(width, ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(size, layout, |ui| {
-        ui.set_min_size(size);
-        add(ui)
-    })
-    .inner
-}
-
-fn left() -> Layout {
-    Layout::left_to_right(Align::Center)
-}
-
-fn right() -> Layout {
-    Layout::right_to_left(Align::Center)
-}
-
-/// One window row: label, percentage, bar, countdown, aligned as a grid.
-/// The bar's eased values are keyed by `key` (the account's
-/// [`super::timeline::series_key`]) and the label.
-pub fn show_window_row(ui: &mut Ui, key: u64, row: &WindowRow) {
-    ui.horizontal(|ui| {
-        cell(ui, LABEL_WIDTH, left(), |ui| {
-            let body = TextStyle::Body.resolve(ui.style());
-            ui.label(
-                RichText::new(&row.label)
-                    .font(theme::font_for(Tone::Strong, &body))
-                    .color(tone_color(Tone::Strong, ui.visuals())),
-            );
-        });
-        cell(ui, PCT_WIDTH, right(), |ui| number(ui, &row.pct));
-        let gap = ui.spacing().item_spacing.x;
-        let bar_width = (ui.available_width() - RESET_WIDTH - gap).max(0.0);
-        // The bar's fill and color ease to each poll's values.
-        let ctx = ui.ctx().clone();
-        let fraction = motion::eased(&ctx, Id::new(("window-bar", key, &row.label)), row.fraction);
-        let fill = tone_color(row.fill, ui.visuals());
-        let fill = motion::eased(&ctx, Id::new(("window-bar-color", key, &row.label)), fill);
-        paint_bar(ui, bar_width, fraction, fill);
-        cell(ui, RESET_WIDTH, right(), |ui| number(ui, &row.reset));
-    });
-}
-
-/// A run in the body font with fixed-width digits; strong runs semibold.
-fn number(ui: &mut Ui, run: &Run) {
-    let body = TextStyle::Body.resolve(ui.style());
-    let font = theme::font_for(run.tone, &body);
-    let color = tone_color(run.tone, ui.visuals());
-    digits::number_label(ui, run.text.trim_start(), font, color);
-}
-
-/// A rounded track with the filled share painted over it.
-fn paint_bar(ui: &mut Ui, width: f32, fraction: f32, fill: Color32) {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(width, ui.spacing().interact_size.y), Sense::hover());
-    let track = Rect::from_center_size(rect.center(), vec2(rect.width(), BAR_HEIGHT));
-    let radius = BAR_HEIGHT / 2.0;
-    let painter = ui.painter();
-    painter.rect_filled(track, radius, bar_track_color(ui.visuals()));
-    if fraction > 0.0 {
-        let mut filled = track;
-        filled.set_width((track.width() * fraction).max(BAR_HEIGHT));
-        painter.rect_filled(filled, radius, fill);
-    }
-}
-
-/// A burn line: the tag in a fixed column so "ALL:" and "FABLE:" bodies line
-/// up, then the body.
-pub fn show_burn_row(ui: &mut Ui, tag: BurnTag, body: &[Run]) {
-    ui.horizontal(|ui| {
-        cell(ui, TAG_WIDTH, left(), |ui| {
-            let tag = burn_tag(tag);
-            let body = TextStyle::Body.resolve(ui.style());
-            ui.label(
-                RichText::new(tag.text)
-                    .font(theme::semibold(body.size))
-                    .color(tone_color(tag.tone, ui.visuals())),
-            );
-        });
-        show_runs(ui, body);
-    });
 }
 
 #[cfg(test)]
@@ -490,18 +385,5 @@ mod tests {
         assert_eq!(runs[0].tone, Tone::Accent);
         assert_eq!(runs[1].tone, Tone::Dim);
         assert_eq!(runs[2], Run::new("Max 5x", Tone::Strong));
-    }
-
-    #[test]
-    fn last_polled_seconds() {
-        assert_eq!(
-            last_polled(NOW - Duration::seconds(24), NOW),
-            "last polled 24s ago"
-        );
-        // Clock skew never shows a negative age.
-        assert_eq!(
-            last_polled(NOW + Duration::seconds(3), NOW),
-            "last polled 0s ago"
-        );
     }
 }

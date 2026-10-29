@@ -19,8 +19,8 @@ pub const MIN_INTERVAL_SECS: u64 = 5;
 
 /// Persisted user settings. Missing fields take their [`Default`] values,
 /// so an `app.ron` written by an older build still loads; fields it has
-/// that were since removed (`cookie_file`, `client_sha`, `alert_state`) are
-/// ignored.
+/// that were since removed (`cookie_file`, `client_sha`, `alert_state`,
+/// `details_open`) are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -50,8 +50,6 @@ pub struct Settings {
     /// Alerts already delivered in the current 5-hour window, per profile id,
     /// persisted so a restart does not repeat them.
     pub alert_states: BTreeMap<String, AlertState>,
-    /// The Details section is expanded.
-    pub details_open: bool,
     /// Skip animations.
     pub reduce_motion: bool,
     /// Keep the high-usage pulse going instead of settling.
@@ -77,7 +75,6 @@ impl Default for Settings {
             start_in_pill: false,
             alerts: AlertToggles::default(),
             alert_states: BTreeMap::new(),
-            details_open: false,
             reduce_motion: false,
             keep_pulsing: false,
             profiles: Vec::new(),
@@ -213,7 +210,7 @@ mod tests {
         assert_eq!(s.alerts, AlertToggles::default());
         assert!(s.alerts.crossed_75 && s.alerts.crossed_90 && s.alerts.projected_cap);
         assert!(s.alert_states.is_empty());
-        assert!(!s.details_open && !s.reduce_motion && !s.keep_pulsing);
+        assert!(!s.reduce_motion && !s.keep_pulsing);
         assert!(s.profiles.is_empty());
     }
 
@@ -246,8 +243,9 @@ mod tests {
     }
 
     /// The full Settings RON of the last cookie-era build (e9dff54), with
-    /// `cookie_file`, `client_sha` and a populated `alert_state`, loads; the
-    /// kept fields survive and the removed ones are dropped.
+    /// `cookie_file`, `client_sha`, a populated `alert_state` and
+    /// `details_open` (the removed Details card's state), loads; the kept
+    /// fields survive and the removed ones are dropped.
     #[test]
     fn settings_cookie_era_app_ron_loads() {
         let old = r#"(plan:"Max",interval_secs:90,show_all:false,always_on_top:false,cookie_file:Some("/Users/x/Library/Application Support/Firefox/Profiles/a.default/cookies.sqlite"),client_sha:Some("abcdef1234567890"),ui_mode:Pill,full_rect:Some((pos:(x:-1200,y:40),w:430.0,h:470.25)),full_maximized:true,pill_pos:Some((x:10,y:20)),tray_enabled:true,close_to_tray:false,start_in_pill:false,alerts:(crossed_75:true,crossed_90:false,projected_cap:true),alert_state:(window:Some("2026-10-01T10:00:00Z"),crossed_75:true,crossed_90:false,projected_cap:false),details_open:true,reduce_motion:false,keep_pulsing:true)"#;
@@ -270,12 +268,27 @@ mod tests {
                     crossed_90: false,
                     ..AlertToggles::default()
                 },
-                details_open: true,
                 keep_pulsing: true,
                 ..Settings::default()
             }
         );
         assert!(s.alert_states.is_empty());
+    }
+
+    /// A settings file from before the Details card was removed, with its
+    /// `details_open` state, still loads.
+    #[test]
+    fn settings_with_details_open_still_load() {
+        let old = r#"(plan:"Pro",reduce_motion:true,details_open:true)"#;
+        let s: Settings = ron::from_str(old).unwrap();
+        assert_eq!(
+            s,
+            Settings {
+                plan: "Pro".into(),
+                reduce_motion: true,
+                ..Settings::default()
+            }
+        );
     }
 
     #[test]
@@ -295,7 +308,6 @@ mod tests {
                 crossed_90: false,
                 ..AlertToggles::default()
             },
-            details_open: true,
             reduce_motion: true,
             keep_pulsing: true,
             ..Settings::default()

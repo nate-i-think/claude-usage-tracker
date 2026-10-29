@@ -10,7 +10,6 @@ pub mod alerts;
 pub mod app;
 pub mod banners;
 pub mod chips;
-pub mod details;
 pub mod digits;
 pub mod footer;
 pub mod layout;
@@ -81,11 +80,6 @@ pub fn level_color(level: Level, visuals: &Visuals) -> Color32 {
 /// Color of a tone on the current theme.
 pub fn tone_color(tone: Tone, visuals: &Visuals) -> Color32 {
     Palette::for_visuals(visuals).tone(tone)
-}
-
-/// Progress-bar track color on the current theme.
-pub fn bar_track_color(visuals: &Visuals) -> Color32 {
-    Palette::for_visuals(visuals).track
 }
 
 /// The runs as one egui text job in the body font; `Strong` runs semibold.

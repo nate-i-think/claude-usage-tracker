@@ -882,7 +882,6 @@ mod tests {
             }),
             full_maximized: true,
             pill_pos: Some(Pos { x: 5, y: 6 }),
-            details_open: true,
             ..Settings::default()
         };
         let d = SettingsDraft {
@@ -918,11 +917,10 @@ mod tests {
         // The panel opened on these settings...
         let opened = Settings::default();
         let d = SettingsDraft::from_settings(&opened);
-        // ...then Details was toggled, the window moved and Always on top flipped
-        // before Apply. Apply builds over the live settings, not the
-        // snapshot the draft came from.
+        // ...then the window moved and Always on top flipped before Apply.
+        // Apply builds over the live settings, not the snapshot the draft
+        // came from.
         let live = Settings {
-            details_open: true,
             always_on_top: true,
             ui_mode: UiMode::Pill,
             full_rect: Some(SavedRect {

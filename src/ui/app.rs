@@ -33,7 +33,7 @@ use super::tray::{self, Tray, TrayAction};
 use super::window::{self, TrackedWindow, SETTINGS_KEY};
 
 mod tray_glue;
-use super::{chips, details, footer, motion, theme, timeline, week};
+use super::{chips, footer, motion, theme, timeline, week};
 
 /// Key eframe stores egui's memory (including the theme preference) under
 /// (private `STORAGE_EGUI_MEMORY_KEY` in eframe's native/epi_integration.rs).
@@ -350,8 +350,8 @@ impl App {
         self.last_refresh = Some(Instant::now());
     }
 
-    /// Hand settings changes (from the panel, Always on top, the Details
-    /// toggle, the alerts' edge state) to the poller and to storage.
+    /// Hand settings changes (from the panel, Always on top, the alerts'
+    /// edge state) to the poller and to storage.
     fn sync_settings(&mut self, frame: &mut eframe::Frame) {
         if !self.storage_cleaned {
             self.storage_cleaned = true;
@@ -603,16 +603,15 @@ fn pill_segments(views: &[AccountView], now: DateTime<Utc>) -> Vec<PillSegment> 
         .collect()
 }
 
-/// The dashboard body once some account has data: the charts, footer
-/// strip, Details.
-fn dashboard(ui: &mut Ui, views: &[AccountView], settings: &mut Settings) {
+/// The dashboard body once some account has data: the charts and the
+/// footer strip.
+fn dashboard(ui: &mut Ui, views: &[AccountView]) {
     if accounts::first_data(views).is_none() {
         return;
     }
     let now = Utc::now();
     charts(ui, views, now);
     footer::show_footer(ui, views);
-    details::show_details(ui, views, settings, now);
 }
 
 /// The 5-hour and the 7-day timelines, each on its titled card, both
@@ -705,7 +704,7 @@ impl eframe::App for App {
                     let views = self
                         .accounts
                         .views(theme::Palette::for_visuals(ui.visuals()));
-                    dashboard(ui, &views, &mut self.settings);
+                    dashboard(ui, &views);
                 });
             });
         });
