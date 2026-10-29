@@ -1,6 +1,6 @@
 //! Layout rules shared by the dashboard sections: outer padding, gaps, the
 //! capped and centered content column, the charts' side-by-side split,
-//! greedy row packing for things that wrap (stat chips, footer items),
+//! greedy row packing for the stat chips that wrap,
 //! account groups side by side when they fit, and the right-then-left row
 //! helper.
 
