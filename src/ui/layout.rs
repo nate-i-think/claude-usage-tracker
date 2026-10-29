@@ -128,7 +128,10 @@ pub fn show_groups<T>(
     mut add: impl FnMut(&mut Ui, T),
 ) {
     let mut column = |ui: &mut Ui, item| {
-        ui.vertical(|ui| add(ui, item));
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+            add(ui, item);
+        });
     };
     if side_by_side {
         ui.horizontal_top(|ui| {

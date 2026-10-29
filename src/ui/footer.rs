@@ -1,8 +1,11 @@
 //! The 5-hour burn row (shown under the timeline, labelled "5h burn") and
-//! the footer strip under the charts: the extra-usage mini gauge.
+//! the footer strip under the charts: each account's top burners and its
+//! extra-usage mini gauge.
+
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use eframe::egui::{vec2, Id, Rect, Sense, Ui};
+use eframe::egui::{vec2, Galley, Id, Rect, Sense, TextStyle, Ui};
 
 use crate::analytics::{self, BurnLine, Eta, FiveHourState, Level};
 use crate::model::ExtraUsage;
@@ -10,7 +13,7 @@ use crate::poller::Dashboard;
 
 use super::accounts::AccountView;
 use super::theme::Palette;
-use super::{digits, motion, rows, Run, Tone};
+use super::{chips, digits, layout, motion, rows, Run, Tone};
 
 /// Width of the extra-usage gauge's bar.
 const GAUGE_W: f32 = 48.0;
@@ -18,6 +21,8 @@ const GAUGE_W: f32 = 48.0;
 const GAUGE_H: f32 = 4.0;
 /// Space between the gauge's caption and its content.
 const CAPTION_GAP: f32 = 6.0;
+/// The extra-usage gauge's caption.
+pub const EXTRA_CAPTION: &str = "extra";
 /// The burn row's label, so the 5-hour figure never reads as a 7-day one.
 pub const BURN_LABEL: &str = "5h burn  ";
 /// The burn row while no 5-hour window is active.
@@ -97,53 +102,121 @@ pub fn show_burn_row(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     super::show_runs(ui, &runs).on_hover_text(burn_hover(burn.as_ref()));
 }
 
-/// The extra-usage gauge's caption: "extra", or "{label} · extra" when
-/// several accounts' gauges share the strip.
-pub fn gauge_caption(label: Option<&str>) -> String {
-    match label {
-        Some(label) => format!("{label} · extra"),
-        None => "extra".to_owned(),
-    }
-}
-
-/// The footer strip on a card: one extra-usage gauge per account with data
-/// whose block analytics says is visible (captioned with the account's
-/// label when two or more accounts have data); nothing when none is.
+/// The footer strip on a card under the charts: for each account with
+/// data, its top burners line ([`rows::burners_runs`]) and, when analytics
+/// says it is visible, its extra-usage gauge; nothing without data. One
+/// account shows just that; with several, each is a group under its dot and
+/// name ([`chips::group_header`], a stale one dimmed), side by side when
+/// they all fit in one row (see [`layout::groups_side_by_side`]), else
+/// stacked.
 pub fn show_footer(ui: &mut Ui, accounts: &[AccountView]) {
     let shown = super::timeline::with_data(accounts);
-    let several = shown.len() >= 2;
-    let gauges: Vec<(&AccountView, &ExtraUsage)> = shown
-        .into_iter()
-        .filter_map(|v| Some((v, analytics::visible_extra(&v.data?.snapshot)?)))
-        .collect();
-    if gauges.is_empty() {
+    if shown.is_empty() {
         return;
     }
+    let several = shown.len() >= 2;
     let palette = Palette::for_visuals(ui.visuals());
     super::theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        for (view, extra) in gauges {
-            let caption = gauge_caption(several.then_some(view.label));
-            extra_row(
-                ui,
-                palette,
-                super::timeline::series_key(view.id),
-                &caption,
-                extra,
-            );
-        }
+        let groups: Vec<Strip> = shown.iter().filter_map(|v| strip(ui, palette, v)).collect();
+        let widths: Vec<f32> = groups
+            .iter()
+            .map(|s| {
+                let header = if several {
+                    chips::group_header_width(ui, s.view)
+                } else {
+                    0.0
+                };
+                header.max(s.width)
+            })
+            .collect();
+        let side_by_side = layout::groups_side_by_side(ui, Id::new("strip-side-by-side"), &widths);
+        layout::show_groups(ui, side_by_side, groups, |ui, s| {
+            if several {
+                if s.view.stale {
+                    ui.multiply_opacity(super::timeline::DIM_ALPHA);
+                }
+                ui.spacing_mut().item_spacing.y = 2.0;
+                chips::group_header(ui, palette, s.view);
+                ui.spacing_mut().item_spacing.y = layout::GAP;
+            }
+            super::show_runs(ui, &s.burners);
+            if let Some((extra, parts)) = s.extra {
+                extra_row(ui, palette, s.key, extra, parts);
+            }
+        });
     });
+}
+
+/// One account's group in the footer strip, measured.
+struct Strip<'v, 'a> {
+    view: &'v AccountView<'a>,
+    /// Its [`super::timeline::series_key`].
+    key: u64,
+    burners: Vec<Run>,
+    extra: Option<(&'a ExtraUsage, ExtraParts)>,
+    /// The widest of its lines, unwrapped (without the header).
+    width: f32,
+}
+
+/// `view`'s strip group, or `None` without data.
+fn strip<'v, 'a>(ui: &Ui, palette: &Palette, view: &'v AccountView<'a>) -> Option<Strip<'v, 'a>> {
+    let d = view.data?;
+    let burners = rows::burners_runs(&d.burners);
+    let burners_w = ui
+        .painter()
+        .layout_job(super::layout_job(&burners, ui))
+        .size()
+        .x;
+    let extra = analytics::visible_extra(&d.snapshot).map(|e| (e, extra_parts(ui, palette, e)));
+    let extra_w = extra.as_ref().map_or(0.0, |(_, p)| p.width());
+    Some(Strip {
+        view,
+        key: super::timeline::series_key(view.id),
+        burners,
+        extra,
+        width: burners_w.max(extra_w),
+    })
+}
+
+/// The extra-usage gauge's text, laid out.
+struct ExtraParts {
+    gauge: ExtraGauge,
+    caption: Arc<Galley>,
+    /// "$23 / $35" and its width with fixed-width digits.
+    figures: (Arc<Galley>, f32),
+}
+
+impl ExtraParts {
+    /// The gauge row's width: caption, figures and bar, [`CAPTION_GAP`]
+    /// apart.
+    fn width(&self) -> f32 {
+        self.caption.size().x + CAPTION_GAP + self.figures.1 + CAPTION_GAP + GAUGE_W
+    }
+}
+
+fn extra_parts(ui: &Ui, palette: &Palette, extra: &ExtraUsage) -> ExtraParts {
+    let gauge = extra_gauge(extra);
+    let painter = ui.painter();
+    let small = TextStyle::Small.resolve(ui.style());
+    let caption = painter.layout_no_wrap(EXTRA_CAPTION.to_owned(), small, palette.text_muted);
+    let body = TextStyle::Body.resolve(ui.style());
+    let figures = digits::number_galley(painter, &gauge.text, body, palette.level(gauge.level));
+    ExtraParts {
+        gauge,
+        caption,
+        figures,
+    }
 }
 
 /// One account's extra-usage gauge: caption, "$23 / $35", the bar; eased
 /// values keyed by `key` (its profile's).
-fn extra_row(ui: &mut Ui, palette: &Palette, key: u64, caption: &str, extra: &ExtraUsage) {
-    let g = extra_gauge(extra);
-    let painter = ui.painter().clone();
-    let small = eframe::egui::TextStyle::Small.resolve(ui.style());
-    let caption = painter.layout_no_wrap(caption.to_owned(), small, palette.text_muted);
-    let body = eframe::egui::TextStyle::Body.resolve(ui.style());
-    let (galley, w) = digits::number_galley(&painter, &g.text, body, palette.level(g.level));
+fn extra_row(ui: &mut Ui, palette: &Palette, key: u64, extra: &ExtraUsage, parts: ExtraParts) {
+    let ExtraParts {
+        gauge: g,
+        caption,
+        figures: (galley, w),
+    } = parts;
     let hover = super::plain_text(&rows::extra_runs(extra));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = CAPTION_GAP;
@@ -162,7 +235,7 @@ fn burn_hover(line: Option<&BurnLine>) -> String {
 
 fn centered_galley(
     ui: &mut Ui,
-    galley: std::sync::Arc<eframe::egui::Galley>,
+    galley: Arc<Galley>,
     color: eframe::egui::Color32,
 ) -> eframe::egui::Response {
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
@@ -281,12 +354,6 @@ mod tests {
             currency: "USD".to_owned(),
             disabled_reason: None,
         }
-    }
-
-    #[test]
-    fn gauge_captions() {
-        assert_eq!(gauge_caption(None), "extra");
-        assert_eq!(gauge_caption(Some("work")), "work · extra");
     }
 
     #[test]
