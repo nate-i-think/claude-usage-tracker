@@ -826,9 +826,9 @@ pub struct SeriesData {
     pub color: Color32,
     pub area: AreaStyle,
     pub points: Vec<Point>,
-    /// The meter's now dot and projection; none while there is nothing to
-    /// draw (no %, or an idle window).
-    pub lines: Vec<Line>,
+    /// The meter's now dot and projection; `None` while there is nothing
+    /// to draw (no %, or an idle window).
+    pub line: Option<Line>,
     /// Stale data (the last poll failed): painted at [`DIM_ALPHA`].
     pub dimmed: bool,
     /// The account's own window end (its reset): hover reads nothing past
@@ -1017,7 +1017,7 @@ pub fn as_series(mut s: SeriesData, view: &AccountView) -> SeriesData {
     s.label = view.label.to_owned();
     s.color = view.color;
     s.area = AreaStyle::Tint(SERIES_TINT);
-    for l in &mut s.lines {
+    if let Some(l) = &mut s.line {
         l.color = view.color;
     }
     s.dimmed = view.stale;
@@ -1117,22 +1117,17 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
     let state = palette.level(analytics::color_for(live.pct));
     let idle = live.state == FiveHourState::Idle;
     let reset_known = live.resets_at.is_some();
-    let lines = live
-        .pct
-        .filter(|_| !idle)
-        .map(|p| {
-            let rate = analytics::compute_rate(&d.history, now);
-            let projection = analytics::projection(now, p, rate, d.window_end);
-            Line {
-                pct: p,
-                projection: Some(projection),
-                label: end_label(reset_known, &projection, now),
-                color: state,
-                cap_color: palette.danger,
-            }
-        })
-        .into_iter()
-        .collect();
+    let line = live.pct.filter(|_| !idle).map(|p| {
+        let rate = analytics::compute_rate(&d.history, now);
+        let projection = analytics::projection(now, p, rate, d.window_end);
+        Line {
+            pct: p,
+            projection: Some(projection),
+            label: end_label(reset_known, &projection, now),
+            color: state,
+            cap_color: palette.danger,
+        }
+    });
     let samples: &[WindowSample] = if idle { &[] } else { &d.window_samples };
     Chart {
         id: "timeline",
@@ -1145,7 +1140,7 @@ pub fn five_hour_chart(d: &Dashboard, now: DateTime<Utc>, palette: &Palette) -> 
             color: state,
             area: AreaStyle::State(state),
             points: samples.iter().map(Point::from).collect(),
-            lines,
+            line,
             dimmed: false,
             end: d.window_end,
             poll_key: snap.fetched_at.timestamp_millis(),
@@ -1425,7 +1420,7 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
         .iter()
         .zip(&layers)
         .filter(|(_, (segs, _))| !segs.is_empty())
-        .flat_map(|(s, _)| s.lines.iter().map(move |line| (s, line)))
+        .filter_map(|(s, _)| Some((s, s.line.as_ref()?)))
         .map(|(s, line)| Ends {
             pct: motion::eased(&ctx, motion_id(chart.id, s.key, "now-pct"), line.pct),
             projection: line.projection,
@@ -1456,9 +1451,9 @@ pub fn show_chart(ui: &mut Ui, chart: &Chart, palette: &Palette, height: f32) ->
             let (s, (segs, gaps)) = (&chart.series[0], &layers[0]);
             // The projection drives the hover beyond now.
             let projecting = s
-                .lines
-                .iter()
-                .find_map(|l| l.projection.map(|p| (l.pct, p)));
+                .line
+                .as_ref()
+                .and_then(|l| l.projection.map(|p| (l.pct, p)));
             let target = hover_target(&axes, &s.points, gaps, chart.now, projecting, pointer.x);
             let drawn = drawn_values(&s.points, segs);
             let tip = paint_hover(
@@ -1499,7 +1494,7 @@ pub fn hover_rows(chart: &Chart, t: DateTime<Utc>) -> Vec<HoverRow> {
                 projected,
             };
             if t > chart.now {
-                let l = s.lines.first()?;
+                let l = s.line.as_ref()?;
                 let pct = l
                     .projection
                     .and_then(|p| projected_pct(chart.now, l.pct, &p, t))
@@ -1983,7 +1978,7 @@ mod tests {
 
     fn assert_idle(c: &Chart) {
         assert!(c.series[0].points.is_empty(), "{:?}", c.series[0].points);
-        assert!(c.series[0].lines.is_empty(), "no now dot or projection");
+        assert!(c.series[0].line.is_none(), "no now dot or projection");
         assert!(c.ticks.is_empty(), "no times on an idle axis");
         assert_eq!(c.end_label, None);
         assert_eq!(c.note, Some(IDLE_NOTE));
@@ -2001,7 +1996,7 @@ mod tests {
         let d = five_dash(t_at(14, 10), 80.0, Some(t_at(14, 20)));
         let live = five_hour_chart(&d, t_at(14, 15), &crate::ui::theme::DARK);
         assert_eq!(live.series[0].points.len(), 2);
-        assert_eq!(live.series[0].lines.len(), 1);
+        assert!(live.series[0].line.is_some());
         assert!(live.end_label.as_deref().unwrap().starts_with("reset "));
         assert_eq!(live.note, None);
         // 14:21: past the chart's end, before the next poll.
@@ -2015,8 +2010,8 @@ mod tests {
         let c = five_hour_chart(&d, t_at(14, 53), &crate::ui::theme::DARK);
         assert_eq!(c.series[0].points.len(), 2);
         assert_eq!(c.end_label.as_deref(), Some("now"));
-        assert_eq!(c.series[0].lines.len(), 1);
-        assert_eq!(c.series[0].lines[0].label, None, "no safe or cap claimed");
+        let line = c.series[0].line.as_ref().unwrap();
+        assert_eq!(line.label, None, "no safe or cap claimed");
         assert_eq!(c.note, None);
     }
 
@@ -2877,7 +2872,7 @@ mod tests {
             assert_eq!(s.color, v.color);
             assert_eq!(s.label, v.label);
             assert_eq!(s.area, AreaStyle::Tint(SERIES_TINT));
-            assert!(s.lines.iter().all(|l| l.color == v.color));
+            assert!(s.line.iter().all(|l| l.color == v.color));
             assert_eq!(s.key, series_key(v.id));
         }
         // The stale account is dimmed, the fresh one not.
@@ -2910,7 +2905,7 @@ mod tests {
         let c = five_hour_series_chart(&[&va, &vb], now, &crate::ui::theme::DARK).unwrap();
         assert_eq!((c.start, c.end), (t_at(10, 0), t_at(15, 0)));
         assert_eq!(c.end_marks.len(), 1);
-        assert!(c.series[1].points.is_empty() && c.series[1].lines.is_empty());
+        assert!(c.series[1].points.is_empty() && c.series[1].line.is_none());
         // Both idle: the empty state.
         let vc = view(&ia, "a", &idle, false);
         let c = five_hour_series_chart(&[&vc, &vb], now, &crate::ui::theme::DARK).unwrap();
@@ -2942,14 +2937,14 @@ mod tests {
         assert_eq!(legend_for(&c.series), vec![]);
     }
 
-    fn series_of(label: &str, points: Vec<Point>, lines: Vec<Line>) -> SeriesData {
+    fn series_of(label: &str, points: Vec<Point>, line: Option<Line>) -> SeriesData {
         SeriesData {
             key: label.len() as u64,
             label: label.to_owned(),
             color: Color32::RED,
             area: AreaStyle::Tint(SERIES_TINT),
             points,
-            lines,
+            line,
             dimmed: false,
             end: at(300),
             poll_key: 0,
@@ -3003,7 +2998,7 @@ mod tests {
                     value: Some(20.0),
                 },
             ],
-            vec![main(20.0, 60.0)],
+            Some(main(20.0, 60.0)),
         );
         let mut b = series_of(
             "work",
@@ -3017,7 +3012,7 @@ mod tests {
                     value: Some(6.0),
                 },
             ],
-            vec![main(5.0, 5.0)],
+            Some(main(5.0, 5.0)),
         );
         b.end = at(200);
         let c = chart_of(vec![a, b], at(100));
@@ -3093,9 +3088,9 @@ mod tests {
 
     #[test]
     fn legend_only_with_two_or_more_series() {
-        let one = vec![series_of("nate", Vec::new(), Vec::new())];
+        let one = vec![series_of("nate", Vec::new(), None)];
         assert!(legend_for(&one).is_empty());
-        let mut two = vec![one[0].clone(), series_of("work", Vec::new(), Vec::new())];
+        let mut two = vec![one[0].clone(), series_of("work", Vec::new(), None)];
         two[1].dimmed = true;
         let legend = legend_for(&two);
         let names: Vec<_> = legend.iter().map(|e| e.label.as_str()).collect();

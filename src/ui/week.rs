@@ -114,16 +114,13 @@ pub fn week_chart(
     let resets = snap.seven_day_resets_at();
     let end = resets.unwrap_or(d.week_end);
     let (projection, label) = weekly_line(outlook, pct, now, end, resets.is_some());
-    let lines = pct
-        .map(|pct| Line {
-            pct,
-            projection,
-            label,
-            color: state,
-            cap_color: palette.level(outlook.level()),
-        })
-        .into_iter()
-        .collect();
+    let line = pct.map(|pct| Line {
+        pct,
+        projection,
+        label,
+        color: state,
+        cap_color: palette.level(outlook.level()),
+    });
     Chart {
         id: "week",
         start: d.week_start,
@@ -135,7 +132,7 @@ pub fn week_chart(
             color: state,
             area: AreaStyle::State(state),
             points: d.week_samples.iter().map(Point::from).collect(),
-            lines,
+            line,
             dimmed: false,
             end: d.week_end,
             poll_key: snap.fetched_at.timestamp_millis(),
@@ -193,7 +190,7 @@ pub fn week_series_chart(
             // over, so it adds no window, no end mark, no now dot.
             let live = d.week_end > now;
             if !live {
-                chart.series.iter_mut().for_each(|s| s.lines.clear());
+                chart.series.iter_mut().for_each(|s| s.line = None);
             }
             Some(timeline::Part {
                 chart,
@@ -460,18 +457,11 @@ mod tests {
         assert!(c.series[1].dimmed);
         // Each projection stays within its own account's window: the
         // cap and "safe" as projected.
-        let ends = |s: &SeriesData| -> Vec<Option<DateTime<Utc>>> {
-            s.lines
-                .iter()
-                .map(|l| l.projection.map(|p| p.end_t))
-                .collect()
-        };
-        assert_eq!(ends(&c.series[0]), [Some(t(13, 12))]);
-        assert_eq!(ends(&c.series[1]), [Some(b.week_end)]);
-        for (s, end) in c.series.iter().zip([a.week_end, b.week_end]) {
-            for l in &s.lines {
-                assert!(l.projection.is_some_and(|p| p.end_t <= end));
-            }
+        let end = |s: &SeriesData| s.line.as_ref()?.projection.map(|p| p.end_t);
+        assert_eq!(end(&c.series[0]), Some(t(13, 12)));
+        assert_eq!(end(&c.series[1]), Some(b.week_end));
+        for (s, week_end) in c.series.iter().zip([a.week_end, b.week_end]) {
+            assert!(end(s).is_some_and(|t| t <= week_end));
         }
         let legend: Vec<_> = c.legend.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(legend, ["default", "work"]);
@@ -491,7 +481,7 @@ mod tests {
         let c = week_series_chart(&accounts, now, palette).unwrap();
         assert_eq!((c.start, c.end), (live.week_start, live.week_end));
         assert_eq!(c.end_marks, vec![(live.week_end, vl.color)]);
-        assert!(c.series[0].lines.is_empty(), "no now dot or projection");
+        assert!(c.series[0].line.is_none(), "no now dot or projection");
         assert_eq!(c.series.len(), 2, "still in the legend");
     }
 
@@ -504,7 +494,7 @@ mod tests {
         let s = &c.series[0];
         let state = palette.level(analytics::color_for(Some(40.0)));
         assert_eq!((s.color, s.area), (state, AreaStyle::State(state)));
-        assert_eq!(s.lines.len(), 1);
+        assert!(s.line.is_some());
         assert!(c.legend.is_empty() && c.end_marks.is_empty());
     }
 }
