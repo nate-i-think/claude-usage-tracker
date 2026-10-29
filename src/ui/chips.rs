@@ -59,11 +59,11 @@ pub struct Chip {
 /// The 5-hour chip's hover text while no window is active.
 pub const IDLE_TIP: &str = "no active window · starts with your next message";
 
-/// The chips for this snapshot: 5-hour and 7-day all. The 5-hour pace runs over the dashboard's
-/// window (`window_start..window_end`), only while it is active with a
-/// known reset (see [`analytics::five_hour_now`]: a window that rolled over
-/// since the poll reads 0% with no pace); the 7-day ones over the 7 days
-/// before its reset.
+/// The chips for this snapshot: 5-hour and 7-day all. The 5-hour pace
+/// runs over the dashboard's window (`window_start..window_end`), only
+/// while it is active with a known reset (see [`analytics::five_hour_now`]:
+/// a window that rolled over since the poll reads 0% with no pace); the
+/// 7-day one over the 7 days before its reset.
 pub fn chips(
     snap: &Snapshot,
     window_start: DateTime<Utc>,
@@ -582,6 +582,18 @@ mod tests {
         assert_eq!(c[0].pace, None, "5-hour without reset has no pace");
         assert_eq!(c[1].pct, None, "7-day all missing: an empty chip");
         assert_eq!(c[1].pace, None, "no utilization, no pace");
+        // A known reset but no %: still no pace.
+        let s = snap(vec![
+            window("5-hour", Some(46.0), None),
+            window("7-day all", None, Some(now + Duration::days(1))),
+        ]);
+        let c = chips(&s, t(9, 0), t(14, 0), now);
+        assert_eq!(c[1].resets_at, Some(now + Duration::days(1)));
+        assert_eq!(
+            (c[1].pct, c[1].pace),
+            (None, None),
+            "reset but no %, no pace"
+        );
     }
 
     #[test]

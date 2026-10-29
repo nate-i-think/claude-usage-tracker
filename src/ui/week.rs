@@ -176,9 +176,9 @@ pub fn account_outlooks<'a>(views: &[&'a AccountView<'a>]) -> Vec<AccountOutlook
 
 /// The weekly chart of several accounts (see [`timeline::overlay_charts`]):
 /// each account's 7-day-all line in its color, its projection ending
-/// within its own window. An account whose
-/// week is already over (stale data from before its reset) adds no window
-/// and draws no now dot or projection.
+/// within its own window. An account whose week is already over (stale
+/// data from before its reset) adds no window and draws no now dot or
+/// projection.
 pub fn week_series_chart(
     accounts: &[AccountOutlook],
     now: DateTime<Utc>,

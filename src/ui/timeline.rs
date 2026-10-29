@@ -6,11 +6,12 @@
 //! [`Mesh`] in the state color with a stroked line), a "now" marker with
 //! a dot, the dashed projection to the reset or the cap (with a ✕ and
 //! "cap 4:10p", or a "safe" end label; "at cap" when it is there), the
-//! dashed 100% cap line, and a hover crosshair with a tooltip. Time gaps in the samples (the app
-//! was closed) are bridged with a faint dotted line: utilization only rises
-//! within a window, so the straight line is the best guess; only resets
-//! and missing values truly break. How long a gap breaks the line is per
-//! chart (10 minutes for 5 hours, an hour for a week).
+//! dashed 100% cap line, and a hover crosshair with a tooltip. Time gaps
+//! in the samples (the app was closed) are bridged with a faint dotted
+//! line: utilization only rises within a window, so the straight line is
+//! the best guess; only resets and missing values truly break. How long a
+//! gap breaks the line is per chart (10 minutes for 5 hours, an hour for a
+//! week).
 //!
 //! A chart holds one [`SeriesData`] per account. One account draws as
 //! above; several overlay over the union of their windows (see
@@ -925,8 +926,7 @@ pub struct Line {
 
 /// Everything a timeline draws: the window, and per account its samples
 /// and meter. One series is one account drawn as it always was (state
-/// colors); two or more overlay in their series colors
-/// with a legend.
+/// colors); two or more overlay in their series colors with a legend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chart {
     /// Distinguishes this chart's eased values.
@@ -1644,8 +1644,7 @@ fn paint_time_axis(
 }
 
 /// One series' fills: the faint bridge fills and the area per segment
-/// (gradient fill). Returns the line of each segment (for
-/// [`paint_lines`]).
+/// (gradient fill). Returns the line of each segment (for [`paint_lines`]).
 fn paint_fills(
     painter: &Painter,
     axes: &Axes,

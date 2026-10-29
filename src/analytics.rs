@@ -1,7 +1,7 @@
 //! Dashboard analytics: burn rate, reset detection, cap ETA, projected use,
 //! color levels, countdown formatting, and the row rules of the dashboard.
-//! Submodules: the hero timeline (pace, projection), the weekly projection, project-name prettifying, and
-//! threshold [`alerts`].
+//! Submodules: the hero timeline (pace, projection), the weekly
+//! projection, project-name prettifying, and threshold [`alerts`].
 //!
 //! Ported from the math in the Python ui.py (removed; see git history),
 //! separated from its Rich rendering. Pure: no I/O, no egui. Wherever
