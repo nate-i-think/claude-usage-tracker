@@ -47,8 +47,6 @@ pub enum Tone {
     /// The app's accent (Rich "cyan"): the "Claude usage" title of the
     /// text report.
     Accent,
-    /// Claude coral (#d97757): the FABLE burn tag.
-    Fable,
 }
 
 /// A styled piece of text.

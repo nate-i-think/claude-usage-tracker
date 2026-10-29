@@ -49,21 +49,9 @@ pub fn window_row(w: &UsageWindow, now: DateTime<Utc>) -> WindowRow {
     }
 }
 
-/// Which burn line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BurnTag {
-    /// The 5-hour window.
-    All,
-    Fable,
-}
-
-/// The burn line's tag: strong "ALL:" or coral "FABLE:" (the accent is
-/// clay too, so ALL stays neutral to keep the two apart).
-pub fn burn_tag(tag: BurnTag) -> Run {
-    match tag {
-        BurnTag::All => Run::new("ALL:", Tone::Strong),
-        BurnTag::Fable => Run::new("FABLE:", Tone::Fable),
-    }
+/// The 5-hour burn line's tag: a strong "ALL:".
+pub fn burn_tag() -> Run {
+    Run::new("ALL:", Tone::Strong)
 }
 
 /// The burn line after its tag (the Python ui.py `render_burn_line`): "15m burn
@@ -223,7 +211,7 @@ mod tests {
         assert_eq!(row.pct, Run::new("104.0%", Tone::Level(Level::Red)));
         assert_eq!(row.fraction, 1.0);
         assert_eq!(row.reset, Run::new("—", Tone::Normal));
-        let row = window_row(&window("Fable", Some(76.0), Some(60 * 30)), NOW);
+        let row = window_row(&window("Sonnet 7d", Some(76.0), Some(60 * 30)), NOW);
         assert_eq!(row.fill, Tone::Level(Level::Orange));
         assert_eq!(row.reset.text, "1d 6h");
     }
@@ -238,9 +226,8 @@ mod tests {
     }
 
     #[test]
-    fn burn_tags() {
-        assert_eq!(burn_tag(BurnTag::All), Run::new("ALL:", Tone::Strong));
-        assert_eq!(burn_tag(BurnTag::Fable), Run::new("FABLE:", Tone::Fable));
+    fn burn_tag_is_strong_all() {
+        assert_eq!(burn_tag(), Run::new("ALL:", Tone::Strong));
     }
 
     #[test]

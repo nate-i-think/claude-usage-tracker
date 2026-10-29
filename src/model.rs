@@ -28,10 +28,8 @@ pub const ALWAYS_SHOW: &[&str] = &["five_hour", "seven_day"];
 pub const FIVE_HOUR_LABEL: &str = "5-hour";
 /// Label of the seven-day (all models) window.
 pub const SEVEN_DAY_LABEL: &str = "7-day all";
-/// Label of Fable's own weekly window (a per-model limit).
-pub const FABLE_LABEL: &str = "Fable";
 
-/// One usage window (a top-level bucket or a per-model limit).
+/// One usage window (a top-level bucket).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageWindow {
     pub label: String,
@@ -98,30 +96,22 @@ impl Snapshot {
     pub fn seven_day_resets_at(&self) -> Option<DateTime<Utc>> {
         self.window(SEVEN_DAY_LABEL).and_then(|w| w.resets_at)
     }
-
-    pub fn fable_pct(&self) -> Option<f64> {
-        self.window(FABLE_LABEL).and_then(|w| w.utilization)
-    }
-
-    pub fn fable_resets_at(&self) -> Option<DateTime<Utc>> {
-        self.window(FABLE_LABEL).and_then(|w| w.resets_at)
-    }
 }
 
 /// Parse a full `/usage` response body into a [`Snapshot`].
 ///
-/// Top-level buckets come first in [`BUCKET_LABELS`] order (kept if in
-/// [`ALWAYS_SHOW`] or utilization is non-null), then per-model limits from
-/// the `limits` array, then `extra_usage` and `seven_day_breakdown`.
+/// The windows are the top-level buckets in [`BUCKET_LABELS`] order (kept
+/// if in [`ALWAYS_SHOW`] or utilization is non-null); `extra_usage` and
+/// `seven_day_breakdown` fill the rest. Other keys, the `limits` array
+/// among them, are ignored.
 pub fn parse_usage(data: &Value, fetched_at: DateTime<Utc>) -> Snapshot {
-    let mut windows: Vec<UsageWindow> = BUCKET_LABELS
+    let windows: Vec<UsageWindow> = BUCKET_LABELS
         .iter()
         .filter_map(|&(key, label)| {
             let w = parse_window(label, data.get(key));
             (ALWAYS_SHOW.contains(&key) || w.utilization.is_some()).then_some(w)
         })
         .collect();
-    windows.extend(parse_model_limits(data));
 
     Snapshot {
         fetched_at,
@@ -158,32 +148,6 @@ pub fn parse_breakdown(raw: Option<&Value>) -> Option<WeekBreakdown> {
         window_started_at: parse_dt(b.get("window_started_at")),
         rows,
     })
-}
-
-/// Extract per-model windows from the `limits` array.
-///
-/// Entries with a non-empty `scope.model.display_name` become windows labeled
-/// by that name, with `percent` as utilization. Others are skipped.
-pub fn parse_model_limits(data: &Value) -> Vec<UsageWindow> {
-    let Some(entries) = data.get("limits").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let name = entry
-                .get("scope")
-                .and_then(|s| s.get("model"))
-                .and_then(|m| m.get("display_name"))
-                .and_then(Value::as_str)
-                .filter(|n| !n.is_empty())?;
-            Some(UsageWindow {
-                label: name.to_owned(),
-                utilization: entry.get("percent").and_then(as_f64),
-                resets_at: parse_dt(entry.get("resets_at")),
-            })
-        })
-        .collect()
 }
 
 fn parse_window(label: &str, raw: Option<&Value>) -> UsageWindow {
@@ -265,84 +229,24 @@ mod tests {
     }
 
     /// Trimmed copy of a real /usage packet (2026-07-01); from the Python test_api.py (removed).
-    fn fable_packet() -> Value {
+    fn packet() -> Value {
         json!({
             "five_hour": {"utilization": 12.0, "resets_at": "2026-07-01T21:10:01+00:00"},
             "seven_day": {"utilization": 13.0, "resets_at": "2026-07-07T06:00:01+00:00"},
-            "seven_day_sonnet": null,
-            "limits": [
-                {"kind": "session", "percent": 12,
-                 "resets_at": "2026-07-01T21:10:01+00:00", "scope": null},
-                {"kind": "weekly_all", "percent": 13,
-                 "resets_at": "2026-07-07T06:00:01+00:00", "scope": null},
-                {"kind": "weekly_scoped", "percent": 0, "resets_at": null,
-                 "scope": {"model": {"display_name": "Fable", "id": null},
-                           "surface": null}}
-            ]
+            "seven_day_sonnet": null
         })
-    }
-
-    // --- Ported from the Python test_api.py (removed) ---------------------
-
-    #[test]
-    fn extracts_fable_window_from_limits_array() {
-        let labels: Vec<String> = parse_model_limits(&fable_packet())
-            .into_iter()
-            .map(|w| w.label)
-            .collect();
-        assert_eq!(labels, vec!["Fable"]);
-    }
-
-    #[test]
-    fn fable_zero_percent_maps_to_zero_utilization_not_none() {
-        let fable = &parse_model_limits(&fable_packet())[0];
-        assert_eq!(fable.utilization, Some(0.0));
-    }
-
-    #[test]
-    fn null_resets_at_parses_to_none() {
-        let fable = &parse_model_limits(&fable_packet())[0];
-        assert_eq!(fable.resets_at, None);
-    }
-
-    #[test]
-    fn active_model_limit_parses_percent_and_resets() {
-        let data = json!({"limits": [
-            {"kind": "weekly_scoped", "percent": 42,
-             "resets_at": "2026-07-07T06:00:01+00:00",
-             "scope": {"model": {"display_name": "Fable"}}}
-        ]});
-        let fable = &parse_model_limits(&data)[0];
-        assert_eq!(fable.utilization, Some(42.0));
-        assert_eq!(fable.resets_at, Some(utc(2026, 7, 7, 6, 0, 1)));
-    }
-
-    #[test]
-    fn ignores_session_and_weekly_all_entries() {
-        let windows = parse_model_limits(&fable_packet());
-        assert!(windows.iter().all(|w| w.label == "Fable"), "{windows:?}");
-    }
-
-    #[test]
-    fn missing_limits_key_returns_empty_list() {
-        assert!(parse_model_limits(&json!({"five_hour": {"utilization": 5.0}})).is_empty());
-    }
-
-    #[test]
-    fn limits_none_returns_empty_list() {
-        assert!(parse_model_limits(&json!({"limits": null})).is_empty());
     }
 
     // --- parse_usage --------------------------------------------------------
 
     #[test]
-    fn parse_usage_orders_buckets_then_model_limits() {
-        let mut data = fable_packet();
+    fn parse_usage_orders_buckets() {
+        let mut data = packet();
         data["seven_day_opus"] = json!({"utilization": 3, "resets_at": null});
         let fetched = utc(2026, 7, 1, 20, 0, 0);
         let snap = parse_usage(&data, fetched);
         let labels: Vec<&str> = snap.windows.iter().map(|w| w.label.as_str()).collect();
-        assert_eq!(labels, vec!["5-hour", "7-day all", "Opus 7d", "Fable"]);
+        assert_eq!(labels, vec!["5-hour", "7-day all", "Opus 7d"]);
         assert_eq!(snap.fetched_at, fetched);
         assert_eq!(snap.window("Opus 7d").unwrap().utilization, Some(3.0));
         assert_eq!(snap.extra, None);
@@ -369,7 +273,7 @@ mod tests {
 
     #[test]
     fn five_hour_accessors() {
-        let snap = parse_usage(&fable_packet(), Utc::now());
+        let snap = parse_usage(&packet(), Utc::now());
         assert_eq!(snap.five_hour_pct(), Some(12.0));
         assert_eq!(snap.five_hour_resets_at(), Some(utc(2026, 7, 1, 21, 10, 1)));
 
@@ -460,7 +364,9 @@ mod tests {
         });
         let snap = parse_usage(&data, Utc::now());
         assert_eq!(snap.five_hour_pct(), Some(14.0));
-        assert_eq!(snap.window("Fable").unwrap().utilization, Some(18.0));
+        // A per-model limit (Fable's) in `limits` makes no window.
+        let labels: Vec<&str> = snap.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, vec!["5-hour", "7-day all"]);
     }
 
     // --- seven_day_breakdown -------------------------------------------------
@@ -481,7 +387,8 @@ mod tests {
         let data: Value = serde_json::from_str(OAUTH_FIXTURE).unwrap();
         let snap = parse_usage(&data, Utc::now());
         let labels: Vec<&str> = snap.windows.iter().map(|w| w.label.as_str()).collect();
-        assert_eq!(labels, vec!["5-hour", "7-day all", "Iguana", "Fable"]);
+        // Its `limits` array (a Fable entry among them) is ignored.
+        assert_eq!(labels, vec!["5-hour", "7-day all", "Iguana"]);
         assert_eq!(snap.five_hour_pct(), Some(0.0));
         assert_eq!(snap.seven_day_pct(), Some(7.0));
         assert_eq!(
@@ -489,11 +396,6 @@ mod tests {
                 .unwrap()
                 .timestamp_subsec_micros(),
             634598
-        );
-        assert_eq!(snap.fable_pct(), Some(0.0));
-        assert_eq!(
-            snap.fable_resets_at().map(|t| t.timestamp()),
-            Some(utc(2026, 11, 3, 5, 59, 59).timestamp())
         );
         let extra = snap.extra.as_ref().unwrap();
         assert!(!extra.enabled);

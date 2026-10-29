@@ -30,7 +30,6 @@ pub struct HistoryEntry {
     pub ts: f64,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
-    pub fable_7d: Option<f64>,
     pub extra_pct: Option<f64>,
 }
 
@@ -57,8 +56,7 @@ pub fn append_snapshot(paths: &Paths, snap: &Snapshot) -> io::Result<()> {
     let entry = HistoryEntry {
         ts: unix_seconds(snap.fetched_at),
         five_hour: snap.five_hour_pct(),
-        seven_day: snap.window("7-day all").and_then(|w| w.utilization),
-        fable_7d: snap.window("Fable").and_then(|w| w.utilization),
+        seven_day: snap.seven_day_pct(),
         extra_pct: snap.extra.as_ref().map(|e| e.utilization),
     };
     let mut line = serde_json::to_string(&entry).map_err(io::Error::other)?;
@@ -116,7 +114,6 @@ fn history_entry_from_json(d: &Value) -> Option<HistoryEntry> {
         ts,
         five_hour: num("five_hour"),
         seven_day: num("seven_day"),
-        fable_7d: num("fable_7d"),
         extra_pct: num("extra_pct"),
     })
 }
@@ -308,9 +305,8 @@ pub fn archive_history(paths: &Paths, old_uuid8: &str) -> io::Result<()> {
 
 /// What the charts and the weekly projections read from history.jsonl: the
 /// five-hour window's samples, the weekly window's (thinned), and the
-/// weekly series (7-day all and Fable 7-day) of the last
-/// [`WEEKLY_RATE_HOURS`] with their anchors, from a single read (from the
-/// earliest cutoff any of them needs).
+/// 7-day-all series of the last [`WEEKLY_RATE_HOURS`] with its anchor, from
+/// a single read (from the earliest cutoff any of them needs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rollups {
     /// Every row in `[window_start, window_end)`, oldest first.
@@ -322,8 +318,6 @@ pub struct Rollups {
     /// anchor (the latest row with a value before the last
     /// [`WEEKLY_RATE_HOURS`]), then every row since, up to `now`.
     pub seven_day_recent: Vec<(DateTime<Utc>, Option<f64>)>,
-    /// The same for Fable's 7-day utilization.
-    pub fable_recent: Vec<(DateTime<Utc>, Option<f64>)>,
 }
 
 /// How far back the read reaches for a weekly series' anchor: a week, the
@@ -347,7 +341,6 @@ pub fn rollups(
         window_samples: window_samples(&rows, window_start, window_end),
         week_samples: week_samples(&rows, week, now),
         seven_day_recent: recent_series(&rows, recent_start, now, |e| e.seven_day),
-        fable_recent: recent_series(&rows, recent_start, now, |e| e.fable_7d),
     }
 }
 
@@ -389,7 +382,6 @@ fn week_samples(
             Some(WeekSample {
                 t: from_unix_seconds(e.ts)?,
                 seven_day: e.seven_day,
-                fable: e.fable_7d,
             })
         })
         .collect();
@@ -413,7 +405,6 @@ fn window_samples(
             Some(WindowSample {
                 t: from_unix_seconds(e.ts)?,
                 five_hour: e.five_hour,
-                fable: e.fable_7d,
             })
         })
         .collect();
@@ -778,7 +769,6 @@ mod tests {
             windows: vec![
                 window("5-hour", Some(12.0), Some(utc(2026, 10, 11, 17, 10, 0))),
                 window("7-day all", Some(30.5), None),
-                window("Fable", Some(4.0), None),
             ],
             extra: Some(ExtraUsage {
                 enabled: true,
@@ -834,14 +824,12 @@ mod tests {
                     ts: 1_791_000_000.25,
                     five_hour: Some(12.0),
                     seven_day: Some(30.5),
-                    fable_7d: Some(4.0),
                     extra_pct: Some(100.0),
                 },
                 HistoryEntry {
                     ts: 1_791_000_300.25,
                     five_hour: Some(12.0),
                     seven_day: None,
-                    fable_7d: None,
                     extra_pct: None,
                 },
             ]
@@ -857,10 +845,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(
-            keys,
-            ["extra_pct", "fable_7d", "five_hour", "seven_day", "ts"]
-        );
+        assert_eq!(keys, ["extra_pct", "five_hour", "seven_day", "ts"]);
         // append also refreshed latest.json.
         assert!(read_latest_snapshot(&paths).is_some());
     }
@@ -868,11 +853,14 @@ mod tests {
     #[test]
     fn read_recent_tolerates_legacy_and_missing_keys() {
         let (_tmp, paths) = temp_paths();
+        // Legacy keys: `sonnet_7d`, and `fable_7d` from before the Fable
+        // limit was dropped; both are ignored.
         write_history(
             &paths,
             &[
                 r#"{"ts": 100.0, "five_hour": 5.0, "seven_day": 9.0, "sonnet_7d": 3.0, "extra_pct": null}"#.into(),
                 r#"{"ts": 200, "seven_day": 10}"#.into(),
+                r#"{"ts": 300, "five_hour": 6.0, "seven_day": 11.0, "fable_7d": 4.0, "extra_pct": 1.0}"#.into(),
             ],
         );
         let rows = read_recent(&paths, utc(1970, 1, 1, 0, 0, 0));
@@ -883,15 +871,19 @@ mod tests {
                     ts: 100.0,
                     five_hour: Some(5.0),
                     seven_day: Some(9.0),
-                    fable_7d: None,
                     extra_pct: None,
                 },
                 HistoryEntry {
                     ts: 200.0,
                     five_hour: None,
                     seven_day: Some(10.0),
-                    fable_7d: None,
                     extra_pct: None,
+                },
+                HistoryEntry {
+                    ts: 300.0,
+                    five_hour: Some(6.0),
+                    seven_day: Some(11.0),
+                    extra_pct: Some(1.0),
                 },
             ]
         );
@@ -944,7 +936,6 @@ mod tests {
                     {"label": "5-hour", "utilization": 12.0,
                      "resets_at": "2026-10-11T17:10:00+00:00"},
                     {"label": "7-day all", "utilization": 30.5, "resets_at": null},
-                    {"label": "Fable", "utilization": 4.0, "resets_at": null},
                     {"label": "Opus 7d", "utilization": null, "resets_at": null},
                 ],
                 "extra": {"enabled": true, "monthly_limit": 75.0, "used_credits": 76.83,
@@ -1234,7 +1225,7 @@ mod tests {
         while t <= now {
             lines.push(
                 json!({"ts": unix_seconds(t), "five_hour": i % 97.0,
-                       "seven_day": i % 89.0, "fable_7d": i % 13.0})
+                       "seven_day": i % 89.0})
                 .to_string(),
             );
             t += Duration::minutes(20);
@@ -1262,19 +1253,13 @@ mod tests {
         );
         assert!((recent[1].0 - start).num_seconds().abs() <= 1);
         assert!((recent.last().unwrap().0 - now).num_seconds().abs() <= 1);
-        // Fable rides the same rows.
-        assert_eq!(got.fable_recent.len(), recent.len());
-        assert!(got
-            .fable_recent
-            .iter()
-            .all(|(_, v)| v.is_some_and(|v| v < 13.0)));
         // The weekly window: from 2 days ago to now, 20-minute rows (one
         // per 5-minute bucket already), the last hour all kept.
         let w = &got.week_samples;
         assert_eq!(w.len(), 2 * 24 * 3 + 1);
         assert!((w[0].t - week.0).num_seconds().abs() <= 1);
         assert!(w.windows(2).all(|p| p[0].t < p[1].t));
-        assert!(w.iter().all(|s| s.seven_day.is_some() && s.fable.is_some()));
+        assert!(w.iter().all(|s| s.seven_day.is_some()));
         // A recent window and week still read the 24 h and the anchor.
         let got = rollups(&paths, (ws, ws + Duration::hours(5)), (ws, now), now);
         assert_eq!(got.seven_day_recent.len(), 24 * 3 + 2);
@@ -1285,34 +1270,33 @@ mod tests {
         let (_tmp, paths) = temp_paths();
         let ws = utc(2026, 10, 11, 10, 0, 0);
         let now = ws + Duration::minutes(200);
-        let line = |t: DateTime<Utc>, five: Value, fable: Value| {
-            json!({"ts": unix_seconds(t), "five_hour": five, "fable_7d": fable}).to_string()
+        let line = |t: DateTime<Utc>, five: Value| {
+            json!({"ts": unix_seconds(t), "five_hour": five}).to_string()
         };
         write_history(
             &paths,
             &[
-                line(ws - Duration::seconds(1), json!(99.0), json!(9.0)), // before
-                line(ws + Duration::minutes(30), json!(20.0), json!(3.0)),
-                line(ws, json!(10.0), Value::Null), // at the start, out of order
+                line(ws - Duration::seconds(1), json!(99.0)), // before
+                line(ws + Duration::minutes(30), json!(20.0)),
+                line(ws, json!(10.0)), // at the start, out of order
                 "garbage".into(),
-                line(ws + Duration::minutes(60), Value::Null, json!(4.0)),
-                line(ws + Duration::minutes(300), json!(1.0), json!(1.0)), // at the end
+                line(ws + Duration::minutes(60), Value::Null),
+                line(ws + Duration::minutes(300), json!(1.0)), // at the end
             ],
         );
         let before = history_reads();
         let got = rollups(&paths, (ws, ws + Duration::hours(5)), (ws, now), now);
         assert_eq!(history_reads() - before, 1, "rollups reads history once");
-        let sample = |m: i64, five, fable| WindowSample {
+        let sample = |m: i64, five| WindowSample {
             t: ws + Duration::minutes(m),
             five_hour: five,
-            fable,
         };
         assert_eq!(
             got.window_samples,
             [
-                sample(0, Some(10.0), None),
-                sample(30, Some(20.0), Some(3.0)),
-                sample(60, None, Some(4.0)),
+                sample(0, Some(10.0)),
+                sample(30, Some(20.0)),
+                sample(60, None),
             ]
         );
     }

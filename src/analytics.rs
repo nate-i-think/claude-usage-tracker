@@ -1,7 +1,6 @@
 //! Dashboard analytics: burn rate, reset detection, cap ETA, projected use,
-//! color levels, countdown formatting, Fable chart ceilings, and the row
-//! rules of the dashboard. Submodules: the hero timeline (pace, projection,
-//! Fable layer), the weekly projection, project-name prettifying, and
+//! color levels, countdown formatting, and the row rules of the dashboard.
+//! Submodules: the hero timeline (pace, projection), the weekly projection, project-name prettifying, and
 //! threshold [`alerts`].
 //!
 //! Ported from the math in the Python ui.py (removed; see git history),
@@ -25,9 +24,9 @@ pub use names::{
 };
 
 pub use timeline::{
-    fable_layer, five_hour_now, five_hour_state, pace, projection, seven_day_pace,
-    since_last_reset, thin_week, week_window, FiveHourNow, FiveHourState, Projection, WeekSample,
-    WindowSample, RESET_DROP, WEEK_KEEP_ALL_MINUTES, WEEK_THIN_BUCKET_MINUTES,
+    five_hour_now, five_hour_state, pace, projection, seven_day_pace, since_last_reset, thin_week,
+    week_window, FiveHourNow, FiveHourState, Projection, WeekSample, WindowSample, RESET_DROP,
+    WEEK_KEEP_ALL_MINUTES, WEEK_THIN_BUCKET_MINUTES,
 };
 pub use weekly::{
     weekly_outlook, weekly_rate, RateBasis, WeeklyOutlook, WeeklyRate, ANCHOR_GAP_MINUTES,
@@ -40,24 +39,9 @@ pub const BURN_WINDOW_MINUTES: i64 = 15;
 /// In-memory history length; holds 15min of samples even at 5s polls.
 pub const HISTORY_LEN: usize = 240;
 
-/// Claude coral/orange (#d97757) for the Fable overlay, as RGB bytes.
-pub const FABLE_ORANGE: [u8; 3] = [0xd9, 0x77, 0x57];
-
-// Fable is a WEEKLY metric, so its % is a share of the weekly Fable cap. To plot
-// Fable's contribution on the *5-hour* chart we take the rise in Fable% since the
-// window start and scale it by this ratio = (weekly Fable cap) / (5-hour cap),
-// turning a weekly-% into a 5-hour-budget-%. It is NOT in the API.
-//
-// Calibrated directly from an all-Fable session: when every bit of usage is Fable,
-// both meters track the same usage, so R = (5-hour burn) / (Fable weekly burn).
-// Measured 1.06%/min ÷ 0.18%/min ≈ 5.9. One-line knob; re-measure the same way
-// (during a pure-Fable burst) if your plan changes.
-/// Weekly-Fable-% to 5-hour-budget-% scale for the 5-hour chart's orange floor.
-pub const FABLE_WEEKLY_TO_5H_RATIO: f64 = 5.9;
-
 /// Windows pinned to the dashboard even at 0%, in their row order. The
 /// remaining windows follow in snapshot order.
-pub const ALWAYS_SHOWN_LABELS: &[&str] = &["5-hour", "7-day all", "Fable"];
+pub const ALWAYS_SHOWN_LABELS: &[&str] = &["5-hour", "7-day all"];
 
 // --- Color & formatting helpers -------------------------------------------
 
@@ -234,7 +218,7 @@ pub struct BurnLine {
     pub samples: usize,
 }
 
-/// Burn line for one window (5-hour for ALL, Fable for FABLE) from its own
+/// Burn line for one window (the 5-hour one, tagged ALL) from its
 /// history, current percentage and reset time. `None` when the rate is
 /// unknown (fewer than two recent samples) or `pct` is unknown.
 pub fn burn_line(
@@ -371,24 +355,6 @@ pub fn headroom(
     })
 }
 
-// --- Orange Fable floor on charts -----------------------------------------
-
-/// Per-bucket orange ceilings (y-axis %) for the 5-hour chart.
-///
-/// Fable% is a weekly figure, so only the *rise since the window start*
-/// reflects Fable used inside this 5-hour window. Scale that rise by `ratio`
-/// (weekly Fable cap / 5-hour cap) to express it on the 5-hour budget. Never
-/// negative; buckets with no Fable sample stay `None`, and so does every
-/// bucket when no bucket has a sample. Clipping to each bar happens
-/// downstream.
-pub fn fable_5h_ceilings<T>(fable_buckets: &[(T, Option<f64>)], ratio: f64) -> Vec<Option<f64>> {
-    let baseline = fable_buckets.iter().find_map(|(_, v)| *v);
-    fable_buckets
-        .iter()
-        .map(|&(_, v)| Some((v? - baseline?).max(0.0) * ratio))
-        .collect()
-}
-
 // --- Dashboard rows ---------------------------------------------------------
 
 /// Whether a window gets a summary row: always with `show_all`; otherwise
@@ -403,7 +369,7 @@ pub fn window_visible(w: &UsageWindow, show_all: bool) -> bool {
 /// lines go between the two groups.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowOrder<'a> {
-    /// 5-hour, 7-day all, Fable, in that order, each when present.
+    /// 5-hour, then 7-day all, each when present.
     pub primary: Vec<&'a UsageWindow>,
     /// Every other window, in snapshot order.
     pub rest: Vec<&'a UsageWindow>,
@@ -520,9 +486,7 @@ mod tests {
     fn constants_match_python() {
         assert_eq!(BURN_WINDOW_MINUTES, 15);
         assert_eq!(HISTORY_LEN, 240);
-        assert_eq!(FABLE_ORANGE, [217, 119, 87]); // #d97757, "217;119;87" truecolor
-        assert_eq!(FABLE_WEEKLY_TO_5H_RATIO, 5.9);
-        assert_eq!(ALWAYS_SHOWN_LABELS, ["5-hour", "7-day all", "Fable"]);
+        assert_eq!(ALWAYS_SHOWN_LABELS, ["5-hour", "7-day all"]);
     }
 
     // --- color_for ----------------------------------------------------------
@@ -731,23 +695,6 @@ mod tests {
         // Rate known but no utilization: still the placeholder line.
         let hist = history(&[(10.0, 20.0), (2.0, 24.0)]);
         assert_eq!(burn_line(&hist, None, None, NOW), None);
-    }
-
-    #[test]
-    fn fable_burn_uses_its_own_history() {
-        // test_fable_burn_uses_its_own_history: independent sourcing.
-        let all = burn_line(
-            &history(&[(10.0, 20.0), (2.0, 24.0)]),
-            Some(24.0),
-            None,
-            NOW,
-        )
-        .unwrap();
-        let fable = burn_line(&history(&[(10.0, 8.0), (2.0, 8.2)]), Some(8.2), None, NOW).unwrap();
-        assert_eq!(fmt_rate(all.rate), "+0.50%/min");
-        assert_ne!(fmt_rate(fable.rate), "+0.50%/min");
-        assert!((fable.rate - 0.025).abs() < 1e-9, "{}", fable.rate);
-        assert_eq!(fable.rate_level, Level::Green);
     }
 
     #[test]
@@ -1047,54 +994,9 @@ mod tests {
         assert_eq!(headroom_of(&s, None, NOW), None);
     }
 
-    // --- Orange Fable floor on charts -----------------------------------------
-
     #[test]
-    fn fable_5h_ceilings_scale_change_since_window_start() {
-        // Fable is a WEEKLY metric; the 5h chart should show only the rise since the
-        // window start, scaled by R (weekly cap / 5h cap) to reach 5h-budget terms.
-        let buckets = [(NOW, Some(4.0)), (NOW, Some(5.0)), (NOW, Some(6.0))]; // window start at 4%
-        assert_eq!(
-            fable_5h_ceilings(&buckets, 2.0),
-            vec![Some(0.0), Some(2.0), Some(4.0)]
-        );
-    }
-
-    #[test]
-    fn fable_5h_ceilings_all_none_when_no_fable_data() {
-        let buckets: [(DateTime<Utc>, Option<f64>); 2] = [(NOW, None), (NOW, None)];
-        assert_eq!(fable_5h_ceilings(&buckets, 2.0), vec![None, None]);
-        let empty: [(DateTime<Utc>, Option<f64>); 0] = [];
-        assert!(fable_5h_ceilings(&empty, 2.0).is_empty());
-    }
-
-    #[test]
-    fn fable_5h_ceilings_never_negative() {
-        // A reset/None dip must not produce a negative (upward-inverted) floor.
-        let buckets = [(NOW, Some(5.0)), (NOW, Some(4.0))];
-        assert_eq!(fable_5h_ceilings(&buckets, 3.0), vec![Some(0.0), Some(0.0)]);
-    }
-
-    #[test]
-    fn fable_5h_ceilings_baseline_is_first_sample_and_gaps_stay_none() {
-        // Leading empty buckets do not set the baseline; later gaps stay None.
-        let buckets = [
-            (NOW, None),
-            (NOW, Some(10.0)),
-            (NOW, None),
-            (NOW, Some(11.0)),
-        ];
-        assert_eq!(
-            fable_5h_ceilings(&buckets, 5.9),
-            vec![None, Some(0.0), None, Some(5.9)]
-        );
-    }
-
-    #[test]
-    fn fable_row_pinned_even_at_zero_percent() {
-        // Fable is an always-shown row: at 0% a non-pinned row would be hidden.
-        assert!(window_visible(&window("Fable", Some(0.0), None), false));
-        assert!(window_visible(&window("Fable", None, None), false));
+    fn pinned_rows_shown_even_at_zero_percent() {
+        // At 0% a non-pinned row would be hidden.
         assert!(window_visible(&window("5-hour", None, None), false));
         assert!(window_visible(&window("7-day all", Some(0.0), None), false));
     }
@@ -1119,18 +1021,17 @@ mod tests {
 
     #[test]
     fn summary_order_primary_then_rest() {
-        // test_summary_order_bars_grouped_then_burns: 5-hour, 7-day all, Fable first.
+        // test_summary_order_bars_grouped_then_burns: 5-hour, 7-day all first.
         let s = snap_with_windows(vec![
             window("Sonnet 7d", None, None),
-            window("Fable", Some(8.0), None),
             window("Opus 7d", Some(3.0), None),
             window("7-day all", Some(14.0), Some(NOW + Duration::days(5))),
         ]);
         let order = ordered_windows(&s);
         let labels = |ws: &[&UsageWindow]| ws.iter().map(|w| w.label.clone()).collect::<Vec<_>>();
-        assert_eq!(labels(&order.primary), ["5-hour", "7-day all", "Fable"]);
+        assert_eq!(labels(&order.primary), ["5-hour", "7-day all"]);
         assert_eq!(labels(&order.rest), ["Sonnet 7d", "Opus 7d"]);
-        assert_eq!(order.primary[2].utilization, Some(8.0));
+        assert_eq!(order.primary[1].utilization, Some(14.0));
     }
 
     #[test]

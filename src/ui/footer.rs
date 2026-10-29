@@ -389,9 +389,7 @@ mod tests {
                 breakdown: None,
             },
             history: Vec::new(),
-            fable_history: Vec::new(),
             seven_day_recent: Vec::new(),
-            fable_recent: Vec::new(),
             burners: burners
                 .iter()
                 .map(|&(name, tokens)| crate::storage::InstanceUsage {

@@ -92,7 +92,7 @@ pub struct PillSegment {
     pub pace: Option<f64>,
     /// No 5-hour window is active: "5h · idle" in place of the countdown.
     pub idle: bool,
-    /// The weekly windows for the tooltip: ("7-day all", %), ("Fable", %).
+    /// The weekly windows for the tooltip: ("7-day all", %).
     pub weekly: Vec<(&'static str, Option<f64>)>,
     /// The account has polled successfully (else everything above is
     /// empty and the segment shows "—").
@@ -778,13 +778,12 @@ mod tests {
         let chips = [
             chip("5-hour", Some(46.0), Some(6.0)),
             chip("7-day all", Some(13.4), None),
-            chip("Fable", Some(0.0), None),
         ];
         let segs = seg(&chips);
         let [a, b] = two(tooltip_lines_in(&segs, false, t(0), &utc));
         assert!(a.starts_with("5-hour 46% · ▲+6 · resets "), "{a}");
         assert!(a.ends_with("· in 1h 59m"), "{a}");
-        assert_eq!(b, "7-day all 13% · Fable 0%");
+        assert_eq!(b, "7-day all 13%");
         let [_, b] = two(tooltip_lines_in(&segs, true, t(0), &utc));
         assert_eq!(b, "Last poll failed · click to see why");
         let waiting = ["5-hour —", "Waiting for the first poll"];

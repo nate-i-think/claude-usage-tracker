@@ -1,5 +1,5 @@
-//! The weekly projections: where a weekly meter (7-day all, or Fable's own
-//! 7-day limit) lands at its reset.
+//! The weekly projections: where the weekly meter (7-day all) lands at its
+//! reset.
 //!
 //! The 5-hour burn rate (15 minutes of samples) says nothing about the
 //! week, so the weekly rate is taken over a long trailing window starting

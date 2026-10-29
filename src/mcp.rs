@@ -530,7 +530,7 @@ other profiles, from the most recent monitor ping.
 Read-only and non-blocking. Use this to decide whether to slow down or keep
 going. The top-level fields describe YOUR profile (the account this Claude
 Code session runs under, identified by `profile`): for each usage window
-(5-hour, 7-day, Fable, ...) utilization percent, when it resets, and a
+(5-hour, 7-day, ...) utilization percent, when it resets, and a
 human-readable time-to-reset — plus the data's age, a `stale` flag (true if
 the monitor isn't updating), the extra-usage block, the 7-day per-model
 breakdown, and a `recommendation`/`summary` you can act on.
@@ -805,7 +805,7 @@ mod tests {
         let ws = [
             win("5-hour", Some(20.0), Some("2h 00m")),
             win("7-day", Some(85.0), None),
-            win("Fable", None, None),
+            win("Opus 7d", None, None),
         ];
         let (rec, summary) = advise(&ws, true);
         assert!(rec.starts_with(
@@ -906,7 +906,7 @@ mod tests {
                     resets_at: Some(now() + Duration::days(2)),
                 },
                 UsageWindow {
-                    label: "Fable".into(),
+                    label: "Opus 7d".into(),
                     utilization: None,
                     resets_at: None,
                 },
@@ -933,7 +933,7 @@ mod tests {
             .iter()
             .map(|w| w["label"].as_str().unwrap())
             .collect();
-        assert_eq!(labels, ["5-hour", "7-day all", "Fable"]);
+        assert_eq!(labels, ["5-hour", "7-day all", "Opus 7d"]);
         assert_eq!(u["windows"][0]["utilization_pct"], 37.5);
         assert_eq!(u["windows"][0]["resets_in_seconds"], 5400);
         assert_eq!(u["windows"][1]["utilization_pct"], 61.0);
@@ -952,6 +952,24 @@ mod tests {
                 "disabled_reason": null,
             })
         );
+    }
+
+    /// A latest.json written before the Fable limit was dropped still
+    /// loads; its Fable window passes through like any other.
+    #[test]
+    fn old_latest_json_with_a_fable_window_still_loads() {
+        let (_tmp, paths) = temp_paths();
+        let mut old = snapshot(30, 42.0, 3600);
+        old["windows"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"label": "Fable", "utilization": 4.0, "resets_at": null}));
+        write_latest(&paths, &old);
+        let u = current_usage(&paths, &cfg(), now());
+        assert_eq!(u["available"], true);
+        assert_eq!(u["five_hour"]["utilization_pct"], 42.0);
+        assert_eq!(u["windows"].as_array().unwrap().len(), 3);
+        assert_eq!(u["summary"], "5-hour 42% · resets in 1h 00m");
     }
 
     #[test]

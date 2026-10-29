@@ -1,30 +1,27 @@
 //! Hero-timeline math: window samples (5-hour and weekly), pace against an
-//! even burn, the dashed projection with its cap crossing, the continuous
-//! Fable layer, and thinning a week of samples.
+//! even burn, the dashed projection with its cap crossing, and thinning a
+//! week of samples.
 //!
 //! Pure and clock-injected like the rest of [`crate::analytics`].
 
 use chrono::{DateTime, Duration, Utc};
 
-use super::FABLE_WEEKLY_TO_5H_RATIO;
-use super::{fable_5h_ceilings, lands_after, minutes_between, minutes_to_cap};
+use super::{lands_after, minutes_between, minutes_to_cap};
 
-/// One history row inside the current 5-hour window: the 5-hour and the
-/// Fable weekly utilization at `t`.
+/// One history row inside the current 5-hour window: the 5-hour
+/// utilization at `t`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowSample {
     pub t: DateTime<Utc>,
     pub five_hour: Option<f64>,
-    pub fable: Option<f64>,
 }
 
-/// One history row inside the current weekly window: the 7-day-all and the
-/// Fable 7-day utilization at `t`.
+/// One history row inside the current weekly window: the 7-day-all
+/// utilization at `t`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WeekSample {
     pub t: DateTime<Utc>,
     pub seven_day: Option<f64>,
-    pub fable: Option<f64>,
 }
 
 /// Bucket length for thinning a week of samples.
@@ -136,8 +133,8 @@ pub fn since_last_reset(samples: &[WindowSample]) -> &[WindowSample] {
 
 /// A week of samples (oldest first) thinned to a bounded size: one sample
 /// per [`WEEK_THIN_BUCKET_MINUTES`] bucket, at the bucket's last time with
-/// each meter's last value in the bucket (a later row missing a meter
-/// doesn't wipe it), and every sample of the last [`WEEK_KEEP_ALL_MINUTES`]
+/// the last value in the bucket (a later row missing it doesn't wipe it),
+/// and every sample of the last [`WEEK_KEEP_ALL_MINUTES`]
 /// before `now`. A week at 30 s polls
 /// (about 20 000 rows) becomes about 2 100. The weekly meters only rise
 /// within a week, so the last sample of a bucket is its highest.
@@ -153,7 +150,6 @@ pub fn thin_week(samples: &[WeekSample], now: DateTime<Utc>) -> Vec<WeekSample> 
                     *last = WeekSample {
                         t: s.t,
                         seven_day: s.seven_day.or(last.seven_day),
-                        fable: s.fable.or(last.fable),
                     };
                     continue;
                 }
@@ -183,7 +179,7 @@ pub fn pace(
     Some(utilization - 100.0 * elapsed)
 }
 
-/// [`pace`] for a 7-day window (7-day all, Fable) from its reset time.
+/// [`pace`] for the 7-day window from its reset time.
 ///
 /// Assumes the window is a fixed 7 days ending at `resets_at`, so it starts
 /// at `resets_at - 7 days`; the API reports only the reset time. `None` when
@@ -252,21 +248,6 @@ pub fn projection(
     }
 }
 
-/// Per sample, the height of the orange Fable layer under the 5-hour curve:
-/// the rise in Fable% since the window's first Fable sample, scaled by
-/// [`FABLE_WEEKLY_TO_5H_RATIO`] (the rule of [`fable_5h_ceilings`], per
-/// sample instead of per bucket), clipped to the sample's 5-hour value.
-/// `None` where either value is missing, and everywhere when the window has
-/// no Fable sample.
-pub fn fable_layer(samples: &[WindowSample]) -> Vec<Option<f64>> {
-    let fable: Vec<_> = samples.iter().map(|s| (s.t, s.fable)).collect();
-    fable_5h_ceilings(&fable, FABLE_WEEKLY_TO_5H_RATIO)
-        .into_iter()
-        .zip(samples)
-        .map(|(ceiling, s)| Some(ceiling?.min(s.five_hour?)))
-        .collect()
-}
-
 fn minutes_duration(minutes: f64) -> Duration {
     Duration::microseconds((minutes * 60e6).round() as i64)
 }
@@ -280,7 +261,6 @@ mod tests {
         WeekSample {
             t: t0() + Duration::minutes(m),
             seven_day: Some(v),
-            fable: None,
         }
     }
 
@@ -318,19 +298,14 @@ mod tests {
     }
 
     #[test]
-    fn thin_week_keeps_each_meters_last_value_in_a_bucket() {
-        let row = |m: i64, seven: Option<f64>, fable: Option<f64>| WeekSample {
+    fn thin_week_keeps_the_last_value_in_a_bucket() {
+        let row = |m: i64, seven: Option<f64>| WeekSample {
             t: t0() + Duration::minutes(m),
             seven_day: seven,
-            fable,
         };
-        let samples = [
-            row(0, Some(10.0), Some(20.0)),
-            row(1, Some(11.0), None),
-            row(2, None, None),
-        ];
+        let samples = [row(0, Some(10.0)), row(1, Some(11.0)), row(2, None)];
         let thin = thin_week(&samples, t0() + Duration::hours(3));
-        assert_eq!(thin, [row(2, Some(11.0), Some(20.0))]);
+        assert_eq!(thin, [row(2, Some(11.0))]);
     }
 
     #[test]
@@ -340,7 +315,6 @@ mod tests {
             .map(|i| WeekSample {
                 t: t0() + Duration::seconds(30 * i),
                 seven_day: Some(1.0),
-                fable: Some(2.0),
             })
             .collect();
         let thin = thin_week(&samples, now);
@@ -482,67 +456,12 @@ mod tests {
         assert_eq!(p.cap_at, None);
     }
 
-    // --- fable_layer --------------------------------------------------------
-
-    fn s(m: i64, five: Option<f64>, fable: Option<f64>) -> WindowSample {
+    fn s(m: i64, five: Option<f64>) -> WindowSample {
         WindowSample {
             t: at(m),
             five_hour: five,
-            fable,
         }
     }
-
-    #[test]
-    fn fable_layer_is_scaled_rise_since_first_fable_sample() {
-        let samples = [
-            s(0, Some(10.0), Some(20.0)),
-            s(5, Some(20.0), Some(21.0)),
-            s(10, Some(40.0), Some(22.0)),
-        ];
-        let layer = fable_layer(&samples);
-        assert_eq!(layer[0], Some(0.0));
-        assert!(close(layer[1].unwrap(), FABLE_WEEKLY_TO_5H_RATIO));
-        assert!(close(layer[2].unwrap(), 2.0 * FABLE_WEEKLY_TO_5H_RATIO));
-    }
-
-    #[test]
-    fn fable_layer_baseline_skips_leading_gaps() {
-        let samples = [
-            s(0, Some(5.0), None),
-            s(5, Some(10.0), Some(3.0)),
-            s(10, Some(30.0), Some(4.0)),
-        ];
-        let layer = fable_layer(&samples);
-        assert_eq!(layer[0], None);
-        assert_eq!(layer[1], Some(0.0));
-        assert!(close(layer[2].unwrap(), FABLE_WEEKLY_TO_5H_RATIO));
-    }
-
-    #[test]
-    fn fable_layer_none_gaps_stay_none() {
-        let samples = [
-            s(0, Some(5.0), Some(1.0)),
-            s(5, Some(9.0), None),
-            s(10, None, Some(2.0)),
-            s(15, Some(30.0), Some(2.0)),
-        ];
-        let layer = fable_layer(&samples);
-        assert_eq!(layer[1], None, "no Fable value");
-        assert_eq!(layer[2], None, "no 5-hour value to sit under");
-        assert!(layer[3].is_some());
-    }
-
-    #[test]
-    fn fable_layer_clips_to_curve_and_never_negative() {
-        let samples = [
-            s(0, Some(10.0), Some(10.0)),
-            s(5, Some(12.0), Some(15.0)), // 5 × 5.9 = 29.5, clipped to 12
-            s(10, Some(12.0), Some(9.0)), // drop below baseline -> 0
-        ];
-        assert_eq!(fable_layer(&samples), [Some(0.0), Some(12.0), Some(0.0)]);
-    }
-
-    // --- the 5-hour window's state --------------------------------------------
 
     #[test]
     fn five_hour_state_idle_trailing_active() {
@@ -609,10 +528,10 @@ mod tests {
     #[test]
     fn since_last_reset_cuts_at_a_big_drop() {
         let samples = [
-            s(0, Some(40.0), None),
-            s(5, Some(80.0), None),
-            s(10, Some(3.0), None),
-            s(15, Some(6.0), None),
+            s(0, Some(40.0)),
+            s(5, Some(80.0)),
+            s(10, Some(3.0)),
+            s(15, Some(6.0)),
         ];
         assert_eq!(since_last_reset(&samples), &samples[2..]);
     }
@@ -620,10 +539,10 @@ mod tests {
     #[test]
     fn since_last_reset_cuts_at_a_drop_to_zero() {
         let samples = [
-            s(0, Some(2.0), None),
-            s(5, Some(4.0), None),
-            s(10, Some(0.0), None),
-            s(15, Some(0.0), None),
+            s(0, Some(2.0)),
+            s(5, Some(4.0)),
+            s(10, Some(0.0)),
+            s(15, Some(0.0)),
         ];
         assert_eq!(since_last_reset(&samples), &samples[2..]);
     }
@@ -631,12 +550,12 @@ mod tests {
     #[test]
     fn since_last_reset_takes_the_last_and_skips_gaps() {
         let samples = [
-            s(0, Some(90.0), None),
-            s(5, Some(1.0), None),
-            s(10, Some(50.0), None),
-            s(15, None, None),
-            s(20, Some(2.0), None),
-            s(25, Some(4.0), None),
+            s(0, Some(90.0)),
+            s(5, Some(1.0)),
+            s(10, Some(50.0)),
+            s(15, None),
+            s(20, Some(2.0)),
+            s(25, Some(4.0)),
         ];
         assert_eq!(since_last_reset(&samples), &samples[4..]);
     }
@@ -644,18 +563,18 @@ mod tests {
     #[test]
     fn since_last_reset_ignores_a_lone_glitch() {
         let samples = [
-            s(0, Some(30.0), None),
-            s(5, Some(40.0), None),
-            s(10, Some(0.0), None),
-            s(15, Some(41.0), None),
+            s(0, Some(30.0)),
+            s(5, Some(40.0)),
+            s(10, Some(0.0)),
+            s(15, Some(41.0)),
         ];
         assert_eq!(since_last_reset(&samples), &samples[..]);
         // Recovered across a gap without a value, too.
         let gap = [
-            s(0, Some(40.0), None),
-            s(5, Some(0.0), None),
-            s(10, None, None),
-            s(15, Some(36.0), None),
+            s(0, Some(40.0)),
+            s(5, Some(0.0)),
+            s(10, None),
+            s(15, Some(36.0)),
         ];
         assert_eq!(since_last_reset(&gap), &gap[..]);
     }
@@ -663,40 +582,29 @@ mod tests {
     #[test]
     fn since_last_reset_cuts_a_persisting_drop_and_heals_a_latest_glitch() {
         let real = [
-            s(0, Some(80.0), None),
-            s(5, Some(0.0), None),
-            s(10, Some(0.0), None),
-            s(15, Some(2.0), None),
+            s(0, Some(80.0)),
+            s(5, Some(0.0)),
+            s(10, Some(0.0)),
+            s(15, Some(2.0)),
         ];
         assert_eq!(since_last_reset(&real), &real[1..]);
         // A drop on the latest poll cuts for now...
-        let latest = [
-            s(0, Some(30.0), None),
-            s(5, Some(40.0), None),
-            s(10, Some(0.0), None),
-        ];
+        let latest = [s(0, Some(30.0)), s(5, Some(40.0)), s(10, Some(0.0))];
         assert_eq!(since_last_reset(&latest), &latest[2..]);
         // ...and the next poll back at 41 heals it.
-        let healed = [latest[0], latest[1], latest[2], s(15, Some(41.0), None)];
+        let healed = [latest[0], latest[1], latest[2], s(15, Some(41.0))];
         assert_eq!(since_last_reset(&healed), &healed[..]);
     }
 
     #[test]
     fn since_last_reset_keeps_a_rising_window_and_small_dips() {
         let samples = [
-            s(0, Some(0.0), None),
-            s(5, Some(10.0), None),
-            s(10, Some(8.0), None),
-            s(15, Some(12.0), None),
+            s(0, Some(0.0)),
+            s(5, Some(10.0)),
+            s(10, Some(8.0)),
+            s(15, Some(12.0)),
         ];
         assert_eq!(since_last_reset(&samples), &samples[..]);
         assert!(since_last_reset(&[]).is_empty());
-    }
-
-    #[test]
-    fn fable_layer_without_fable_or_samples() {
-        assert!(fable_layer(&[]).is_empty());
-        let samples = [s(0, Some(10.0), None), s(5, Some(20.0), None)];
-        assert_eq!(fable_layer(&samples), [None, None]);
     }
 }

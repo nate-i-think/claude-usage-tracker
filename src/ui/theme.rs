@@ -10,10 +10,10 @@
 //! Contrast rules, enforced by the tests below on both palettes:
 //! - text roles (`text`, `text_muted`) and state colors, which color numbers
 //!   and labels: at least 4.5:1 on `bg` and `surface`;
-//! - graphic roles (`accent`, `fable`, bars, chips, chart
-//!   fills): at least 3:1 on `bg` and `surface`. `accent`/`fable` reach
-//!   4.5:1 on `bg` (where the title and burn tag sit) but not on the dark
-//!   `surface`, so text on cards should not use them.
+//! - graphic roles (`accent`, bars, chips, chart fills): at least 3:1 on
+//!   `bg` and `surface`. `accent` reaches 4.5:1 on `bg` (where the title
+//!   sits) but not on the dark `surface`, so text on cards should not use
+//!   it.
 
 use eframe::egui::{
     self, epaint::Shadow, pos2, vec2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily,
@@ -22,7 +22,7 @@ use eframe::egui::{
 use egui::epaint::text::{FontTweak, VariationCoords};
 
 use super::Tone;
-use crate::analytics::{Level, FABLE_ORANGE};
+use crate::analytics::Level;
 
 /// Inter 4.1 variable (rsms/inter release v4.1, `InterVariable.ttf`, SIL OFL
 /// 1.1; license text in `assets/fonts/OFL.txt`, copied from the release's
@@ -71,15 +71,12 @@ pub struct Palette {
     pub accent: Color32,
     /// Accent tint behind selected items; text on it stays `text`.
     pub accent_soft: Color32,
-    /// The Fable layer/tag (Claude coral).
-    pub fable: Color32,
     /// State colors, low to high.
     pub good: Color32,
     pub warn: Color32,
     pub high: Color32,
     pub danger: Color32,
-    /// Neutral chart bars; a clear lightness step from `fable`, so the
-    /// Fable floor reads without color vision.
+    /// Neutral chart bars.
     pub bar: Color32,
     /// Chart gridlines.
     pub grid: Color32,
@@ -90,7 +87,7 @@ pub struct Palette {
     /// Categorical colors that tell accounts apart in charts (≈ blue,
     /// violet, teal, magenta, slate, olive): at least 3:1 on `bg` and
     /// `surface`, and clearly apart (CIELAB ΔE76 ≥ 20) from the state
-    /// colors, `fable`, `accent` and each other; the first two stay apart
+    /// colors, `accent` and each other; the first two stay apart
     /// under deuteranopia. Pick with [`Palette::series`].
     pub series: [Color32; 6],
 }
@@ -113,7 +110,6 @@ pub const DARK: Palette = Palette {
     text_muted: hex(0xA6A39A),
     accent: hex(0xD97757),
     accent_soft: hex(0x4E3D35),
-    fable: Color32::from_rgb(FABLE_ORANGE[0], FABLE_ORANGE[1], FABLE_ORANGE[2]),
     good: hex(0x7FB069),
     warn: hex(0xE0B341),
     high: hex(0xECA04A),
@@ -146,8 +142,6 @@ pub const LIGHT: Palette = Palette {
     text_muted: hex(0x6B6A65),
     accent: hex(0xB04F30),
     accent_soft: hex(0xE4D1C5),
-    // #d97757 darkened to stay readable on cream.
-    fable: hex(0xB04F30),
     good: hex(0x3B7A2A),
     warn: hex(0x8A6400),
     high: hex(0x864700),
@@ -195,7 +189,6 @@ impl Palette {
             Tone::Dim => self.text_muted,
             Tone::Level(level) => self.level(level),
             Tone::Accent => self.accent,
-            Tone::Fable => self.fable,
         }
     }
 
@@ -556,12 +549,10 @@ mod tests {
     }
 
     #[test]
-    fn accent_and_fable_text_on_bg_graphic_on_surface() {
+    fn accent_text_on_bg_graphic_on_surface() {
         for p in palettes() {
-            for (name, fg) in [("accent", p.accent), ("fable", p.fable)] {
-                assert_contrast(p, name, fg, "bg", p.bg, TEXT);
-                assert_contrast(p, name, fg, "surface", p.surface, GRAPHIC);
-            }
+            assert_contrast(p, "accent", p.accent, "bg", p.bg, TEXT);
+            assert_contrast(p, "accent", p.accent, "surface", p.surface, GRAPHIC);
         }
     }
 
@@ -618,14 +609,13 @@ mod tests {
     const SERIES_DE: f64 = 20.0;
 
     #[test]
-    fn series_apart_from_state_fable_accent_and_each_other() {
+    fn series_apart_from_state_accent_and_each_other() {
         for p in palettes() {
             let roles = [
                 ("good", p.good),
                 ("warn", p.warn),
                 ("high", p.high),
                 ("danger", p.danger),
-                ("fable", p.fable),
                 ("accent", p.accent),
             ];
             for (i, &c) in p.series.iter().enumerate() {
@@ -687,18 +677,6 @@ mod tests {
     }
 
     #[test]
-    fn state_colors_distinct_from_fable() {
-        // The Fable layer sits next to state-colored fills; orange (`high`)
-        // is the nearest hue, so it also needs a lightness step.
-        for p in palettes() {
-            for fg in [p.good, p.warn, p.high, p.danger] {
-                assert_ne!(fg, p.fable);
-            }
-            assert_contrast(p, "high", p.high, "fable", p.fable, 1.3);
-        }
-    }
-
-    #[test]
     fn control_edges_visible_on_bg_and_surface() {
         for p in palettes() {
             let edge = p.control_border;
@@ -714,10 +692,9 @@ mod tests {
     }
 
     #[test]
-    fn chart_bar_graphic_and_apart_from_fable() {
+    fn chart_bar_graphic() {
         for p in palettes() {
             assert_contrast(p, "bar", p.bar, "surface", p.surface, GRAPHIC);
-            assert_contrast(p, "bar", p.bar, "fable", p.fable, 1.5);
         }
     }
 
@@ -733,14 +710,6 @@ mod tests {
             assert_eq!(state.corner_radius, r);
         }
         const { assert!(CHECKBOX_RADIUS < WIDGET_RADIUS) };
-    }
-
-    #[test]
-    fn fable_is_brand_coral_on_dark_and_darker_on_light() {
-        let [r, g, b] = FABLE_ORANGE;
-        let coral = Color32::from_rgb(r, g, b);
-        assert_eq!(DARK.fable, coral);
-        assert!(luminance(LIGHT.fable) < luminance(coral));
     }
 
     #[test]
@@ -764,7 +733,6 @@ mod tests {
             assert_eq!(p.tone(Tone::Strong), p.text);
             assert_eq!(p.tone(Tone::Dim), p.text_muted);
             assert_eq!(p.tone(Tone::Accent), p.accent);
-            assert_eq!(p.tone(Tone::Fable), p.fable);
             assert_eq!(p.tone(Tone::Level(Level::Red)), p.danger);
             assert_eq!(p.level(Level::Green), p.good);
             assert_eq!(p.level(Level::Yellow), p.warn);

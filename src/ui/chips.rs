@@ -1,5 +1,5 @@
-//! The header's stat chips: one rounded chip per headline window (5-hour,
-//! 7-day all, and Fable when reported) with a small label, the big
+//! The header's stat chips: one rounded chip per headline window (5-hour
+//! and 7-day all) with a small label, the big
 //! percentage in its state color, and the pace delta against an even burn.
 //!
 //! The chip model, copy, pace colors and wrapping are pure and tested; the
@@ -59,12 +59,11 @@ pub struct Chip {
 /// The 5-hour chip's hover text while no window is active.
 pub const IDLE_TIP: &str = "no active window · starts with your next message";
 
-/// The chips for this snapshot: 5-hour and 7-day all always, Fable only
-/// when the API reports it. The 5-hour pace runs over the dashboard's
+/// The chips for this snapshot: 5-hour and 7-day all. The 5-hour pace runs over the dashboard's
 /// window (`window_start..window_end`), only while it is active with a
 /// known reset (see [`analytics::five_hour_now`]: a window that rolled over
 /// since the poll reads 0% with no pace); the 7-day ones over the 7 days
-/// before their reset.
+/// before its reset.
 pub fn chips(
     snap: &Snapshot,
     window_start: DateTime<Utc>,
@@ -83,23 +82,15 @@ pub fn chips(
         pulses: true,
         idle: five.state == analytics::FiveHourState::Idle,
     }];
-    let weekly = |label: &'static str| {
-        let w = snap.window(label);
-        let pct = w.and_then(|w| w.utilization);
-        let resets_at = w.and_then(|w| w.resets_at);
-        Chip {
-            label,
-            pct,
-            pace: analytics::seven_day_pace(pct, resets_at, now),
-            resets_at,
-            pulses: false,
-            idle: false,
-        }
-    };
-    out.push(weekly("7-day all"));
-    if snap.window("Fable").is_some() {
-        out.push(weekly("Fable"));
-    }
+    let (pct, resets_at) = (snap.seven_day_pct(), snap.seven_day_resets_at());
+    out.push(Chip {
+        label: "7-day all",
+        pct,
+        pace: analytics::seven_day_pace(pct, resets_at, now),
+        resets_at,
+        pulses: false,
+        idle: false,
+    });
     out
 }
 
@@ -569,7 +560,7 @@ mod tests {
         ]);
         // 5-hour window 9:00-14:00: 3 of 5 hours gone = 60% -> 46 - 60.
         let c = chips(&s, t(9, 0), t(14, 0), now);
-        assert_eq!(c.len(), 2, "no Fable chip when not reported: {c:?}");
+        assert_eq!(c.len(), 2, "{c:?}");
         assert_eq!(c[0].label, "5-hour");
         assert_eq!(c[0].pct, Some(46.0));
         assert!((c[0].pace.unwrap() - -14.0).abs() < 1e-9);
@@ -582,19 +573,15 @@ mod tests {
     }
 
     #[test]
-    fn chips_fable_when_reported_and_no_pace_without_reset() {
+    fn chips_without_reset_or_utilization_have_no_pace() {
         let now = t(12, 0);
-        let s = snap(vec![
-            window("5-hour", Some(46.0), None),
-            window("Fable", None, Some(now + Duration::days(1))),
-        ]);
+        let s = snap(vec![window("5-hour", Some(46.0), None)]);
         let c = chips(&s, t(9, 0), t(14, 0), now);
         let labels: Vec<_> = c.iter().map(|c| c.label).collect();
-        assert_eq!(labels, ["5-hour", "7-day all", "Fable"]);
+        assert_eq!(labels, ["5-hour", "7-day all"]);
         assert_eq!(c[0].pace, None, "5-hour without reset has no pace");
         assert_eq!(c[1].pct, None, "7-day all missing: an empty chip");
-        assert_eq!(c[2].pct, None);
-        assert_eq!(c[2].pace, None, "no utilization, no pace");
+        assert_eq!(c[1].pace, None, "no utilization, no pace");
     }
 
     #[test]
@@ -696,9 +683,7 @@ mod tests {
                 window("7-day all", Some(10.0), Some(now + Duration::days(3))),
             ]),
             history: Vec::new(),
-            fable_history: Vec::new(),
             seven_day_recent: Vec::new(),
-            fable_recent: Vec::new(),
             burners: Vec::new(),
             window_start: t(9, 0),
             window_end: t(14, 0),

@@ -8,13 +8,11 @@ use chrono::{DateTime, Utc};
 use crate::analytics;
 use crate::model::UsageWindow;
 use crate::poller::Dashboard;
-use crate::ui::rows::{self, BurnTag};
+use crate::ui::rows;
 use crate::ui::Run;
 
 /// Label column: fits the longest window label ("Omelette promo").
 const LABEL_WIDTH: usize = 14;
-/// Burn tag column: fits "FABLE:" plus a space.
-const TAG_WIDTH: usize = 7;
 
 /// Concatenate the runs' text, dropping styling.
 fn plain(runs: &[Run]) -> String {
@@ -31,9 +29,10 @@ pub fn window_line(w: &UsageWindow, now: DateTime<Utc>) -> String {
     }
 }
 
-fn burn_line(tag: BurnTag, line: Option<&analytics::BurnLine>) -> String {
-    let tag = rows::burn_tag(tag).text;
-    format!("{tag:<TAG_WIDTH$}{}", plain(&rows::burn_body(line)))
+/// "ALL: 15m burn …": the 5-hour burn line.
+fn burn_line(line: Option<&analytics::BurnLine>) -> String {
+    let tag = rows::burn_tag().text;
+    format!("{tag} {}", plain(&rows::burn_body(line)))
 }
 
 /// The whole dashboard as plain text, one line per row, ending in a newline.
@@ -57,11 +56,7 @@ pub fn render(d: &Dashboard, plan: &str, show_all: bool, now: DateTime<Utc>) -> 
         snap.five_hour_resets_at(),
         now,
     );
-    out.push(burn_line(BurnTag::All, all.as_ref()));
-    if let Some(fable) = snap.window("Fable") {
-        let line = analytics::burn_line(&d.fable_history, fable.utilization, fable.resets_at, now);
-        out.push(burn_line(BurnTag::Fable, line.as_ref()));
-    }
+    out.push(burn_line(all.as_ref()));
 
     let rest = visible(&order.rest);
     if !rest.is_empty() {
@@ -114,9 +109,7 @@ mod tests {
                 breakdown: None,
             },
             history: Vec::new(),
-            fable_history: Vec::new(),
             seven_day_recent: Vec::new(),
-            fable_recent: Vec::new(),
             burners: Vec::new(),
             window_start: now() - Duration::hours(5),
             window_end: now(),
@@ -151,7 +144,6 @@ mod tests {
         let d = dashboard(vec![
             window("5-hour", Some(46.0), Some(119)),
             window("7-day all", Some(20.0), Some(3 * 24 * 60 + 60)),
-            window("Fable", Some(10.0), Some(3 * 24 * 60 + 60)),
             window("Opus", Some(0.0), None),
         ]);
         let expected = "\
@@ -159,10 +151,8 @@ Claude usage  ·  Max
 
 5-hour           46.0%  resets in 1h 59m
 7-day all        20.0%  resets in 3d 1h
-Fable            10.0%  resets in 3d 1h
 
-ALL:   15m burn —, → 100% in — (need 2 recent samples)
-FABLE: 15m burn —, → 100% in — (need 2 recent samples)
+ALL: 15m burn —, → 100% in — (need 2 recent samples)
 
 Top burners (5h):  no local activity yet
 Projected use: 0%  ·  idle, safe to spin up agents
@@ -201,9 +191,9 @@ Projected use: 0%  ·  idle, safe to spin up agents
         assert_eq!(lines[2], "5-hour           50.0%  resets in 1h 00m");
         assert_eq!(
             lines[4],
-            "ALL:   15m burn +0.50%/min, → 100% in 1h 40m (over last 10m, 2 samples)"
+            "ALL: 15m burn +0.50%/min, → 100% in 1h 40m (over last 10m, 2 samples)"
         );
-        // No Fable window: no FABLE line. Opus shows only with show_all.
+        // Opus shows only with show_all.
         assert_eq!(lines[6], "Opus              0.0%  resets in —");
         assert_eq!(
             lines[8],

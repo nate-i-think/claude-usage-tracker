@@ -40,14 +40,10 @@ pub struct Dashboard {
     pub snapshot: Snapshot,
     /// In-memory 5-hour samples, oldest first.
     pub history: Vec<Sample>,
-    /// In-memory Fable weekly samples, oldest first.
-    pub fable_history: Vec<Sample>,
     /// 7-day-all samples of the last [`crate::analytics::WEEKLY_RATE_HOURS`]
     /// after their anchor, oldest first, including this poll's, for the
     /// weekly projection.
     pub seven_day_recent: Vec<Sample>,
-    /// The same for Fable's 7-day limit.
-    pub fable_recent: Vec<Sample>,
     pub burners: Vec<InstanceUsage>,
     pub window_start: DateTime<Utc>,
     /// End of the current five-hour window: its `resets_at`, else
@@ -464,16 +460,10 @@ fn build_dashboard(
     let week_samples = with_current_week_sample(rollups.week_samples, &snapshot);
     Dashboard {
         history: history.five_hour(),
-        fable_history: history.fable(),
         seven_day_recent: with_current(
             rollups.seven_day_recent,
             snapshot.fetched_at,
             snapshot.seven_day_pct(),
-        ),
-        fable_recent: with_current(
-            rollups.fable_recent,
-            snapshot.fetched_at,
-            snapshot.fable_pct(),
         ),
         burners: storage::attribute_recent(&dirs.claude_code, &dirs.cowork, ws, cowork),
         window_start: ws,
@@ -512,7 +502,6 @@ fn with_current_week_sample(mut samples: Vec<WeekSample>, snap: &Snapshot) -> Ve
     samples.push(WeekSample {
         t,
         seven_day: snap.seven_day_pct(),
-        fable: snap.fable_pct(),
     });
     samples.sort_by_key(|s| s.t);
     samples
@@ -546,17 +535,15 @@ fn with_current_sample(
     samples.push(WindowSample {
         t,
         five_hour: snap.five_hour_pct(),
-        fable: snap.window("Fable").and_then(|w| w.utilization),
     });
     samples.sort_by_key(|s| s.t);
     samples
 }
 
-/// In-memory burn histories (5-hour and Fable), capped at [`HISTORY_LEN`].
+/// In-memory 5-hour burn history, capped at [`HISTORY_LEN`].
 #[derive(Debug, Clone, Default)]
 pub struct BurnHistory {
     five_hour: VecDeque<Sample>,
-    fable: VecDeque<Sample>,
 }
 
 impl BurnHistory {
@@ -569,32 +556,26 @@ impl BurnHistory {
             let Some(t) = DateTime::from_timestamp_micros((e.ts * 1e6).round() as i64) else {
                 continue;
             };
-            h.push(t, e.five_hour, e.fable_7d);
+            h.push(t, e.five_hour);
         }
         h
     }
 
     /// Append this poll (Python `record()`).
     pub fn record(&mut self, snap: &Snapshot) {
-        let fable = snap.window("Fable").and_then(|w| w.utilization);
-        self.push(snap.fetched_at, snap.five_hour_pct(), fable);
+        self.push(snap.fetched_at, snap.five_hour_pct());
     }
 
-    fn push(&mut self, t: DateTime<Utc>, five_hour: Option<f64>, fable: Option<f64>) {
-        for (q, v) in [(&mut self.five_hour, five_hour), (&mut self.fable, fable)] {
-            if q.len() == HISTORY_LEN {
-                q.pop_front();
-            }
-            q.push_back((t, v));
+    fn push(&mut self, t: DateTime<Utc>, five_hour: Option<f64>) {
+        let q = &mut self.five_hour;
+        if q.len() == HISTORY_LEN {
+            q.pop_front();
         }
+        q.push_back((t, five_hour));
     }
 
     pub fn five_hour(&self) -> Vec<Sample> {
         self.five_hour.iter().copied().collect()
-    }
-
-    pub fn fable(&self) -> Vec<Sample> {
-        self.fable.iter().copied().collect()
     }
 }
 
@@ -1184,22 +1165,14 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(1);
 
-    fn snap(at: DateTime<Utc>, five: Option<f64>, fable: Option<f64>) -> Snapshot {
-        let mut windows = vec![UsageWindow {
-            label: "5-hour".into(),
-            utilization: five,
-            resets_at: Some(at + ChronoDuration::hours(2)),
-        }];
-        if let Some(f) = fable {
-            windows.push(UsageWindow {
-                label: "Fable".into(),
-                utilization: Some(f),
-                resets_at: None,
-            });
-        }
+    fn snap(at: DateTime<Utc>, five: Option<f64>) -> Snapshot {
         Snapshot {
             fetched_at: at,
-            windows,
+            windows: vec![UsageWindow {
+                label: "5-hour".into(),
+                utilization: five,
+                resets_at: Some(at + ChronoDuration::hours(2)),
+            }],
             extra: None,
             breakdown: None,
         }
@@ -1207,7 +1180,7 @@ mod tests {
 
     fn fetch_ok(pct: f64) -> FetchOk {
         FetchOk {
-            snapshot: snap(Utc::now(), Some(pct), None),
+            snapshot: snap(Utc::now(), Some(pct)),
             plan: Some("max".into()),
             token_expires_at: None,
         }
@@ -1997,7 +1970,7 @@ mod tests {
     #[test]
     fn window_start_from_resets_at_or_now() {
         let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
-        let s = snap(now, Some(1.0), None); // resets at now + 2h
+        let s = snap(now, Some(1.0)); // resets at now + 2h
         assert_eq!(window_start(&s, now), now - ChronoDuration::hours(3));
         let no_reset = Snapshot {
             fetched_at: now,
@@ -2014,15 +1987,12 @@ mod tests {
         let mut h = BurnHistory::default();
         for i in 0..(HISTORY_LEN + 3) {
             let t = t0 + ChronoDuration::seconds(i as i64);
-            h.record(&snap(t, Some(i as f64), (i % 2 == 0).then_some(1.0)));
+            h.record(&snap(t, Some(i as f64)));
         }
         let five = h.five_hour();
         assert_eq!(five.len(), HISTORY_LEN);
         assert_eq!(five[0].1, Some(3.0));
         assert_eq!(five.last().unwrap().1, Some((HISTORY_LEN + 2) as f64));
-        let fable = h.fable();
-        assert_eq!(fable.len(), HISTORY_LEN);
-        assert_eq!(fable[0].0, five[0].0);
     }
 
     #[test]
@@ -2032,11 +2002,8 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
         let ts = |mins_ago: i64| (now - ChronoDuration::minutes(mins_ago)).timestamp() as f64;
         let lines = [
-            format!(r#"{{"ts": {}, "five_hour": 1.0, "fable_7d": 9.0}}"#, ts(30)),
-            format!(
-                r#"{{"ts": {}, "five_hour": 2.0, "fable_7d": 10.0}}"#,
-                ts(10)
-            ),
+            format!(r#"{{"ts": {}, "five_hour": 1.0}}"#, ts(30)),
+            format!(r#"{{"ts": {}, "five_hour": 2.0}}"#, ts(10)),
             format!(r#"{{"ts": {}.5, "five_hour": 3.0}}"#, ts(1)),
         ];
         fs::write(paths.history_file(), lines.join("\n") + "\n").unwrap();
@@ -2053,15 +2020,13 @@ mod tests {
                 ),
             ]
         );
-        let fable: Vec<_> = h.fable().iter().map(|(_, v)| *v).collect();
-        assert_eq!(fable, [Some(10.0), None]);
     }
 
     #[test]
     fn history_seed_missing_file_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let h = BurnHistory::seeded(&Paths::with_data_dir(tmp.path().join("x")), Utc::now());
-        assert!(h.five_hour().is_empty() && h.fable().is_empty());
+        assert!(h.five_hour().is_empty());
     }
 
     /// A runtime for the default profile under `tmp`, fetching from `source`.
@@ -2084,19 +2049,16 @@ mod tests {
         assert_eq!(d.snapshot.five_hour_pct(), Some(42.0));
         assert_eq!(d.plan.as_deref(), Some("max"));
         assert_eq!(d.history.len(), 1);
-        assert_eq!(d.fable_history, [(d.snapshot.fetched_at, None)]);
         // The persisted copy of this poll is replaced by the exact one.
         assert_eq!(
             d.seven_day_recent,
             [(d.snapshot.fetched_at, d.snapshot.seven_day_pct())]
         );
-        assert_eq!(d.fable_recent, [(d.snapshot.fetched_at, None)]);
         assert_eq!(
             d.week_samples,
             [WeekSample {
                 t: d.snapshot.fetched_at,
                 seven_day: d.snapshot.seven_day_pct(),
-                fable: None,
             }]
         );
         assert_eq!(d.week_end - d.week_start, ChronoDuration::days(7));
@@ -2128,13 +2090,10 @@ mod tests {
         fs::create_dir_all(paths.data_dir()).unwrap();
         let lines = [
             format!(
-                r#"{{"ts": {}, "five_hour": 1.0, "fable_7d": 5.0}}"#,
+                r#"{{"ts": {}, "five_hour": 1.0}}"#,
                 ts(now - ChronoDuration::hours(4))
             ),
-            format!(
-                r#"{{"ts": {}, "five_hour": 30.0, "fable_7d": 6.0}}"#,
-                ts(earlier)
-            ),
+            format!(r#"{{"ts": {}, "five_hour": 30.0}}"#, ts(earlier)),
         ];
         fs::write(paths.history_file(), lines.join("\n") + "\n").unwrap();
 
@@ -2152,13 +2111,11 @@ mod tests {
                 WindowSample {
                     t: DateTime::from_timestamp(earlier.timestamp(), 0).unwrap(),
                     five_hour: Some(30.0),
-                    fable: Some(6.0),
                 },
                 // This poll, once, at its exact fetch time.
                 WindowSample {
                     t: fetched,
                     five_hour: Some(42.0),
-                    fable: None,
                 },
             ]
         );
@@ -2286,18 +2243,16 @@ mod tests {
     #[test]
     fn current_sample_is_added_when_persist_failed_and_kept_in_order() {
         let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
-        let s = snap(now, Some(50.0), Some(7.0)); // window 9:00..14:00
+        let s = snap(now, Some(50.0)); // window 9:00..14:00
         let ws = window_start(&s, now);
         let old = WindowSample {
             t: now - ChronoDuration::minutes(5),
             five_hour: Some(45.0),
-            fable: None,
         };
         let got = with_current_sample(vec![old], &s, ws, ws + ChronoDuration::hours(5));
         let current = WindowSample {
             t: now,
             five_hour: Some(50.0),
-            fable: Some(7.0),
         };
         assert_eq!(got, [old, current]);
         // A window that already ended (stale reset): not added.
@@ -2514,7 +2469,7 @@ mod tests {
         fn get_usage(&mut self, bearer: &str) -> Result<Snapshot, FetchError> {
             self.bearers.push(bearer.to_owned());
             let next = self.script.pop_front().unwrap_or(Ok(1.0));
-            next.map(|pct| snap(Utc::now(), Some(pct), None))
+            next.map(|pct| snap(Utc::now(), Some(pct)))
         }
     }
 
@@ -2682,7 +2637,7 @@ mod tests {
         fn get_usage(&mut self, bearer: &str) -> Result<Snapshot, FetchError> {
             self.0.lock().unwrap().push(bearer.to_owned());
             let pct = if bearer == TOKEN { 11.0 } else { 22.0 };
-            Ok(snap(Utc::now(), Some(pct), None))
+            Ok(snap(Utc::now(), Some(pct)))
         }
     }
 
