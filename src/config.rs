@@ -24,9 +24,14 @@ pub const MIN_INTERVAL_SECS: u64 = 5;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Plan label shown in the UI.
+    /// The CLI report's default plan label (`claude-usage-cli once`
+    /// without `--plan`). The GUI has no control for it any more; a value
+    /// saved by an older build is kept.
     pub plan: String,
     pub interval_secs: u64,
+    /// The CLI report also lists windows at 0% (as `--show-all` does). The
+    /// GUI has no control for it any more; a value saved by an older build
+    /// is kept.
     pub show_all: bool,
     pub always_on_top: bool,
     /// The window mode to open in.

@@ -104,9 +104,7 @@ Clicking a notification is meant to bring the window forward, but this has not b
 
 Open Settings with ⚙. Changes take effect on **Apply**, except **Always on top** and **Theme**, which apply at once.
 
-- **Plan label** (default "Max"): not shown anywhere since the Details card was removed.
 - **Poll interval**: default 60 s, minimum 5 s. It accepts plain seconds or a suffix: `30`, `30s`, `2m`, `1h`.
-- **Show all buckets**: not used anywhere since the Details card was removed.
 - **Always on top**: keep the full window above other windows. (The pill is always on top.)
 - **Theme**: **System**, **Dark** (the default) or **Light**.
 - **Accounts**: one card per profile, in display (and poll) order:
@@ -179,7 +177,7 @@ A rate limit (429) pauses that profile's polling for the `Retry-After` time, or 
 ```bash
 claude-usage-cli once                       # poll every enabled profile, record it, print a text report per profile
 claude-usage-cli once --profile work        # only one profile (its id, label or config dir)
-claude-usage-cli once --plan "Max 5x"       # plan label in the titles (default: the GUI's setting)
+claude-usage-cli once --plan "Max 5x"       # plan label in the titles (default "Max", or one saved by an older GUI)
 claude-usage-cli once --show-all            # include 0% windows
 claude-usage-cli debug                      # diagnose every profile's folder, credential and endpoint
 claude-usage-cli debug --profile work

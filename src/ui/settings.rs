@@ -23,9 +23,7 @@ use super::{level_color, theme};
 /// The panel's text fields, edited freely until Apply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsDraft {
-    pub plan: String,
     pub interval: String,
-    pub show_all: bool,
     pub tray_enabled: bool,
     pub close_to_tray: bool,
     pub start_in_pill: bool,
@@ -84,9 +82,7 @@ fn non_blank(s: &str) -> Option<String> {
 impl SettingsDraft {
     pub fn from_settings(s: &Settings) -> Self {
         Self {
-            plan: s.plan.clone(),
             interval: format_interval(s.interval_secs),
-            show_all: s.show_all,
             tray_enabled: s.tray_enabled,
             close_to_tray: s.close_to_tray,
             start_in_pill: s.start_in_pill,
@@ -240,8 +236,9 @@ impl IntervalCheck {
 }
 
 /// The settings Apply would commit: the draft over `current`, whose
-/// fields the panel does not buffer (`always_on_top`, edited live, and the
-/// window/alert state the app maintains) are kept. `Err` carries the
+/// fields the panel does not buffer (`always_on_top`, edited live, the
+/// window/alert state the app maintains, and `plan` and `show_all`, which
+/// only the CLI reads) are kept. `Err` carries the
 /// interval error; nothing is applied then.
 pub fn build_settings(draft: &SettingsDraft, current: &Settings) -> Result<Settings, String> {
     let interval_secs = match check_interval(&draft.interval) {
@@ -251,9 +248,7 @@ pub fn build_settings(draft: &SettingsDraft, current: &Settings) -> Result<Setti
     let mut rows = draft.clone();
     rows.absorb_discovered(&current.profiles);
     Ok(Settings {
-        plan: non_blank(&draft.plan).unwrap_or_else(|| Settings::default().plan),
         interval_secs,
-        show_all: draft.show_all,
         tray_enabled: draft.tray_enabled,
         close_to_tray: draft.close_to_tray,
         start_in_pill: draft.start_in_pill,
@@ -434,10 +429,6 @@ impl SettingsPanel {
             ui.heading("Settings");
             ui.add_space(4.0);
 
-            field(ui, "Plan label", |ui| {
-                ui.add(TextEdit::singleline(&mut self.draft.plan).desired_width(f32::INFINITY));
-            });
-
             field(ui, "Poll interval", |ui| {
                 ui.add(
                     TextEdit::singleline(&mut self.draft.interval)
@@ -455,7 +446,6 @@ impl SettingsPanel {
                 }
             });
 
-            theme::checkbox(ui, &mut self.draft.show_all, "Show all buckets");
             let mut on_top = live.always_on_top;
             if theme::checkbox(ui, &mut on_top, "Always on top")
                 .on_hover_text("Applies immediately")
@@ -776,9 +766,7 @@ mod tests {
         assert_eq!(
             SettingsDraft::from_settings(&s),
             SettingsDraft {
-                plan: "Max 5x".into(),
                 interval: "2m".into(),
-                show_all: true,
                 tray_enabled: false,
                 close_to_tray: true,
                 start_in_pill: true,
@@ -847,25 +835,24 @@ mod tests {
     }
 
     #[test]
-    fn build_applies_trimmed_fields_and_keeps_live_always_on_top() {
+    fn build_clamps_the_interval_and_keeps_live_and_cli_only_fields() {
+        // Always on top is edited live; the plan label and Show all are
+        // only the CLI's defaults, with no control in the panel.
         let current = Settings {
             always_on_top: true,
+            plan: "Max 5x".into(),
+            show_all: true,
             ..Settings::default()
         };
         let d = SettingsDraft {
-            plan: "  Pro ".into(),
             interval: "2s".into(),
-            show_all: true,
-            ..draft()
+            ..SettingsDraft::from_settings(&current)
         };
         assert_eq!(
             build_settings(&d, &current).unwrap(),
             Settings {
-                plan: "Pro".into(),
                 interval_secs: MIN_INTERVAL_SECS,
-                show_all: true,
-                always_on_top: true,
-                ..Settings::default()
+                ..current.clone()
             }
         );
     }
@@ -936,23 +923,9 @@ mod tests {
     }
 
     #[test]
-    fn build_blank_plan_becomes_default() {
-        let current = Settings::default();
-        let blank_plan = SettingsDraft {
-            plan: "  ".into(),
-            ..draft()
-        };
-        assert_eq!(
-            build_settings(&blank_plan, &current).unwrap().plan,
-            Settings::default().plan
-        );
-    }
-
-    #[test]
     fn build_rejects_invalid_interval() {
         let d = SettingsDraft {
             interval: "soon".into(),
-            plan: "Changed".into(),
             ..draft()
         };
         let err = build_settings(&d, &Settings::default()).unwrap_err();
