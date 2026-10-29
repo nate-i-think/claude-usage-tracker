@@ -102,23 +102,42 @@ pub fn show_burn_row(ui: &mut Ui, d: &Dashboard, now: DateTime<Utc>) {
     super::show_runs(ui, &runs).on_hover_text(burn_hover(burn.as_ref()));
 }
 
-/// The footer strip on a card under the charts: for each account with
-/// data, its top burners line ([`rows::burners_runs`]) and, when analytics
-/// says it is visible, its extra-usage gauge; nothing without data. One
-/// account shows just that; with several, each is a group under its dot and
-/// name ([`chips::group_header`], a stale one dimmed), side by side when
-/// they all fit in one row (see [`layout::groups_side_by_side`]), else
-/// stacked.
+/// What an account's group in the strip shows (see [`strip_content`]).
+#[derive(Debug, PartialEq)]
+pub struct StripContent<'a> {
+    /// The top burners line ([`rows::burners_runs`]), when there are any.
+    pub burners: Option<Vec<Run>>,
+    /// The extra-usage block, when analytics says it is visible.
+    pub extra: Option<&'a ExtraUsage>,
+}
+
+/// An account's group in the strip under the charts: its top burners line
+/// and its extra-usage gauge, each only when there is something to show;
+/// `None` (no group) when neither is.
+pub fn strip_content(d: &Dashboard) -> Option<StripContent<'_>> {
+    let burners = (!d.burners.is_empty()).then(|| rows::burners_runs(&d.burners));
+    let extra = analytics::visible_extra(&d.snapshot);
+    (burners.is_some() || extra.is_some()).then_some(StripContent { burners, extra })
+}
+
+/// The footer strip on a card under the charts: a group per account with
+/// [`strip_content`]; no card when no account has any. The groups are
+/// labelled with the account's dot and name ([`chips::group_header`], a
+/// stale one dimmed) when the chips are ([`chips::grouped`]), and sit side
+/// by side when they all fit in one row (see
+/// [`layout::groups_side_by_side`]), else stack.
 pub fn show_footer(ui: &mut Ui, accounts: &[AccountView]) {
-    let shown = super::timeline::with_data(accounts);
-    if shown.is_empty() {
+    let palette = Palette::for_visuals(ui.visuals());
+    let groups: Vec<Strip> = accounts
+        .iter()
+        .filter_map(|v| strip(ui, palette, v))
+        .collect();
+    if groups.is_empty() {
         return;
     }
-    let several = shown.len() >= 2;
-    let palette = Palette::for_visuals(ui.visuals());
+    let several = chips::grouped(accounts);
     super::theme::card(palette).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let groups: Vec<Strip> = shown.iter().filter_map(|v| strip(ui, palette, v)).collect();
         let widths: Vec<f32> = groups
             .iter()
             .map(|s| {
@@ -140,7 +159,9 @@ pub fn show_footer(ui: &mut Ui, accounts: &[AccountView]) {
                 chips::group_header(ui, palette, s.view);
                 ui.spacing_mut().item_spacing.y = layout::GAP;
             }
-            super::show_runs(ui, &s.burners);
+            if let Some(burners) = &s.burners {
+                super::show_runs(ui, burners);
+            }
             if let Some((extra, parts)) = s.extra {
                 extra_row(ui, palette, s.key, extra, parts);
             }
@@ -153,22 +174,23 @@ struct Strip<'v, 'a> {
     view: &'v AccountView<'a>,
     /// Its [`super::timeline::series_key`].
     key: u64,
-    burners: Vec<Run>,
+    burners: Option<Vec<Run>>,
     extra: Option<(&'a ExtraUsage, ExtraParts)>,
     /// The widest of its lines, unwrapped (without the header).
     width: f32,
 }
 
-/// `view`'s strip group, or `None` without data.
+/// `view`'s strip group, measured; `None` without data or
+/// [`strip_content`].
 fn strip<'v, 'a>(ui: &Ui, palette: &Palette, view: &'v AccountView<'a>) -> Option<Strip<'v, 'a>> {
-    let d = view.data?;
-    let burners = rows::burners_runs(&d.burners);
-    let burners_w = ui
-        .painter()
-        .layout_job(super::layout_job(&burners, ui))
-        .size()
-        .x;
-    let extra = analytics::visible_extra(&d.snapshot).map(|e| (e, extra_parts(ui, palette, e)));
+    let StripContent { burners, extra } = strip_content(view.data?)?;
+    let burners_w = burners.as_ref().map_or(0.0, |runs| {
+        ui.painter()
+            .layout_job(super::layout_job(runs, ui))
+            .size()
+            .x
+    });
+    let extra = extra.map(|e| (e, extra_parts(ui, palette, e)));
     let extra_w = extra.as_ref().map_or(0.0, |(_, p)| p.width());
     Some(Strip {
         view,
@@ -195,6 +217,7 @@ impl ExtraParts {
     }
 }
 
+/// `extra`'s gauge figures and text, laid out for this frame.
 fn extra_parts(ui: &Ui, palette: &Palette, extra: &ExtraUsage) -> ExtraParts {
     let gauge = extra_gauge(extra);
     let painter = ui.painter();
@@ -354,6 +377,68 @@ mod tests {
             currency: "USD".to_owned(),
             disabled_reason: None,
         }
+    }
+
+    fn dashboard(burners: &[(&str, u64)], extra: Option<ExtraUsage>) -> Dashboard {
+        let now = DateTime::from_timestamp(1_791_000_000, 0).unwrap();
+        Dashboard {
+            snapshot: crate::model::Snapshot {
+                fetched_at: now,
+                windows: Vec::new(),
+                extra,
+                breakdown: None,
+            },
+            history: Vec::new(),
+            fable_history: Vec::new(),
+            seven_day_recent: Vec::new(),
+            fable_recent: Vec::new(),
+            burners: burners
+                .iter()
+                .map(|&(name, tokens)| crate::storage::InstanceUsage {
+                    name: name.to_owned(),
+                    display_name: name.to_owned(),
+                    source: "claude-code",
+                    tokens,
+                    last_active: now,
+                })
+                .collect(),
+            window_start: now,
+            window_end: now,
+            window_samples: Vec::new(),
+            week_start: now,
+            week_end: now,
+            week_samples: Vec::new(),
+            persist_error: None,
+            plan: None,
+            token_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn strip_shows_only_what_there_is() {
+        // Burners and extra usage: both.
+        let d = dashboard(&[("app", 12_000)], Some(extra(23.0, 35.0, 65.7)));
+        let c = strip_content(&d).unwrap();
+        assert_eq!(
+            plain_text(c.burners.as_deref().unwrap()),
+            "Top burners (5h):  app 12k"
+        );
+        assert!(c.extra.is_some());
+        // No burners: no "no local activity yet" filler, the gauge alone.
+        let d = dashboard(&[], Some(extra(23.0, 35.0, 65.7)));
+        let c = strip_content(&d).unwrap();
+        assert_eq!(c.burners, None);
+        assert!(c.extra.is_some());
+        // Burners only.
+        let d = dashboard(&[("app", 1)], None);
+        let c = strip_content(&d).unwrap();
+        assert!(c.burners.is_some() && c.extra.is_none());
+        // Neither (an unused extra block counts as none): no group.
+        assert_eq!(strip_content(&dashboard(&[], None)), None);
+        assert_eq!(
+            strip_content(&dashboard(&[], Some(extra(0.0, 0.0, 0.0)))),
+            None
+        );
     }
 
     #[test]

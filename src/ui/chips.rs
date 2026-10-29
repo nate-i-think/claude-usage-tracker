@@ -272,10 +272,8 @@ pub struct ChipGroup {
 /// [`accounts::hottest`]: super::accounts::hottest
 pub fn chip_groups(views: &[AccountView], now: DateTime<Utc>) -> Vec<ChipGroup> {
     let hot = super::accounts::hottest(views, now);
-    let shown: Vec<usize> = (0..views.len())
-        .filter(|&i| views[i].data.is_some() || views[i].error.is_some())
-        .collect();
-    let header = shown.len() >= 2;
+    let shown: Vec<usize> = (0..views.len()).filter(|&i| listed(&views[i])).collect();
+    let header = grouped(views);
     shown
         .into_iter()
         .filter(|&i| header || views[i].data.is_some())
@@ -294,6 +292,19 @@ pub fn chip_groups(views: &[AccountView], now: DateTime<Utc>) -> Vec<ChipGroup> 
             }
         })
         .collect()
+}
+
+/// Whether an account is shown in the header (and labelled when
+/// [`grouped`]): it has data or an error.
+fn listed(view: &AccountView) -> bool {
+    view.data.is_some() || view.error.is_some()
+}
+
+/// Whether the accounts are shown as labelled groups: two or more have data
+/// or an error. The chips and the strip under the charts both follow this,
+/// so they are labelled alike.
+pub(super) fn grouped(views: &[AccountView]) -> bool {
+    views.iter().filter(|v| listed(v)).count() >= 2
 }
 
 /// The id of one eased value (`what`: "chip-pct", "chip-color") of an
@@ -774,6 +785,27 @@ mod tests {
             .filter(|c| c.2)
             .collect();
         assert_eq!(pulsing, [(3, "5-hour", true)]);
+    }
+
+    #[test]
+    fn grouped_counts_error_only_accounts_like_the_chips() {
+        use crate::profiles::ProfileId;
+        let (a, b, c) = (
+            ProfileId::new("a"),
+            ProfileId::new("b"),
+            ProfileId::new("c"),
+        );
+        let d = dashboard(40.0);
+        let e = error("expired");
+        // One with data, one with only an error: labelled groups, as the
+        // chips draw them.
+        let views = [view(&a, Some(&d), None), view(&b, None, Some(&e))];
+        assert!(grouped(&views));
+        assert!(chip_groups(&views, t(12, 0)).iter().all(|g| g.header));
+        // One with data, one still polling: one unlabelled account.
+        let views = [view(&a, Some(&d), None), view(&c, None, None)];
+        assert!(!grouped(&views));
+        assert!(!grouped(&[]));
     }
 
     #[test]
