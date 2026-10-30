@@ -16,3 +16,6 @@ desktop.ini
 
 # Rust
 target/
+
+# Output of `just start`
+logs/

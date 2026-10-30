@@ -1,5 +1,16 @@
-# Run the Claude usage monitor GUI
+# Build, then launch the GUI detached from the terminal; output goes to logs/
 start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin claude-usage
+    mkdir -p logs
+    log="logs/claude-usage-$(date +%Y%m%d-%H%M%S).log"
+    nohup target/release/claude-usage > "$log" 2>&1 < /dev/null &
+    disown
+    echo "claude-usage started (pid $!), logging to $log"
+
+# Run the GUI in the foreground, output to this terminal
+start-fg:
     cargo run --release --bin claude-usage
 
 # Alias for `just start`

@@ -130,7 +130,8 @@ cargo build --release
 The binaries land in `target/release/`: `claude-usage` (GUI) and `claude-usage-cli` (CLI), with `.exe` on Windows. If you have [just](https://github.com/casey/just), the justfile wraps the common commands:
 
 ```bash
-just start        # build (release) and run the GUI; `just run` is an alias
+just start        # build (release) and launch the GUI detached; output goes to logs/. `just run` is an alias
+just start-fg     # build and run the GUI in the foreground, output to the terminal
 just cli once     # run the CLI with arguments: once | debug | mcp
 just mcp          # run the MCP server on stdio, for testing
 just test         # cargo test
