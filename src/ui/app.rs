@@ -43,6 +43,17 @@ const EGUI_MEMORY_KEY: &str = "egui";
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 /// Repaint cadence so "last polled" and the countdowns tick while idle.
 const TICK: Duration = Duration::from_secs(1);
+/// The shortest frame: rendering is capped at about 15 fps, animations and
+/// pointer movement included, to keep GPU use down.
+const MIN_FRAME: Duration = Duration::from_millis(1000 / 15);
+
+/// How long to hold a frame that would start `now`, given when the last one
+/// started, so frames are at least [`MIN_FRAME`] apart.
+pub fn frame_wait(last_frame: Option<Instant>, now: Instant) -> Duration {
+    last_frame.map_or(Duration::ZERO, |t| {
+        MIN_FRAME.saturating_sub(now.saturating_duration_since(t))
+    })
+}
 
 /// Whether the refresh button is usable again, given its last click.
 pub fn refresh_ready(last_click: Option<Instant>, now: Instant) -> bool {
@@ -135,6 +146,8 @@ pub struct App {
     quitting: bool,
     /// When a tray toggle last acted (see [`tray::toggle_accepted`]).
     last_toggle: Option<Instant>,
+    /// When the last frame started (see [`frame_wait`]).
+    last_frame: Option<Instant>,
     /// Whether the app was active at the last look (macOS; see
     /// [`tray::became_active`]).
     #[cfg(target_os = "macos")]
@@ -209,6 +222,7 @@ impl App {
             hidden: false,
             quitting: false,
             last_toggle: None,
+            last_frame: None,
             #[cfg(target_os = "macos")]
             was_active: None,
             alerts: AlertHook::new(toasts),
@@ -673,6 +687,8 @@ fn content_column(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        std::thread::sleep(frame_wait(self.last_frame, Instant::now()));
+        self.last_frame = Some(Instant::now());
         self.track_window(ctx, frame);
         self.handle_close_request(ctx);
         self.drain_events();
@@ -749,6 +765,19 @@ mod tests {
         assert!(first_run(Some(&storage)));
         storage.set_string(EGUI_MEMORY_KEY, "{}".to_owned());
         assert!(!first_run(Some(&storage)));
+    }
+
+    #[test]
+    fn frames_are_held_to_the_cap() {
+        let t = Instant::now();
+        assert_eq!(frame_wait(None, t), Duration::ZERO);
+        assert_eq!(frame_wait(Some(t), t), MIN_FRAME);
+        let later = t + Duration::from_millis(20);
+        assert_eq!(
+            frame_wait(Some(t), later),
+            MIN_FRAME - Duration::from_millis(20)
+        );
+        assert_eq!(frame_wait(Some(t), t + MIN_FRAME * 2), Duration::ZERO);
     }
 
     #[test]
